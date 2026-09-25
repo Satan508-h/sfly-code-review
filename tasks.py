@@ -345,8 +345,17 @@ def cmd_eval(_: argparse.Namespace) -> None:
 
 
 def cmd_lint(_: argparse.Namespace) -> None:
-    run([_uv(), "run", "ruff", "check", "."])
-    run([_uv(), "run", "ruff", "format", "--check", "."])
+    # --no-cache：ruff 的缓存会把**已经不再成立**的结果报成通过，而它不会因此
+    # 有任何提示。M3 真的踩到了：一个 import 的分组取决于被导入的模块能不能在
+    # src 根下解析到，而我只移动了那个模块的目录（tests/integration/ →
+    # tests/），conftest.py 自己一个字节都没改 —— 于是它的缓存条目没失效，
+    # 本地一路绿灯，CI（全新 clone、没有缓存）在第一步就红了。
+    #
+    # 这正是 ci.yml 开头那句「本地过了 CI 挂了这种事不会发生」要挡住的东西，
+    # 所以这里宁可不要缓存。73 个文件的代价是零点几秒，换来的是这条命令
+    # **说它通过就是真通过**。CI 本来就没有缓存，两边因此也完全一致。
+    run([_uv(), "run", "ruff", "check", "--no-cache", "."])
+    run([_uv(), "run", "ruff", "format", "--check", "--no-cache", "."])
     _ok("lint 通过")
 
 

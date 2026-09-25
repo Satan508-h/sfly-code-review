@@ -14,6 +14,9 @@ CLAUDE.md 里那句「声明了却在别处不执行的门槛比没有门槛更�
 from __future__ import annotations
 
 import pytest
+
+# 空行不是随手加的：``redis_support`` 住在 ``tests/`` 下，而 ``tests`` 是
+# ruff 配置里的一个 src 根，所以它被算作**本仓库的模块**、要和第三方分开。
 from redis_support import flush_test_db, probe
 
 
