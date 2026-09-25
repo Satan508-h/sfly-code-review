@@ -78,7 +78,15 @@ def run(
     """
     printable = " ".join(cmd)
     if not capture:
-        print(f"\n\033[36m$\033[0m {printable}", flush=True)
+        # **这一行走 stderr，不走 stdout。**
+        #
+        # 它是「我正在做什么」，不是程序输出 —— 而项目的约定是
+        # 「stdout 只留给程序输出」（CLAUDE.md）。写错地方的症状很具体：
+        # ``python tasks.py review > report.json`` 得到的文件第一行是那行
+        # 带颜色的命令，于是 ``json.loads`` 在第二个字节上失败，而报错指向
+        # JSON 语法 —— 完全看不出真正的原因是多了一行日志。
+        # 这正是同一条约定在别处（sfly_workers --diff | jq）已经踩过的坑。
+        print(f"\n\033[36m$\033[0m {printable}", file=sys.stderr, flush=True)
     try:
         # 命令列表全部由本文件的开发者硬编码，不含用户输入；参数（--times /
         # --port）是 argparse 校验过的 int，不做字符串插值，所以没有注入面。
@@ -446,6 +454,27 @@ def cmd_typecheck(_: argparse.Namespace) -> None:
 # -- 演示 ------------------------------------------------------------------- #
 
 
+def cmd_review(args: argparse.Namespace) -> None:
+    """M5 的端到端验收：一条 diff 走完整张图（Mock LLM）。
+
+    **单进程形态**：图 + 协调协程 + 超时扫描器 + 三个 Worker 全在一个进程里，
+    所以它证明的是「整条链路是通的」—— 分容器跑的时候「没出报告」有十几种可能
+    （Worker 没起来、Redis 连错、消费者组没建…），单进程把变量全部固定，
+    只剩业务逻辑本身。Worker 容器同时开着也无所谓：三条 lane 加入的是同一批
+    消费者组，Redis 保证一条消息只投给组内一个成员，所以那是分担负载。
+
+    仍然需要 Postgres 和 Redis 可达（``python tasks.py up postgres redis``）——
+    它们不是「测试替身」，是这条链路的真实组成部分。
+    """
+    cmd = [_py(), "-m", "sfly_orchestrator", "--diff", args.diff]
+    if not args.replay:
+        # 不带 --new 时会复用同一个 run（幂等键 = repo:pr:head_sha）。
+        # 那是对的行为，但演示需要每次都有新东西看 —— 所以默认给 --new，
+        # 而 --replay 留出「我要看幂等那条路」的入口。
+        cmd.append("--new")
+    run(cmd)
+
+
 def cmd_demo(args: argparse.Namespace) -> None:
     """端到端演示。M6 会实现 scripts/replay_webhook.py。"""
     script = ROOT / "scripts" / "replay_webhook.py"
@@ -611,7 +640,16 @@ def build_parser() -> argparse.ArgumentParser:
     add("fmt", cmd_fmt, "自动格式化")
     add("typecheck", cmd_typecheck, "mypy 类型检查")
 
-    add("demo", cmd_demo, "端到端演示", [(("--times",), {"type": int, "default": 1})])
+    add("demo", cmd_demo, "端到端演示（M6：replay_webhook）", [(("--times",), {"type": int, "default": 1})])
+    add(
+        "review",
+        cmd_review,
+        "端到端审查一条 diff：投递 → 三个 Worker → 报告（M5 验收）",
+        [
+            (("--diff",), {"default": "fixtures/security_demo.diff", "metavar": "PATH"}),
+            (("--replay",), {"action": "store_true", "help": "复用已有 run，验证幂等（默认每次新建）"}),
+        ],
+    )
     add("web-install", cmd_web_install, "安装前端依赖")
     add("web-dev", cmd_web_dev, "启动前端开发服务器")
 

@@ -1770,20 +1770,24 @@ name = "sfly-orchestrator"
 version = "0.1.0"
 source = { editable = "apps/orchestrator" }
 dependencies = [
+    { name = "langchain-core" },
     { name = "langgraph" },
     { name = "langgraph-checkpoint-postgres" },
     { name = "sfly-agent" },
     { name = "sfly-bus" },
     { name = "sfly-shared" },
+    { name = "sfly-workers" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "langchain-core", specifier = ">=1.6" },
     { name = "langgraph", specifier = ">=1.2" },
     { name = "langgraph-checkpoint-postgres", specifier = ">=3.1" },
     { name = "sfly-agent", editable = "packages/agent-core" },
     { name = "sfly-bus", editable = "packages/bus" },
     { name = "sfly-shared", editable = "packages/shared" },
+    { name = "sfly-workers", editable = "apps/workers" },
 ]
 
 [[package]]

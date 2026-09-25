@@ -14,14 +14,36 @@
 
 ## 当前状态
 
-**M4 已完成**：Postgres 六张表由启动时的**幂等 `migrate()`** 建出来（本地容器和 Neon
-走的是同一条代码路径），`PostgresRunStore` 实现了整个 `RunStore` 协议，
-**Worker 的常驻消费循环真的在跑**——存库 → 发结果 → ack，顺序就是那条投递顺序铁律。
-验收是一条命令：
+**M5 已完成**：LangGraph 图（七个节点）跑通了，`wait` 节点的 `interrupt()` 真的会
+挂起、真的能恢复，编排层有了协调协程和超时扫描器，主 Agent 的聚合（去重 / 置信度
+重算 / 阻断决策 / 评论渲染）**全确定性、零 LLM 调用**。验收是一条命令：
 
 ```bash
-python tasks.py tables
+python tasks.py review
 ```
+
+```text
+── 时间线（12 条事件）─────────────────────────
+  #23  run.created         files=4 head_sha=fb7353185e1b-… pr_number=1
+  #24  node.finished       node=plan planned_workers=['security','performance','style'] rules=8
+  #25  worker.dispatched   worker_type=security message_id=1790341750660-0
+  #30  worker.result       worker_type=style findings=4 status=ok
+  #31  aggregate.done      findings=14 suppressed=2 degraded=False tokens=6216
+  #32  node.finished       node=finalize decision_reason=secrets_found
+  #33  publish.done        posted=False reason=github_client_not_implemented
+  #34  run.finished        status=published duration_ms=49
+
+── 审查结果 ─────────────────────────────────────────
+  状态       published
+  结论       🔴 建议修改后再合并（secrets_found）
+  发现       14 条：严重 4 · 高危 5 · 中危 3 · 低危 2
+             另有 2 条置信度不足，只入库不发布
+
+  [严重]    app/db.py:17  sqli  置信度 60%  来自 安全
+          SQL 语句用字符串拼接/格式化构造，用户输入可直接改写查询语义
+```
+
+报告 JSON 走 stdout（`python tasks.py review | jq` 直接用），时间线和中文摘要走 stderr。
 
 下面按里程碑倒序排列，最近完成的在最前。
 
@@ -95,6 +117,84 @@ CI 就只能一律当成失败。
 容器内跑同一份 fixture 得到**逐字节相同**的输出（证明规则库随镜像正确分发）。
 
 373 个单测 + 59 个集成测试通过；ruff + mypy strict（含 tests）全绿。
+
+### M5 已完成：LangGraph 图 / 断点恢复 / 主 Agent 聚合
+
+```
+ingest → plan → dispatch → wait → aggregate → finalize → publish
+```
+
+七个节点各管一件事，每个都有自己的失败模式：`ingest` 是唯一会被重复执行的节点
+（bootstrap 重投），`plan` 是唯一可能提前结束整个 run 的，`dispatch` 是唯一有
+不可撤销副作用的，`wait` 是唯一会挂起的。
+
+#### `interrupt()`：全项目唯一的高风险项
+
+`wait` 节点在屏障没闭合时调 `interrupt()` —— 它会 checkpoint 然后**退出图执行**，
+进程里不再持有这个 run 的任何状态。唤醒由**图之外**的协调协程完成：它消费
+`review_results`，查一次屏障，闭合了就 `ainvoke(Command(resume=...))`。
+
+**判断依据是数据库，不是唤醒信号。** 节点被唤醒后 LangGraph 会从头重跑它，
+而它做的第一件事是再查一次 `worker_results` —— 所以协调协程、超时扫描器、
+甚至手工 resume，走的都是同一条路径、得到同一个结论。唤醒信号里带什么值都不影响
+结果（`interrupt()` 的返回值在这个节点里根本没用）。
+
+两条命保着这套机制：
+
+| 机制 | 救的是 |
+|---|---|
+| **超时扫描器**（每 15 秒） | `due_runs()` 捞出过了 `deadline_at` 还在 `dispatched`/`waiting` 的 run 并唤醒。**图挂起期间 orchestrator 崩了，恢复靠的是这一条 SQL，不是内存里的定时器** |
+| **唤醒选举**（`SETNX resume:{task_id}`） | 扫描器在每个副本里都跑，同一个 run 会被多个副本同时盯上；而 LangGraph 不阻止同一个 thread 被并发 invoke。锁只省重复劳动，**它不是正确性机制** —— 真正的兜底是 M7 的两道防重复评论闸 |
+
+逃生开关是 `WAIT_STRATEGY=poll`：节点签名完全相同，原地轮询。它有已知代价 ——
+轮询期间整条消费协程被占住，一次只能推进一个 run —— 所以它是开关，不是默认值。
+
+#### 屏障读数据库，不读消息流
+
+`wait` 查的是 `worker_results` 表。这不是实现细节，是**唯一正确的选择**：
+Worker 是「先写库、再 `XADD`」（约定 #1），所以编排器被唤醒时结果一定已经在了。
+反过来会有真实的竞态 —— `XADD` 先到、去查库查不到、屏障看起来没闭合，
+然后那条消息被 ack 掉，再也没人来叫醒这个 run。
+
+#### 主 Agent 的聚合：全确定性、零 LLM 调用
+
+`results → 合并 → 置信度重算 → 分档 → ReviewReport`，整条链路上除了 Worker 本身
+一个模型都不调 —— 因为评测要可复现：同一批结果跑一百遍必须得到一模一样的报告，
+否则「改了聚类阈值，精确率涨了 3%」就说不清是改动带来的还是模型抖动带来的。
+
+置信度**重算而不是照抄**，因为模型自报的数有两个已知偏差（系统性偏高、跨 Worker
+不可比）：
+
+```
+c = 严重度先验 × (0.55 × 模型自报 + 0.25 × 一致度 + 0.20 × 跨 Worker 度) + 0.10 × 有规则依据
+```
+
+一致度是**饱和**的（1 / 2 / 3 个来源 → 0 / 0.49 / 0.74）：从「没人印证」到
+「有人印证」是最值钱的一步，之后迅速递减。低于 `0.35` 的**入库但不发布** ——
+评测需要它们来测量这道闸砍掉了多少召回，只存发布出去的话阈值就只能盲调。
+
+阻断决策是规则引擎，**永不发 APPROVE**（机器人审批人类 PR 是策略漏洞）：
+命中 `secrets` 直接拦（不看严重度也不看置信度，因为代价不对称）、
+高危类目的 `critical` 且置信度 ≥ 0.60、或者 ≥ 3 条高危且置信度 ≥ 0.70。
+
+#### 过程中改掉的东西
+
+| 现象 | 真因 |
+|---|---|
+| 报告里 `degraded=True` 但 `missing_workers=[]` | 「谁没上报」和「谁没产出可用结果」是**两个问题**。`wait` 会给超时的 Worker 补写 failed 结果（约定 #2），所以 aggregate 跑的时候「谁没上报」永远是空集 —— 前端那个降级徽章找不到任何一个可以显示的名字。现在按「没有可用结果」算，顺带覆盖了「上报了一条失败结果」那一类 |
+| `worker.result` 事件排在 `run.finished` **后面** | 事件由协调协程写，而图和协调协程是并发的两条路径 —— 图判断屏障读的是数据库，所以「三条结果都在库里了、图已经 aggregate 完、协调协程才开始消费第一条消息」完全可能。**那不是排序问题，是写事件的人站错了位置**：这件事的因果起点是「Worker 写完了结果」，就该由 Worker 在那一刻记下来 |
+| `comment_chars` 在 finalize 和 publish 两处差 1 | `_Contract` 开了 `str_strip_whitespace=True`，评论正文结尾那个换行存进 jsonb 再读回来时被吃掉了。渲染时干脆不留 —— 让它一开始就等于最终形态 |
+| 报告里有 emoji 时 CLI 以非零码退出 | Windows 上重定向到文件用的是 cp936，`🤖` 编码不了 → `UnicodeEncodeError`，**而报告已经生成好了**。这套判断（`isatty()` 决定编码）原本只写在 Worker 的 CLI 里，现在抽成了 `sfly_shared.console` 给两个入口共用 |
+| `python tasks.py review > report.json` 得到的不是合法 JSON | `tasks.py` 的 `run()` 往 **stdout** 打了一行 `$ <命令>`，于是 `json.loads` 在第二个字节上失败，报错指向 JSON 语法。这违反项目自己的约定（stdout 只留给程序输出），现在那行走 stderr |
+| pydantic 对象存进 checkpoint 时每次读都warn | `JsonPlusSerializer` 能把契约对象存回来，但会打印「Deserializing unregistered type … This will be blocked in a future version」。所以**图状态里只放 JSON**，节点边界上 `model_validate` —— 顺带让 `SELECT checkpoint FROM checkpoints` 直接可读 |
+
+#### 一处刻意的顺序
+
+`publish` **先写状态、后写事件**。两次写库不可能原子，所以必然有一个窗口，
+而两种顺序的失败方向不一样：状态先写的话，崩在中间的表现是「run 读作已完成、
+时间线少了最后一条」—— 客户端跟着 `run.finished` 事件走，等不到就读一次状态，
+发现已经完成，是安全的失败方向。反过来会让 run 永远停在 `aggregating`，
+而**没有任何东西能唤醒它**（扫描器的 `due_runs` 只看 `dispatched`/`waiting`）。
 
 ### M4 已完成：Postgres schema / 仓储 / 迁移 / Worker 消费循环
 
@@ -405,7 +505,11 @@ DeepSeek 走 OpenAI 兼容接口，所以换成 OpenAI、vLLM 或本地模型只
 | **副本猝死，同伴接手** | `python tasks.py demo-reclaim` | 4 条任务被两个副本瓜分 → 一个副本中途消失 → PEL 里留下 1 条没人认领的记录 → `reclaim()` 抢回 → 重投的 `attempt` 是 2（不需要全栈，只要一个 Redis） |
 | Worker 水平扩展 | `python tasks.py scale 3` | `worker-security` 变成 3 个副本，**同一个消费者组里三个消费者在竞争**（常驻循环 M4 已就绪，`XINFO CONSUMERS` 数得出来） |
 | **Worker 真的在写库** | `docker compose logs worker-security \| grep worker.consuming` | 每个副本报出消费者组、并发数、回收间隔；收到任务时按「存库 → 发结果 → ack」处理（集成测试逐条验证这个顺序） |
-| Worker 猝死不影响结果 | `python tasks.py kill-worker` | run 照样跑完，UI 显示「1 个 Worker 降级」徽章 —— **等 M5**：屏障闭合需要编排器 |
+| **一条命令跑完整条链路** | `python tasks.py review` | 一张图从 bootstrap 跑到报告：三次派发、三个 Worker 上报、聚合、阻断决策。stdout 是报告 JSON（`\| jq` 直接可用） |
+| **图会挂起，也能被唤醒** | `python tasks.py review` 的 stderr 时间线 | 若某个 Worker 慢一步，日志里会出现 `node.wait_suspend`，然后是协调协程的 `coordinator.barrier_closed` 把它叫醒 —— 中间进程不持有这个 run 的任何状态 |
+| **断点恢复靠一条 SQL** | `RUN_DEADLINE_S=10 python tasks.py review`（不启动 Worker） | 15 秒内扫描器捞出这个 run 并唤醒，`wait` 走超时分支给三个掉队的 Worker 各补一条 failed 结果，报告带降级徽章 |
+| 幂等：同一份 diff 只审一次 | `python tasks.py review --replay` | 复用同一个 run（幂等键 = `repo:pr:head_sha`），打印上一次的报告而不是重新审查 |
+| Worker 猝死不影响结果 | `python tasks.py kill-worker` | run 照样跑完并显示降级徽章（M5 起屏障能被编排器闭合了） |
 | Webhook 幂等 | 同一 payload 连投 3 次 | 1 个 run + 2 个 `duplicate` 响应 |
 | 断点恢复 | `docker restart sfly-orchestrator-1` | 从 Postgres 的 checkpoint 续跑，不重复发评论 |
 | Redis 重启不丢任务 | `docker restart sfly-redis` | 扫描器按 `attempt+1` 重派，消息排空 |
@@ -488,15 +592,22 @@ LLM 裁判会引入非确定性，直接毁掉评测的可复现性。四条规�
 ```
 apps/
   api/           FastAPI 网关：HMAC 校验、投递去重、runs 接口、SSE
-  orchestrator/  LangGraph 图 + coordinator 协程 + 超时扫描器
+  orchestrator/  graph.py 装配图；nodes/ 七个节点各一个文件
+                 runner.py 消费 bootstrap；coordinator.py 屏障 + 唤醒
+                 sweeper.py 超时扫描；checkpointer.py **自己一个连接池**
   workers/       一套代码三种部署：--spec {security|performance|style}
+                 pool.py 是消费循环本体 —— 一个容器一条 lane，或者一个进程
+                 三条协程（精简模式），**同一份代码**
   lite/          单事件循环，一个进程跑完整个系统（Render 用）
 packages/
-  shared/        领域契约、配置、ID、日志、异常
+  shared/        领域契约、配置、ID、日志、异常、console（编码）
   bus/           TaskQueue / RunStore / Lock 协议 + 两种实现
                  postgres.py 里是池子 + 仓储；migrations/001_init.sql 是六张表
                  （**迁移 SQL 是数据文件**，靠 Dockerfile 的 COPY packages 进镜像）
-  agent-core/    LLM 抽象与结构化输出、RAG、聚合算法、GitHub 客户端
+  agent-core/    LLM 抽象与结构化输出（含 pricing.py 的价格表）、RAG、
+                 state.py 图状态、risk.py 文件风险排序、
+                 aggregate/ 主 Agent 的聚合（fingerprint / confidence /
+                 decision / pipeline / render，**全确定性、零 LLM 调用**）
 web/             Vue 3 SPA
 infra/           postgres init（只有扩展，表由应用建）、redis conf、nginx conf、限流桩
 fixtures/        diff 样例、webhook payload、大 PR
@@ -519,15 +630,23 @@ API 不直接写 `review_tasks` —— 文件风险排序和规则检索由编�
 写在前面而不是藏在最后：一个未被说明的限制会被当成经验不足，一个被说明的限制
 则是严谨。
 
-- **没有东西往 `review_tasks` 里写。** Worker 的消费循环（M4）已经就绪 ——
-  手工投一条任务进 Redis，对应的容器会真的处理它、写库、再 ack（这也是集成测试
-  在做的事）。但投递方 `dispatch` 是 LangGraph 图的一环，要等 M5，所以
-  **一条完整的 run 现在还走不通**：Webhook 进来只会建一行 `review_runs`。
-  `python tasks.py kill-worker` 那个演示也因此还差一步（屏障闭合需要编排器）。
-- **`purge_older_than` 里清 checkpoint 的那一段还没有被真正执行过。**
-  LangGraph 的表要等 M5 的 `AsyncPostgresSaver` 才会出现，所以那条分支现在是
-  「表不存在 → 返回 0」。SQL 是按 LangGraph 的表结构写的，但**它在 M4 只是代码，
-  不是证据** —— M5 接上 checkpointer 之后要补一条测试。
+- **`publish` 节点现在不发任何东西。** GitHub 客户端是 M7 的交付物，所以
+  `publish.done` 事件里明写 `posted: false`，`review_runs.github_comment_id`
+  保持为空 —— **没有这个 id 的 run 就是没发过评论**，UI 不该显示「已评论」。
+  报告本身是完整的（正文已经在 `review_reports.comment_body` 里），
+  M7 只负责把它投出去。
+- **聚合只做指纹精确合并，还没有相似度聚类。** 两个 Worker 用不同措辞说同一处
+  问题、或者模型这次报第 10 行下次报第 12 行时，指纹不同 —— 而它们其实是同一件事。
+  那一步（并查集 + rapidfuzz，同 Worker 0.75 / 跨 Worker 0.55）是 M9。
+  指纹那一步**永远不会被替换掉**（它是并查集的快速路径），M9 加的是它后面的兜底。
+- **`conflicts` 恒为空。** 冲突消解（同路径 + 邻近行号 + 不同 Worker + 严重度差 ≥ 2）
+  和聚类一起排在 M9。前端要在空列表上正常工作。
+- **`WAIT_STRATEGY=poll` 一次只能推进一个 run。** 轮询期间整条消费协程被占住，
+  而 `interrupt` 之下 `ainvoke` 几十毫秒就返回了。这是逃生开关的已知代价，
+  不是缺陷 —— 但它意味着那个开关只适合兜底，不适合长期开着。
+- **窗口期内的 `worker.result` 事件可能排在 `aggregate.done` 之后。** Worker 写结果行
+  和写事件之间有微秒级的窗口，而图判断屏障读的是**数据库**。这个顺序不该被断言
+  （写了就是偶尔会红的测试），客户端也不该依赖它。
 - **数据量没有验证过。** 六张表的索引是按查询形状设计的（部分索引给超时扫描、
   复合主键给屏障查询），但整个 M4 阶段的数据都是个位数行。
   真实规模下的表现只有 M9 的评测集能回答。

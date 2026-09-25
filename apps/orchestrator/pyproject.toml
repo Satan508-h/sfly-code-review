@@ -7,6 +7,15 @@ dependencies = [
     "sfly-shared",
     "sfly-bus",
     "sfly-agent",
+    # 只用到 ``sfly_workers.specs`` 这一张数据表（每个 lane 的核心规则 id、
+    # 检索条数、负责的类目），用来在 plan 节点决定「给这个 Worker 送哪些规则」。
+    # **不导入 WorkerRunner** —— 派发和执行是两件事，编排器不该能顺手跑一次审查。
+    "sfly-workers",
+    # ``RunnableConfig``（图的 thread_id 配置的类型）来自这里。
+    # 它是 langgraph 的传递依赖 —— 而**直接 import 一个没声明的依赖**
+    # 正是这个项目在别处刻意避免的事（见 agent-core 里关于 httpx 的注释）：
+    # 版本一升级，import 会以一条与升级毫无关系的报错炸掉。
+    "langchain-core>=1.6",
     "langgraph>=1.2",
     "langgraph-checkpoint-postgres>=3.1",
 ]
@@ -15,6 +24,7 @@ dependencies = [
 sfly-shared = { workspace = true }
 sfly-bus = { workspace = true }
 sfly-agent = { workspace = true }
+sfly-workers = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

@@ -34,17 +34,22 @@
 apps/
   api/           FastAPI 网关：HMAC 校验、投递去重、runs 接口、SSE
   orchestrator/  LangGraph 图 + coordinator 协程 + 超时扫描器
+                 nodes/ 七个节点各一个文件；context.py 是节点拿依赖的唯一入口
+                 checkpointer.py **自己一个连接池**（autocommit，见下面那条）
   workers/       一套代码三种部署：python -m sfly_workers --spec {security|performance|style}
+                 pool.py 是消费循环本体（一个容器一条 lane，或一个进程三条协程）
   lite/          单事件循环，同时跑 API + GraphRunner + WorkerPool（Render 用）
 packages/
-  shared/        sfly_shared — 领域契约（contracts.py）、配置、ID 生成
+  shared/        sfly_shared — 领域契约（contracts.py）、配置、ID 生成、console 编码
   bus/           sfly_bus — TaskQueue / RunStore / Lock 协议 + 两种实现
                  （锁和队列放在一起：memory.py 有 InMemoryQueue + InMemoryLock，
                    redis_streams.py 有 RedisStreamsQueue + RedisLock；
                    postgres.py 有 PostgresPool + PostgresRunStore —— 仓储只有这一个实现）
                  migrations/ 纯 SQL 迁移 + 迁移器（001_init.sql 是六张表）
                  注意：迁移 SQL 是**数据文件**，Dockerfile 靠 `COPY packages` 带进镜像
-  agent-core/    sfly_agent — LLM 抽象与结构化输出、RAG、聚合算法、GitHub 客户端
+  agent-core/    sfly_agent — LLM 抽象与结构化输出（含 pricing.py）、RAG、
+                 state.py 图状态、risk.py 文件风险排序、labels.py 显示层标签、
+                 aggregate/ 主 Agent 的聚合（全确定性、零 LLM 调用）、GitHub 客户端
 web/             Vue 3 + Element Plus + Vite SPA
 infra/           postgres init.sql、redis.conf、nginx 配置、GitHub 限流桩
 fixtures/        diff 样例、webhook payload、大 PR fixture
@@ -68,7 +73,7 @@ reports/         评测报告，提交进仓库
 
 ## 不可违反的约定
 
-这五条每一条都对应一个具体的、已经想清楚的失败模式。改代码时如果发现自己在违反其中任何一条，先停下来问。
+每一条都对应一个具体的、已经想清楚的失败模式。改代码时如果发现自己在违反其中任何一条，先停下来问。
 
 ### 1. 投递顺序铁律：存 Postgres → XADD 结果 → XACK
 
@@ -112,7 +117,23 @@ Worker 放弃之前**必须先发一条 `status="failed"` 的 `WorkerResult` 再
 
 改动顺序永远是：先改 contracts.py → 跑 `pytest tests/unit/contracts` → 再改消费方。反过来做会产生静默的字段丢失，因为 Pydantic 默认忽略多余字段。
 
-### 6. `/healthz` 永不探测依赖
+### 6. 图节点必须幂等
+
+**LangGraph 恢复时会重新执行节点，这是正常路径不是异常路径。** ``wait`` 在
+``interrupt()`` 挂起后被唤醒时，整个函数会**从头重跑一遍**（这是 ``interrupt()``
+的语义，不是实现细节）。
+
+两个直接后果：
+
+* 节点里的每一次写入都要能重放。``create_run`` / ``set_plan`` / ``save_report``
+  本来就是幂等的（upsert）；``dispatch`` 会重复发消息，而它靠的是 Worker 那一侧的
+  ``exists_result`` 快路径 + ``worker_results`` 的主键 —— **不是靠在自己状态里记
+  一份「已派发」的账**（那份账在崩溃时同样会丢）。
+* ``wait`` 的屏障检查写成 ``while`` 循环：被唤醒 → 重新查库 → 闭合了就往下走、
+  没闭合就**再挂起一次**。写成 ``if`` 的话，一次提前唤醒（扫描器或重复唤醒）
+  就会带着不完整的屏障进 ``aggregate``。
+
+### 7. `/healthz` 永不探测依赖
 
 存活与就绪是**两个不同的接口**，判据必须不同：
 
@@ -196,6 +217,70 @@ Windows 默认的 `ProactorEventLoop` 不支持 `add_reader`，而 psycopg v3 �
    `SyntaxError: cannot insert multiple commands into a prepared statement`。
    所以 `run_migrations` 里的 `execute` 一律不带参数，带参数的语句单独发。
 
+**checkpointer 必须有自己的连接池 —— 不能复用 `PostgresPool`。**
+两个理由，第二个是硬的：
+
+1. 仓储的池是非 autocommit 的（每处写入都显式 `conn.transaction()`），
+   而 checkpointer 的写入路径是一串裸 `conn.execute()`，**它依赖连接的
+   autocommit**。给它非 autocommit 的连接，那些写入会停在一个永不提交的事务里：
+   图能跑、日志正常、状态读出来也对（同一个连接看得见自己的未提交数据），
+   **然后进程一重启，checkpoint 全没了**。
+2. `AsyncPostgresSaver.setup()` 里有 `CREATE INDEX CONCURRENTLY`，而 Postgres
+   **禁止**它出现在事务块里。就算解决了第 1 条，建表那一步也会直接报
+   `cannot run inside a transaction block`。
+
+所以 `checkpointer.py` 自己开一个池，参数照抄 LangGraph 的 `from_conn_string`
+（`autocommit=True, prepare_threshold=0, row_factory=dict_row`）。`prepare_threshold=0`
+是给 Neon 的连接池端点（pgbouncer，transaction 模式）准备的 —— 它不支持
+prepared statements，而报出来的错是 `prepared statement "s0" already exists`，
+看起来像并发 bug，其实是端点类型不对。
+
+**图状态里只放 JSON，不放 pydantic 对象。**
+实测：`JsonPlusSerializer`（checkpointer 的默认序列化器）确实能把 `FilePatch` / `Rule`
+存进去再读回来，**但每次读都会打印**
+「Deserializing unregistered type sfly_shared.contracts.FilePatch from checkpoint.
+This will be blocked in a future version」。要在将来继续可用，就得维护一份
+「允许的契约类型」白名单 —— 而那份清单一定会漂移（加个字段、引个新类型，
+忘了登记只会在运行时看到一行警告，而那是最容易被忽略的信号）。
+换成纯 JSON 之后这件事就不存在了，顺带让 `SELECT checkpoint FROM checkpoints`
+直接可读。代价是节点边界上要做一次 `model_validate` —— 显式的、看得见的成本。
+
+**「谁没上报」和「谁没产出可用结果」是两个问题。**
+M5 实测踩到：报告显示 `degraded=True` 而 `missing_workers=[]`，前端那个降级徽章
+找不到任何一个可以显示的名字。原因是 `aggregate` 按「谁不在 `worker_results` 里」
+算 missing —— 而 `wait` 会给超时的 Worker **补写 failed 结果**（约定 #2），
+所以 aggregate 跑的时候那个集合永远是空的。
+
+现在分开命名：`wait` 算的是 `deadline_missed`（屏障能否闭合，判据是「有没有结果」，
+失败也算），报告里的 `missing_workers` 算的是「有没有**可用**的结果」。
+
+**事件要由因果起点写。**
+`worker.result` 一开始是协调协程写的，实测会写出错误的顺序：协调协程和图是
+**并发的两条路径**，而图判断屏障读的是数据库 —— 所以「三条结果都在库里了、
+图已经 aggregate 完、协调协程才开始消费第一条消息」完全可能，时间线上于是出现
+`worker.result` 排在 `run.finished` 后面。那不是排序问题，是**写事件的人站错了
+位置**：这件事的因果起点是「Worker 写完了结果」，就该由 Worker 在那一刻记下来。
+
+**`publish` 先写状态、后写事件。**
+两次写库不可能原子，必然有一个窗口，而两种顺序的失败方向不一样：状态先写的话，
+崩在中间的表现是「run 读作已完成、时间线少了最后一条」—— 客户端等不到
+`run.finished` 就读一次状态，发现已经完成，是安全的失败方向。反过来会让 run
+永远停在 `aggregating`，而**没有任何东西能唤醒它**（`due_runs` 只看
+`dispatched`/`waiting`）。推论：**断言「run 到终态」之后不能立刻去读事件**，
+那两件事本来就没有先后保证。
+
+**`uv sync` 不加 `--all-packages` 会把 workspace 的包全部卸掉。**
+根 `pyproject.toml` 是 `package = false` 的虚拟工作区，所以裸 `uv sync` 只装
+根项目自己的 dev 依赖 —— 表现是「同步成功了，然后 `import pydantic` 报
+ModuleNotFoundError」，而 pydantic 是 `sfly-shared` 的依赖，跟着成员包一起被卸了。
+**一律用 `python tasks.py sync`**（它内部就是 `uv sync --all-packages`）。
+
+**`_Contract` 开了 `str_strip_whitespace=True`，它会吃掉首尾空白。**
+评论正文结尾那个换行在存进 jsonb 再读回来时消失，于是
+`finalize` 事件里的 `comment_chars` 和 `publish` 里的会差 1 —— 一个看起来像 bug
+却什么也不说明的差异。渲染时干脆不留：**让它一开始就等于最终形态**。
+写任何会被这个契约接住的字符串时，都要假设首尾空白不存在。
+
 **连接的行工厂会传染给每一个在它上面执行的 helper。**
 `PostgresPool` 的连接设了 `dict_row`（仓储里所有查询都按列名取值），于是任何
 拿这个连接执行 SQL 的辅助函数都会拿到 dict 而不是元组。M4 实测踩到：
@@ -248,6 +333,8 @@ python tasks.py logs -f    # 跟踪全部日志
 python tasks.py ps         # 各容器健康状态
 python tasks.py health     # 依赖真实连通性（探 /api/health，不是 /healthz）
 python tasks.py tables     # 看建了哪些表、迁移到第几版（M4 验收）
+python tasks.py review     # 端到端审查一条 diff：投递 → 三个 Worker → 报告（M5 验收）
+                           # 报告 JSON 走 stdout，时间线与摘要走 stderr
 
 python tasks.py test       # 单测（无 Docker、无密钥；Linux/CI 约 2s，Windows 约 16s）
 python tasks.py test-int   # 集成测试（需 Docker 里的 Redis + Postgres；Redis 用 db 15，
@@ -308,7 +395,7 @@ python tasks.py demo           # 端到端：投递 3 次同一 webhook → 1 ru
 - [x] M2 — 队列协议 + InMemoryQueue / InMemoryLock + 指纹 + 两后端的契约测试骨架
 - [x] M3 — RedisStreamsQueue（含 XAUTOCLAIM / 死信 / 重试计数）+ RedisLock + 契约跑真 Redis
 - [x] M4 — Postgres 六张表 + `PostgresRunStore` + 幂等 migrate + Worker 常驻消费循环
-- [ ] M5 — LangGraph 图（高风险：`interrupt()`）
+- [x] M5 — LangGraph 图（`interrupt()` 挂起/恢复）+ 协调协程 + 超时扫描器 + 主 Agent 聚合
 - [ ] M6 — FastAPI + SSE 带 Last-Event-ID 补齐
 - [ ] M7 — GitHub 客户端 + publish 节点
 - [ ] M8 — Vue SPA

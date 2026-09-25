@@ -1,6 +1,6 @@
 """Worker 常驻消费循环的端到端验证（M4）。
 
-**这个文件测的是 ``_process_one`` 里那三行的顺序** —— 它是 CLAUDE.md 约定 #1
+**这个文件测的是 ``process_one`` 里那三行的顺序** —— 它是 CLAUDE.md 约定 #1
 （投递顺序铁律）在代码里唯一出现的地方，而它的两个反例都是灾难：
 
 * 先 ``XADD`` 后写库 → 编排器被唤醒去读一个还不存在的结果，屏障检查失败
@@ -39,7 +39,7 @@ from sfly_shared.contracts import (
     WorkerType,
 )
 from sfly_shared.errors import SchemaUnrecoverableError, TransientError
-from sfly_workers.__main__ import _process_one
+from sfly_workers.pool import process_one
 from sfly_workers.runner import WorkerRunner
 from sfly_workers.specs import spec_for
 
@@ -193,16 +193,14 @@ async def test_the_worker_saves_then_publishes_then_acks(
     三件事都要发生，而且顺序固定：结果先在数据库里（编排器的屏障查的就是它）、
     再出现在 ``review_results``（唤醒编排器）、最后才离开 PEL（ack）。
 
-    顺序反过来的两种写法各自的后果写在 ``_process_one`` 的文档字符串里。
+    顺序反过来的两种写法各自的后果写在 ``process_one`` 的文档字符串里。
     这里能断言的是结果，不是顺序 —— 而结果的组合恰好只有一种写法能同时满足。
     """
     settings = _settings()
     handle, got = await _deliver(queue, store)
     llm = _CountingLLM(build_llm(settings, worker_types=(WorkerType.SECURITY,)))
 
-    await _process_one(
-        handle, got, runner=_runner(llm, settings), queue=queue, store=store, settings=settings
-    )
+    await process_one(handle, got, runner=_runner(llm, settings), queue=queue, store=store, settings=settings)
 
     # 1. 落库了 —— 而且 findings 逐条展开（Mock 是确定性扫描器，坏代码必有发现）
     results = await store.get_results(TASK_ID)
@@ -235,7 +233,7 @@ async def test_a_redelivered_message_does_not_call_the_llm_again(
     settings = _settings()
     handle, got = await _deliver(queue, store)
     first = _CountingLLM(build_llm(settings, worker_types=(WorkerType.SECURITY,)))
-    await _process_one(
+    await process_one(
         handle, got, runner=_runner(first, settings), queue=queue, store=store, settings=settings
     )
     assert first.calls == 1
@@ -245,7 +243,7 @@ async def test_a_redelivered_message_does_not_call_the_llm_again(
     second = _CountingLLM(build_llm(settings, worker_types=(WorkerType.SECURITY,)))
     handle2, got2 = await _next_task(queue)
 
-    await _process_one(
+    await process_one(
         handle2, got2, runner=_runner(second, settings), queue=queue, store=store, settings=settings
     )
 
@@ -271,7 +269,7 @@ async def test_a_crashed_review_still_writes_a_result(
     settings = _settings()
     handle, got = await _deliver(queue, store)
 
-    await _process_one(
+    await process_one(
         handle,
         got,
         runner=_runner(_RaisingLLM(TransientError("连接超时")), settings),
@@ -308,7 +306,7 @@ async def test_a_non_retryable_failure_lands_in_the_dead_letter(
     settings = _settings()
     handle, got = await _deliver(queue, store)
 
-    await _process_one(
+    await process_one(
         handle,
         got,
         runner=_runner(_RaisingLLM(SchemaUnrecoverableError("模型连坏三次")), settings),
@@ -349,7 +347,7 @@ async def test_a_store_failure_leaves_the_message_unacked(
     handle, got = await _deliver(queue, store)
 
     with pytest.raises(psycopg.OperationalError):
-        await _process_one(
+        await process_one(
             handle,
             got,
             runner=_runner(build_llm(settings, worker_types=(WorkerType.SECURITY,)), settings),
@@ -371,10 +369,10 @@ async def test_the_consumer_survives_a_store_failure_and_keeps_consuming(
     ``docker ps`` 显示 healthy，而 ``review_tasks`` 的 lag 一直涨 ——
     没有任何地方报错。所以 ``_consumer`` 必须逐条接住存储层异常并继续。
 
-    （业务错误在 ``_process_one`` 里就已经有自己的归宿了；能漏到这里的只有
+    （业务错误在 ``process_one`` 里就已经有自己的归宿了；能漏到这里的只有
     存储层故障。）
     """
-    from sfly_workers.__main__ import _consumer  # 局部导入：只有这条测试驱动整个循环
+    from sfly_workers.pool import consumer_loop  # 局部导入：只有这条测试驱动整个循环
 
     settings = _settings()
     handle, _ = await _deliver(queue, store)
@@ -387,7 +385,7 @@ async def test_the_consumer_survives_a_store_failure_and_keeps_consuming(
     await queue.publish_task(task(TASK_ID, file_patches=[_DIFF_PATCH]))
 
     consumer = asyncio.create_task(
-        _consumer(
+        consumer_loop(
             spec_for("security"),
             _runner(build_llm(settings, worker_types=(WorkerType.SECURITY,)), settings),
             queue=queue,

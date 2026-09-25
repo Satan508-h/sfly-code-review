@@ -22,7 +22,8 @@ import pytest
 
 from sfly_shared.config import Settings
 from sfly_shared.contracts import ErrorClass, WorkerResult, WorkerType
-from sfly_workers.__main__ import EXIT_BAD_INPUT, EXIT_FAILED, EXIT_OK, _should_dead_letter, main
+from sfly_workers.__main__ import EXIT_BAD_INPUT, EXIT_FAILED, EXIT_OK, main
+from sfly_workers.pool import should_dead_letter
 
 FIXTURES = Path(__file__).resolve().parents[3] / "fixtures"
 NOT_A_DIFF = "这是一段普通文字，不是 diff。"
@@ -345,8 +346,8 @@ def test_a_non_retryable_failure_goes_to_the_dead_letter_on_the_first_try() -> N
     settings = Settings(llm_provider="mock")
     handle = _Handle(attempt=1)
 
-    assert _should_dead_letter(_failed(ErrorClass.SCHEMA_UNRECOVERABLE), handle, settings) is True
-    assert _should_dead_letter(_failed(ErrorClass.AUTH_REVOKED), handle, settings) is True
+    assert should_dead_letter(_failed(ErrorClass.SCHEMA_UNRECOVERABLE), handle, settings) is True
+    assert should_dead_letter(_failed(ErrorClass.AUTH_REVOKED), handle, settings) is True
 
 
 @pytest.mark.unit
@@ -358,9 +359,9 @@ def test_a_transient_failure_is_retried_up_to_max_attempts() -> None:
     """
     settings = Settings(llm_provider="mock", max_attempts=3)
 
-    assert _should_dead_letter(_failed(ErrorClass.TRANSIENT), _Handle(1), settings) is False
-    assert _should_dead_letter(_failed(ErrorClass.TRANSIENT), _Handle(2), settings) is False
-    assert _should_dead_letter(_failed(ErrorClass.TRANSIENT), _Handle(3), settings) is True
+    assert should_dead_letter(_failed(ErrorClass.TRANSIENT), _Handle(1), settings) is False
+    assert should_dead_letter(_failed(ErrorClass.TRANSIENT), _Handle(2), settings) is False
+    assert should_dead_letter(_failed(ErrorClass.TRANSIENT), _Handle(3), settings) is True
 
 
 @pytest.mark.unit
@@ -369,4 +370,4 @@ def test_a_successful_result_never_goes_to_the_dead_letter() -> None:
     settings = Settings(llm_provider="mock")
     ok = WorkerResult(task_id="01JTESTRUN0000000000000000", worker_type=WorkerType.SECURITY)
 
-    assert _should_dead_letter(ok, _Handle(attempt=9), settings) is False
+    assert should_dead_letter(ok, _Handle(attempt=9), settings) is False

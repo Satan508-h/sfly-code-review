@@ -15,8 +15,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
+from sfly_agent.diff import parse_unified_diff
 from sfly_shared.contracts import (
     AggregatedFinding,
     BootstrapMessage,
@@ -37,6 +39,27 @@ from sfly_shared.contracts import (
 #: 默认的 run id。用 ULID 的字面形态（26 位 Crockford base32），
 #: 因为 ``list_runs`` 的排序依赖它的字典序 == 时间序（见 sfly_shared/ids.py）。
 DEFAULT_TASK_ID = "01JTESTRUN0000000000000000"
+
+#: 仓库根下的 ``fixtures/``。**从 fixtures 里读而不是在这里手写一份 diff**：
+#: 手写的那份一定会和 CLI 用的那份分叉，而分叉的后果是
+#: 「测试里 Mock 报 12 条、命令行上只报 2 条」这种要查半天的不一致。
+FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
+
+#: 演示用的 diff。它被三个地方共用：``sfly_workers --diff``、
+#: ``sfly_orchestrator --diff``、以及这里的图测试。
+DEMO_DIFF = "security_demo.diff"
+
+
+def demo_patches(name: str = DEMO_DIFF, *, max_patch_chars: int = 8_000) -> list[FilePatch]:
+    """``fixtures/`` 里那份真实 diff 解析出来的补丁。
+
+    **不要用 ``bootstrap()`` 的默认补丁跑图测试或消费循环测试**：
+    那是三行的玩具补丁（``@@ -1 +1 @@``），Mock 是确定性的规则扫描器，
+    在它上面什么都不会报 —— 于是测试会在「零发现」那条路径上通过，
+    而它要验证的东西一条也没验证到。M4 就是被这个坑掉的。
+    """
+    text = (FIXTURES_DIR / name).read_text(encoding="utf-8")
+    return parse_unified_diff(text, max_patch_chars=max_patch_chars).patches
 
 
 def bootstrap(**over: Any) -> BootstrapMessage:
