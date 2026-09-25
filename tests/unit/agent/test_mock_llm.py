@@ -16,10 +16,10 @@ from typing import Any
 
 import pytest
 
-from sfly_agent.diff import parse_unified_diff
 from sfly_agent.llm.mock import FAILURE_MODES, MockLLM, _inject_failure
 from sfly_agent.prompt import build_system_prompt, build_user_prompt
 from sfly_shared.contracts import FilePatch, Rule, WorkerType
+from sfly_shared.diff import parse_unified_diff
 from sfly_workers.specs import SECURITY, spec_for
 
 FIXTURES = Path(__file__).resolve().parents[3] / "fixtures"

@@ -60,6 +60,40 @@ class RunStatus(StrEnum):
     SKIPPED = "skipped"
 
 
+#: run 的终态。到了这里就**没有任何东西需要被唤醒**了，图的消费协程会直接
+#: 丢弃这条 bootstrap，SSE 也可以收流了。
+#:
+#: ``publish_failed`` 也在里面：那是一次失败的**投递**，报告已经落库，
+#: 由「重新发布」入口处理，不该再让图跑一遍。
+#:
+#: 放在契约层而不是编排层，是因为**它有三个消费方**：图（要不要跑）、
+#: 协调协程（要不要唤醒）、SSE（要不要收流）。三处各写一份的话，
+#: 加一个新状态时漏改一处的症状是「事件流永远不结束」或者「图被反复唤醒」。
+TERMINAL_STATUSES: frozenset[RunStatus] = frozenset(
+    {
+        RunStatus.PUBLISHED,
+        RunStatus.PUBLISH_FAILED,
+        RunStatus.FAILED,
+        RunStatus.SKIPPED,
+    }
+)
+
+
+class DeliveryStatus(StrEnum):
+    """一次 webhook 投递的处置结果。见 ``migrations/002_webhook_deliveries.sql``。
+
+    ``RECEIVED`` 是**唯一可以被接管的状态**：它表示「记了账、还没干完」，
+    所以下一次重投会重新处理它。其余四个都是终态，重投只会如实报告
+    「这条投递之前已经处理过了」。
+    """
+
+    RECEIVED = "received"
+    ACCEPTED = "accepted"
+    DUPLICATE = "duplicate"
+    IGNORED = "ignored"
+    REJECTED = "rejected"
+
+
 class ErrorClass(StrEnum):
     """错误分类决定重试策略。不可重试的类别直接进死信，不浪费三次尝试。"""
 
@@ -697,6 +731,29 @@ class RunRow(_Contract):
     degraded: bool = False
     totals: RunTotals | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class DeliveryRow(_Contract):
+    """``webhook_deliveries`` 表的一行 —— 一次 webhook 投递的账。
+
+    **这是 API 侧唯一的持久化写入。** 它不建 run（那是编排层 ``ingest`` 的事），
+    所以这张表里的 ``task_id`` 是「这次投递转给了谁」，可空、也不加外键。
+    """
+
+    delivery_id: str
+    event: str = ""
+    repo_id: str = ""
+    pr_number: int | None = None
+    status: DeliveryStatus = DeliveryStatus.RECEIVED
+    task_id: str | None = None
+    reason: str | None = None
+    received_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    finished_at: datetime | None = None
+
+    @property
+    def is_settled(self) -> bool:
+        """已经了结了吗。未了结的投递可以被下一次重投接管。"""
+        return self.status is not DeliveryStatus.RECEIVED
 
 
 # --------------------------------------------------------------------------- #

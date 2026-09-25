@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from sfly_agent.diff import (
+from sfly_shared.diff import (
     TRUNCATION_MARKER,
     detect_language,
     iter_added_lines,

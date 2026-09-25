@@ -25,6 +25,7 @@ from sfly_bus.migrations import (
 )
 from sfly_bus.postgres import migrate_on_startup
 from sfly_shared.contracts import (
+    DeliveryStatus,
     ErrorClass,
     ResultStatus,
     RunStatus,
@@ -153,11 +154,27 @@ _CHECKED_ENUMS: dict[tuple[str, str], type[StrEnum]] = {
     ("worker_results", "error_class"): ErrorClass,
     ("findings", "worker_type"): WorkerType,
     ("findings", "severity"): Severity,
+    ("webhook_deliveries", "status"): DeliveryStatus,
 }
 
 
 def _enum_values(enum: type[StrEnum]) -> set[str]:
     return {member.value for member in enum}
+
+
+def _all_check_constraints() -> dict[tuple[str, str], set[str]]:
+    """**全部**迁移文件里的 CHECK 约束。
+
+    一开始这里写的是 ``(MIGRATIONS_DIR / "001_init.sql").read_text(...)`` ——
+    在只有一个迁移文件时那是对的，而 M6 加了 ``002_webhook_deliveries.sql``
+    之后它就悄悄失效了：新表上的 ``CHECK (status IN (...))`` 根本不在扫描范围里，
+    于是这条「每条约束都必须被对照过」的测试**对第二个文件之后的约束完全无效**,
+    而它看起来一切正常。改成读全部文件。
+    """
+    found: dict[tuple[str, str], set[str]] = {}
+    for migration in load_migrations():
+        found.update(_check_constraints(migration.sql))
+    return found
 
 
 def test_every_check_constraint_in_the_sql_is_covered() -> None:
@@ -168,7 +185,7 @@ def test_every_check_constraint_in_the_sql_is_covered() -> None:
     之后安静地拒绝一条本该合法的写入（而错误信息是
     ``violates check constraint``，不会告诉你是哪个枚举漏了）。
     """
-    found = set(_check_constraints((MIGRATIONS_DIR / "001_init.sql").read_text(encoding="utf-8")))
+    found = set(_all_check_constraints())
 
     assert found == set(_CHECKED_ENUMS), (
         "SQL 里的 CHECK 约束和 _CHECKED_ENUMS 对不上。\n"
@@ -189,8 +206,7 @@ def test_a_check_constraint_matches_its_enum(table: str, column: str, enum: type
     * 多了一个值（SQL 里留着已删掉的状态）→ 库接受一个代码不认识的状态，
       而 ``RunStatus(...)`` 在**读**的时候才会炸，离写入点很远
     """
-    sql = (MIGRATIONS_DIR / "001_init.sql").read_text(encoding="utf-8")
-    constraints = _check_constraints(sql)
+    constraints = _all_check_constraints()
 
     assert (table, column) in constraints
     assert constraints[(table, column)] == _enum_values(enum)

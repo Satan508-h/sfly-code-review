@@ -1,9 +1,24 @@
 """Unified diff 解析 —— 把一份 patch 变成 ``FilePatch`` 列表。
 
-两个消费者共用这里的扫描逻辑，所以它必须放在两边都能 import 的地方：
+### 它为什么在 ``sfly_shared`` 而不在 ``sfly_agent``
 
-* 编排层的 ``ingest`` 节点（M5）：把 webhook 载荷里的 patch 变成结构化文件列表
-* Mock LLM（M1）：它得真的「读」diff，才知道某段代码落在新文件的第几行
+**因为它有四个消费方，而其中一个不该为此拖进整个 LLM 栈。**
+
+* API 网关（M6）：把 webhook 载荷里的 patch 变成结构化文件列表
+* 编排层的 ``plan`` 节点：按风险排序、截断
+* Worker 与它的 ``--diff`` CLI：审之前要知道哪些行是变更行
+* Mock LLM：它得真的「读」diff，才知道某段代码落在新文件的第几行
+
+它原本住在 ``sfly_agent.diff``，直到 M6 在**容器里**才暴露：网关 import 它会
+``ModuleNotFoundError: No module named 'sfly_agent'``（api 的依赖里没有
+agent-core，也不该有 —— 那是 LLM/RAG/聚合的包）。修法有两条：给网关加上
+agent-core 依赖（它的镜像会因此多出 rapidfuzz / rank_bm25 / LLM 客户端，
+而网关一行都用不到），或者把这个模块搬到两边都能 import 的地方。
+第二条是它对的位置 —— 它只依赖 ``contracts.FilePatch`` 和标准库。
+
+> 本地跑得好好的、容器里才炸，是因为开发机上的 venv 装了**全部** workspace 包
+> （``uv sync --all-packages``），于是「网关能不能 import 到 agent-core」
+> 这个约束在本地根本不存在。这正是容器验收不能省的原因。
 
 **``changed_lines`` 是整个项目的地基。** GitHub 会 422 拒绝锚定在未变更行上的
 inline 评论，所以「这条 finding 的行号是否落在变更行上」必须在 Worker 侧就算清楚 ——

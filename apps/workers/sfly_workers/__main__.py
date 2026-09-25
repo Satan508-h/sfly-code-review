@@ -25,7 +25,6 @@ import asyncio
 import sys
 from pathlib import Path
 
-from sfly_agent.diff import DiffParseResult, parse_unified_diff
 from sfly_agent.labels import SEVERITY_LABEL, STATUS_LABEL
 from sfly_agent.labels import worker_label as worker_label_of
 from sfly_agent.llm.base import LLMProvider
@@ -45,6 +44,7 @@ from sfly_shared.contracts import (
     Severity,
     WorkerResult,
 )
+from sfly_shared.diff import DiffParseResult, parse_unified_diff
 from sfly_shared.heartbeat import run_service
 from sfly_shared.ids import new_task_id
 from sfly_shared.logging import get_logger, setup_logging

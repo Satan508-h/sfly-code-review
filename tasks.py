@@ -10,7 +10,7 @@
     python tasks.py test-int    集成测试：同一份队列契约对着真 Redis + Postgres 再跑一遍
     python tasks.py tables      看数据库建了哪些表、迁移到第几版（M4 验收）
     python tasks.py demo-reclaim 队列容错演示：副本猝死 → 回收 → 重投（不需要全栈）
-    python tasks.py demo        端到端演示：投递 3 次 webhook
+    python tasks.py demo        端到端演示：同一份 webhook 投 3 次 → 1 个 run
     python tasks.py scale 3     把 worker-security 扩到 3 个副本
     python tasks.py kill-worker 杀掉一个 Worker，验证容错
 """
@@ -476,14 +476,27 @@ def cmd_review(args: argparse.Namespace) -> None:
 
 
 def cmd_demo(args: argparse.Namespace) -> None:
-    """端到端演示。M6 会实现 scripts/replay_webhook.py。"""
+    """M6 的端到端验收：同一份 webhook 投 3 次 → 1 个 run + 2 次 duplicate。
+
+    它**不需要全栈**：只要求 api 起着（`python tasks.py up` 会连编排器和三个
+    Worker 一起起，但这两条命令的差别只影响「报告多久出来」，
+    不影响「产生几个 run」—— 后者由 API 和数据库唯一约束决定）。
+    `--follow` 才会跟到 run 结束，那一步需要编排器和 Worker。
+    """
     script = ROOT / "scripts" / "replay_webhook.py"
-    if not script.exists():
-        _die(
-            "scripts/replay_webhook.py 还不存在 —— 它是 M6 的交付物。\n"
-            "  Step 0 阶段请先验证：python tasks.py health"
-        )
-    run([_py(), str(script), "--times", str(args.times)])
+    cmd = [_py(), str(script), "--times", str(args.times)]
+    if args.follow:
+        cmd.append("--follow")
+    if args.drop_after:
+        cmd += ["--drop-after", str(args.drop_after)]
+    if args.new_delivery:
+        cmd.append("--new-delivery")
+    result = run(cmd, check=False)
+    if result.returncode != 0:
+        # 脚本自己已经打印了 [!!] 那一行说明差在哪，这里只负责把退出码
+        # 变成一条能读的话 —— 直接抛 "exit 1" 会让它看起来像环境问题。
+        _die("演示不符合预期：3 次投递应当产生 1 个 run + 2 次 duplicate")
+    _ok("演示通过：同一份 webhook 投 3 次，只产生 1 个 run")
 
 
 def cmd_web_dev(_: argparse.Namespace) -> None:
@@ -640,7 +653,23 @@ def build_parser() -> argparse.ArgumentParser:
     add("fmt", cmd_fmt, "自动格式化")
     add("typecheck", cmd_typecheck, "mypy 类型检查")
 
-    add("demo", cmd_demo, "端到端演示（M6：replay_webhook）", [(("--times",), {"type": int, "default": 1})])
+    add(
+        "demo",
+        cmd_demo,
+        "端到端演示：同一份 webhook 投 3 次 → 1 个 run + 2 次 duplicate（M6 验收）",
+        [
+            (("--times",), {"type": int, "default": 3, "help": "投递次数（默认 3）"}),
+            (("--follow",), {"action": "store_true", "help": "跟 SSE 时间线到 run 结束"}),
+            (
+                ("--drop-after",),
+                {"type": int, "default": 0, "metavar": "N", "help": "收到 N 条事件后断线重连，验证无缺口"},
+            ),
+            (
+                ("--new-delivery",),
+                {"action": "store_true", "help": "每次换 delivery id：演示第二层去重（幂等键）"},
+            ),
+        ],
+    )
     add(
         "review",
         cmd_review,

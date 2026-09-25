@@ -21,10 +21,16 @@ import time
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Annotated, Any
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+# get_deps 住在 deps.py（不是这里）—— 路由要 Depends 它，而它们由本模块 import，
+# 放在这里就成了循环导入。``as get_deps`` 是**显式再导出**（写成一个名字
+# 只是为了绕开 mypy 的 no_implicit_reexport），单测一直是
+# ``from sfly_api.main import get_deps``，那条路径不该因为搬家而断。
+from sfly_api.deps import get_deps as get_deps
+from sfly_api.routes import events, runs, webhook
 from sfly_bus.factory import Dependencies, open_dependencies
 from sfly_bus.postgres import migrate_on_startup
 from sfly_shared.config import get_settings
@@ -38,22 +44,6 @@ log = get_logger(__name__)
 
 _started_at = time.time()
 _heartbeat = Heartbeat()
-
-
-def get_deps(request: Request) -> Dependencies | None:
-    """取本进程的依赖句柄。由 ``lifespan`` 写入 ``app.state.deps``。
-
-    做成 FastAPI 依赖（而不是路由里直接 ``request.app.state.deps``）是为了
-    **给单测一个干净的替换点**：``app.dependency_overrides[get_deps] = ...``
-    就能让健康接口的测试不需要真的连 Postgres / Redis。
-
-    没有它的话，这个测试只有两条路：要么起 TestClient 时跑 lifespan 去连
-    真实依赖（单测从此需要 Docker，违背「< 10 秒、无外部依赖」的分层约定），
-    要么在测试里手改 ``app.state``（可行，但那是绕过接口而不是使用接口，
-    重构时会静默失效）。
-    """
-    deps: Dependencies | None = getattr(request.app.state, "deps", None)
-    return deps
 
 
 @asynccontextmanager
@@ -167,18 +157,23 @@ def create_app() -> FastAPI:
                 "llm_provider": s.llm_provider,
                 "wait_strategy": s.wait_strategy,
                 "conflict_resolver": s.conflict_resolver,
+                # **只回显配没配，不回显密钥本身。** webhook 不验签这件事必须
+                # 在一个能看见的地方 —— 否则它就是「本地一直好好的，上线第一天
+                # 被人刷爆了额度」那种发现问题的方式。
+                "webhook_secret": "configured" if s.github_webhook_secret else "missing",
             },
             **report.as_dict(),
         }
         return JSONResponse(payload, status_code=200 if report.ok else 503)
 
     # --------------------------------------------------------------------- #
-    # 业务路由（M6 实现）
+    # 业务路由
     # --------------------------------------------------------------------- #
-    # from sfly_api.routes import events, runs, webhook
-    # app.include_router(webhook.router, prefix="/api")
-    # app.include_router(runs.router,    prefix="/api")
-    # app.include_router(events.router,  prefix="/api")
+    # 全部挂在 /api 下：nginx 做的是直通代理（不改路径），所以本地和线上
+    # 用的是同一套 URL，前端只需要换 VITE_API_BASE 的值。
+    app.include_router(webhook.router, prefix="/api")
+    app.include_router(runs.router, prefix="/api")
+    app.include_router(events.router, prefix="/api")
 
     return app
 

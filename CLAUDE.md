@@ -33,6 +33,10 @@
 ```
 apps/
   api/           FastAPI 网关：HMAC 校验、投递去重、runs 接口、SSE
+                 webhook.py 签名（**签发与校验只此一份**，回放脚本 import 它）
+                 github_payload.py 载荷 → BootstrapMessage（纯函数，不碰网络/数据库）
+                 sse.py 收流条件；routes/{webhook,runs,events}.py；deps.py 注入点
+                 **它不建 run** —— run 的生命周期属于编排器（见 routes/runs.py）
   orchestrator/  LangGraph 图 + coordinator 协程 + 超时扫描器
                  nodes/ 七个节点各一个文件；context.py 是节点拿依赖的唯一入口
                  checkpointer.py **自己一个连接池**（autocommit，见下面那条）
@@ -40,12 +44,14 @@ apps/
                  pool.py 是消费循环本体（一个容器一条 lane，或一个进程三条协程）
   lite/          单事件循环，同时跑 API + GraphRunner + WorkerPool（Render 用）
 packages/
-  shared/        sfly_shared — 领域契约（contracts.py）、配置、ID 生成、console 编码
+  shared/        sfly_shared — 领域契约（contracts.py）、配置、ID 生成、console 编码、
+                 **diff.py**（unified diff 解析 —— 网关/编排器/Worker 三处共用，
+                 所以它在这里。放在 agent-core 会让网关拖进整个 LLM 栈）
   bus/           sfly_bus — TaskQueue / RunStore / Lock 协议 + 两种实现
                  （锁和队列放在一起：memory.py 有 InMemoryQueue + InMemoryLock，
                    redis_streams.py 有 RedisStreamsQueue + RedisLock；
                    postgres.py 有 PostgresPool + PostgresRunStore —— 仓储只有这一个实现）
-                 migrations/ 纯 SQL 迁移 + 迁移器（001_init.sql 是六张表）
+                 migrations/ 纯 SQL 迁移 + 迁移器（001 六张业务表、002 webhook 投递账本）
                  注意：迁移 SQL 是**数据文件**，Dockerfile 靠 `COPY packages` 带进镜像
   agent-core/    sfly_agent — LLM 抽象与结构化输出（含 pricing.py）、RAG、
                  state.py 图状态、risk.py 文件风险排序、labels.py 显示层标签、
@@ -65,7 +71,8 @@ reports/         评测报告，提交进仓库
 在下面加一条测试，四个文件同时受益；而**放宽某一条断言就等于毁掉证据**，
 所以契约里只准用 Protocol 上的方法（见该文件开头的三条纪律）。
 
-**数据流**：`review_bootstrap → review_tasks → review_results → dead_letter`
+**数据流**：`webhook → webhook_deliveries（账本）→ review_bootstrap → review_tasks
+→ review_results → dead_letter`
 
 注意 API **不直接写 `review_tasks`**。它只写 `review_bootstrap`；文件风险排序和规则检索由编排层的 `plan` 节点负责。Worker 收到的 `TaskMessage` 已经带上检索好的规则，所以 Worker 保持无状态且不需要 RAG 依赖。
 
@@ -145,6 +152,18 @@ Worker 放弃之前**必须先发一条 `status="failed"` 的 `WorkerResult` 再
 合成一个接口就必然二选一：要么在数据库抖动时重启一堆无辜的容器（而 `restart: unless-stopped` 会让它们进入退避循环，日志被重启信息冲掉），要么让负载均衡把流量送进一个干不了活的服务。
 
 新增任何依赖时，探测**只加到 `/api/health`**。容器 healthcheck 用的是心跳文件（`/tmp/sfly-heartbeat`）和 HTTP 存活探针，都不该知道数据库的存在。
+
+### 8. 未认证的输入永不写库
+
+`POST /api/webhook` 上，**验签和「拿到 delivery id」都必须在第一次写库之前**。
+
+理由不是「脏数据不好看」，而是**去重机制会被反过来当攻击面用**：任何人都能用
+**未来的** delivery id 投一条垃圾载荷提前占位，于是真实的投递到达时被判成重复、
+**永久丢掉**。而丢掉的表现是「GitHub 显示 200，那个 PR 没被审」—— 查不出任何东西。
+
+同一个坑的另一面：**投递失败时不结算那条投递，而是释放它**。账本记的是
+**处置结果**，而那次处置没有发生。留一行永远停在 `received` 的记录，
+下一次排查时会被读成「处理过但没结果」—— 一个查不下去的状态。
 
 ---
 
@@ -261,6 +280,55 @@ M5 实测踩到：报告显示 `degraded=True` 而 `missing_workers=[]`，前端
 `worker.result` 排在 `run.finished` 后面。那不是排序问题，是**写事件的人站错了
 位置**：这件事的因果起点是「Worker 写完了结果」，就该由 Worker 在那一刻记下来。
 
+**验签必须对原始字节做，不对重新序列化后的 JSON 做。**
+`sha256=HMAC(secret, raw_body)`。先 `json.loads` 再 `json.dumps` 回去验签，
+键顺序/空白/非 ASCII 转义都可能变，于是 HMAC 一定对不上 —— 而症状是
+「密钥明明配对了却验不过」，排查会先跑偏到密钥上。所以路由里先
+`await request.body()` 拿字节、再解析。同一件事的另一面：
+`hexdigest` 与 `sha256=hexdigest` 混用，症状一模一样。
+（`sfly_api/webhook.py` 的 `sign` 返回**带前缀的完整头部值**就是为了这个。）
+
+**「正在处理」和「死在中途」只能靠时间区分，不能靠状态。**
+两条撞上同一条没结算的投递记录时，可能是「另一个请求此刻正在处理它」
+（绝不能重复投递），也可能是「上一次处理到一半就崩了」（必须接管，
+否则那个 PR 永远不会被审）—— 而它们的**状态一模一样**（都是 `received`）。
+唯一的区别是时间：一次处理只有几次 IO（毫秒级），崩溃留下的是一个
+**再也不会动**的时间戳。所以有 `INFLIGHT_WINDOW_S`（60 秒）。
+这条是被集成测试逼出来的：并发投同一个 delivery id 时，5 个请求里有 4 个
+「接管」并各自投了一条 bootstrap —— **5 条消息**。
+
+**`docker compose` 只把 `env_file` / `environment:` 里的变量传进容器。**
+命令行前面写的 `FOO=bar docker compose up -d api` **不会**让容器看到 `FOO`
+（那只用于 compose 文件里的 `${FOO}` 插值）。M6 验收「配了密钥之后真的会拒绝
+错误签名」时踩到过：那次实验什么也没验证，却看起来通过了 —— 因为服务端
+根本没读到那个密钥。**验证配置类功能的实验，要先确认配置真的进去了**
+（`/api/health` 的 `config` 回显就是干这个的）。
+
+**本地 venv 装了全部 workspace 包，所以「缺依赖」在本地测不出来。**
+`uv sync --all-packages` 让 `import sfly_agent` 在开发机上永远成功，
+而 `apps/api/pyproject.toml` 里根本没有那个依赖 —— 容器里才发现
+`ModuleNotFoundError: No module named 'sfly_agent'`。
+`docker compose up` 的容器验收因此不是「顺手跑一遍」，它是唯一能发现这类问题的
+路径。（顺带一条：一个模块该住在哪个包，判据是**它的消费者有没有权利依赖那个包**。
+`diff.py` 因为网关也要用，从 `sfly_agent` 搬到了 `sfly_shared` ——
+网关不该为了解析 diff 拖进 rapidfuzz / rank_bm25 / LLM 客户端。）
+
+**`run_events.seq` 是**全表**自增，同一个 run 的 seq 会跳。**
+它只保证「同一条 run 内递增」，中间那些号属于别的 run（同一张表上并行跑着多个
+run 是常态）。所以**不能断言 `[1,2,3]` 这种连续性** —— 要验证「断线重连没有缺口」，
+只能拿 SSR 收到的那批 seq 和 `GET /api/runs/{id}` 返回的全量 seq 对比
+（`scripts/replay_webhook.py --drop-after` 就是这么做的）。
+另外它也不是「事件序号」：任何按 seq 推断事件条数的代码都是错的。
+
+**SSE 收流必须留宽限期（终态之后再等 5 秒）。**
+`publish` 先写状态、后写事件，两步之间有真实的窗口 —— 一看到终态就收流，
+客户端会**永远看不到最后那条 `run.finished`**，而且看起来完全正常
+（它只是没再收到东西）。同一条规则的另外三处：
+「断言 run 到终态之后不能立刻去读事件」（见下面 `publish` 那条）、
+SSE 的 `id` 必须是 `seq`（它是 `Last-Event-ID` 的唯一来源）、
+以及 run 不存在时要回 **404 而不是空流**（404 和空流的区别就是
+「重试」和「永远等下去」的区别）。
+
 **`publish` 先写状态、后写事件。**
 两次写库不可能原子，必然有一个窗口，而两种顺序的失败方向不一样：状态先写的话，
 崩在中间的表现是「run 读作已完成、时间线少了最后一条」—— 客户端等不到
@@ -335,6 +403,8 @@ python tasks.py health     # 依赖真实连通性（探 /api/health，不是 /h
 python tasks.py tables     # 看建了哪些表、迁移到第几版（M4 验收）
 python tasks.py review     # 端到端审查一条 diff：投递 → 三个 Worker → 报告（M5 验收）
                            # 报告 JSON 走 stdout，时间线与摘要走 stderr
+python tasks.py demo       # 同一份 webhook 投 3 次 → 1 run + 2 duplicate（M6 验收）
+                           # 加 --follow --drop-after 3 会断开重连，验证 SSE 无缺口
 
 python tasks.py test       # 单测（无 Docker、无密钥；Linux/CI 约 2s，Windows 约 16s）
 python tasks.py test-int   # 集成测试（需 Docker 里的 Redis + Postgres；Redis 用 db 15，
@@ -362,7 +432,7 @@ python -m sfly_workers --spec security --diff fixtures/security_demo.diff
 # 分布式能力验证（这几条就是项目要证明的东西）
 python tasks.py scale 3        # --scale worker-security=3，三个副本竞争消费
 python tasks.py kill-worker    # 杀掉一个 Worker：run 仍应跑完并显示降级徽章
-python tasks.py demo           # 端到端：投递 3 次同一 webhook → 1 run + 2 duplicate
+python tasks.py demo --follow --drop-after 3   # 断开重连，SSE 无缺口
 ```
 
 **依赖管理**：改动任何 `pyproject.toml` 之后必须 `python tasks.py lock` 并提交
@@ -396,7 +466,7 @@ python tasks.py demo           # 端到端：投递 3 次同一 webhook → 1 ru
 - [x] M3 — RedisStreamsQueue（含 XAUTOCLAIM / 死信 / 重试计数）+ RedisLock + 契约跑真 Redis
 - [x] M4 — Postgres 六张表 + `PostgresRunStore` + 幂等 migrate + Worker 常驻消费循环
 - [x] M5 — LangGraph 图（`interrupt()` 挂起/恢复）+ 协调协程 + 超时扫描器 + 主 Agent 聚合
-- [ ] M6 — FastAPI + SSE 带 Last-Event-ID 补齐
+- [x] M6 — FastAPI 网关（HMAC 验签 + 两层去重）+ runs 接口 + SSE 带 Last-Event-ID 补齐
 - [ ] M7 — GitHub 客户端 + publish 节点
 - [ ] M8 — Vue SPA
 - [ ] M9 — 聚合硬化 + 评测集

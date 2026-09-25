@@ -15,7 +15,6 @@ from pathlib import Path
 
 import pytest
 
-from sfly_agent.diff import parse_unified_diff
 from sfly_agent.llm.base import LLMProvider, LLMResponse
 from sfly_shared.config import Settings
 from sfly_shared.contracts import (
@@ -27,6 +26,7 @@ from sfly_shared.contracts import (
     Severity,
     WorkerType,
 )
+from sfly_shared.diff import parse_unified_diff
 from sfly_shared.errors import LlmTimeoutError
 from sfly_workers.runner import WorkerRunner, reconcile_findings
 from sfly_workers.specs import spec_for

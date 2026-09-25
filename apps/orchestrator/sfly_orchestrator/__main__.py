@@ -34,7 +34,6 @@ from typing import Any
 
 from langgraph.graph.state import CompiledStateGraph
 
-from sfly_agent.diff import parse_unified_diff
 from sfly_agent.labels import SEVERITY_LABEL, SEVERITY_ORDER, STATUS_LABEL, worker_label
 from sfly_agent.state import ReviewState
 from sfly_bus.base import TaskQueue
@@ -44,12 +43,13 @@ from sfly_orchestrator.checkpointer import open_checkpointer, setup_on_startup
 from sfly_orchestrator.context import NodeContext
 from sfly_orchestrator.coordinator import Coordinator
 from sfly_orchestrator.graph import NODES, build_graph
-from sfly_orchestrator.runner import TERMINAL_STATUSES, GraphRunner
+from sfly_orchestrator.runner import GraphRunner
 from sfly_orchestrator.sweeper import Sweeper
 from sfly_shared.aio import run
 from sfly_shared.config import Settings, get_settings
 from sfly_shared.console import configure_streams
 from sfly_shared.contracts import (
+    TERMINAL_STATUSES,
     BootstrapMessage,
     ReviewReport,
     RunEvent,
@@ -57,6 +57,7 @@ from sfly_shared.contracts import (
     RunStatus,
     idempotency_key_for,
 )
+from sfly_shared.diff import parse_unified_diff
 from sfly_shared.heartbeat import run_service
 from sfly_shared.ids import new_id, new_task_id
 from sfly_shared.logging import get_logger, setup_logging

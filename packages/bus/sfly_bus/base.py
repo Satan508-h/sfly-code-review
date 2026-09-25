@@ -28,11 +28,14 @@ from typing import Any, Protocol, runtime_checkable
 
 from sfly_shared.contracts import (
     BootstrapMessage,
+    DeliveryRow,
+    DeliveryStatus,
     ErrorClass,
     ReviewReport,
     RunEvent,
     RunRow,
     RunStatus,
+    RunTotals,
     TaskMessage,
     WorkerResult,
     WorkerType,
@@ -356,6 +359,15 @@ class RunStore(Protocol):
         """``plan`` 节点写回。``deadline_at`` 一旦落库，超时扫描器就开始管这个 run。"""
         ...
 
+    async def set_decision(self, task_id: str, *, block_merge: bool, totals: RunTotals) -> None:
+        """把最终决定与成本汇总写回 run 行。
+
+        和 ``save_report`` 分开：报告是**产物**（jsonb，评测和重新发布要用），
+        这两列是**索引**（运行列表直接读，不解 jsonb）。合成一次写入的话，
+        列表页就会被绑在报告的结构上。
+        """
+        ...
+
     async def due_runs(self, now: datetime) -> list[RunRow]:
         """扫出已过 ``deadline_at`` 但仍在 ``DISPATCHED``/``WAITING`` 的 run。
 
@@ -421,6 +433,58 @@ class RunStore(Protocol):
     async def events_since(self, task_id: str, after_seq: int) -> list[RunEvent]: ...
 
     async def list_runs(self, limit: int = 50, offset: int = 0) -> list[RunRow]: ...
+
+    # -- webhook 投递 ------------------------------------------------------ #
+
+    async def record_delivery(
+        self,
+        delivery_id: str,
+        *,
+        event: str,
+        repo_id: str = "",
+        pr_number: int | None = None,
+    ) -> bool:
+        """认领一次 webhook 投递。**首次返回 True，已经见过返回 False。**
+
+        判据必须是主键冲突（``INSERT ... ON CONFLICT DO NOTHING``），不是先查后写：
+        并发投递同一个 delivery id 时，先查后写两边都会读到「不存在」，
+        然后两条都往下走。
+
+        .. note::
+           「已经见过」不等于「已经处理完」。要求调用方在冲突时再读一次
+           :meth:`get_delivery` —— 停在 ``RECEIVED`` 的那条是**可以接管的**
+           （进程在记账之后、干活之前崩了）。只认主键不看状态的话，
+           一次崩溃就能让那批投递被永久当成重复。
+        """
+        ...
+
+    async def get_delivery(self, delivery_id: str) -> DeliveryRow | None: ...
+
+    async def list_deliveries(self, limit: int = 50) -> list[DeliveryRow]: ...
+
+    async def release_delivery(self, delivery_id: str) -> None:
+        """撤销一次还没结算的认领，让这次投递可以被重新处理。
+
+        「干了活但没干成」的路径要用它：账本记的是**处置结果**，
+        而那次处置没有发生。留一行停在 ``RECEIVED`` 的记录，
+        下一次排查时会被读成「处理过但没结果」—— 一个查不下去的状态。
+        """
+        ...
+
+    async def finish_delivery(
+        self,
+        delivery_id: str,
+        status: DeliveryStatus,
+        *,
+        task_id: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """回填这次投递的处置结果。
+
+        **没有回填的投递可以被下一次重投接管** —— 这是 ``received`` 存在的全部理由。
+        所以这个方法只在「事情真的做完/决定了」之后调，不要在中间调。
+        """
+        ...
 
     # -- 成本 -------------------------------------------------------------- #
 

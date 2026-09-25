@@ -43,6 +43,7 @@ EXPECTED_TABLES = {
     "review_reports",
     "run_events",
     "llm_calls",
+    "webhook_deliveries",
     "schema_version",
 }
 
@@ -71,7 +72,11 @@ async def test_migrate_is_idempotent(store: PostgresRunStore, raw_pg: psycopg.Co
 
     rows = raw_pg.execute("SELECT version FROM schema_version ORDER BY version").fetchall()
     assert [r[0] for r in rows] == [m.version for m in load_migrations()]
-    assert raw_pg.execute("SELECT count(*) FROM schema_version").fetchone() == (1,)
+    # 条数 == 迁移文件数。写死成 1 的话，加第二个迁移文件时这条断言会红，
+    # 而那正是它该做的事 —— 但红的理由要说清楚是「文件数对不上」，
+    # 所以这里直接和 load_migrations() 比。
+    count = raw_pg.execute("SELECT count(*) FROM schema_version").fetchone()
+    assert count == (len(load_migrations()),)
 
 
 async def test_five_processes_migrating_at_once_create_one_schema() -> None:
@@ -102,7 +107,7 @@ async def test_five_processes_migrating_at_once_create_one_schema() -> None:
 
     assert table_names() == EXPECTED_TABLES
     with psycopg.connect(postgres_test_dsn()) as conn:
-        assert conn.execute("SELECT count(*) FROM schema_version").fetchone() == (1,)
+        assert conn.execute("SELECT count(*) FROM schema_version").fetchone() == (len(load_migrations()),)
 
 
 async def test_a_changed_migration_file_is_refused(
@@ -156,10 +161,14 @@ async def test_a_failing_migration_leaves_no_trace(store: PostgresRunStore) -> N
     await store.migrate()
     before = table_names()
 
+    # 版本号取「现有迁移数 + 1」而不是写死 2：**写死的话，加一个真实的迁移文件
+    # 就会让这条测试变成「版本号重复」，而它要测的东西（事务回滚）根本没跑到。**
+    # 路径同理 —— 它必须是一个不存在的文件名，不然会和真实迁移撞上。
+    next_version = len(load_migrations()) + 1
     half_applied = Migration(
-        version=2,
+        version=next_version,
         name="deliberately_broken",
-        path=MIGRATIONS_DIR / "002_deliberately_broken.sql",
+        path=MIGRATIONS_DIR / f"{next_version:03d}_deliberately_broken.sql",
         sql="CREATE TABLE should_not_survive (x int);\nINSERT INTO no_such_table VALUES (1);",
         checksum="not-compared-because-it-was-never-applied",
     )
@@ -170,7 +179,7 @@ async def test_a_failing_migration_leaves_no_trace(store: PostgresRunStore) -> N
 
     assert table_names() == before, "失败的那条语句之前的 CREATE TABLE 也必须回滚掉"
     with psycopg.connect(postgres_test_dsn()) as conn:
-        assert conn.execute("SELECT count(*) FROM schema_version").fetchone() == (1,)
+        assert conn.execute("SELECT count(*) FROM schema_version").fetchone() == (len(load_migrations()),)
 
 
 def test_the_migrations_directory_is_reachable_from_the_installed_package() -> None:

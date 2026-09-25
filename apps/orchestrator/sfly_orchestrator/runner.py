@@ -51,23 +51,14 @@ from sfly_orchestrator.context import NodeContext
 from sfly_orchestrator.graph import thread_config
 from sfly_orchestrator.nodes.wait import WAKE_REASON
 from sfly_shared.config import Settings, get_settings
-from sfly_shared.contracts import BootstrapMessage, RunStatus
+from sfly_shared.contracts import TERMINAL_STATUSES, BootstrapMessage, RunStatus
 from sfly_shared.logging import bind_task, get_logger
 
 log = get_logger(__name__)
 
-#: run 的终态。到了这里就**没有任何东西需要被唤醒**了。
-#:
-#: ``publish_failed`` 也在里面：那是一次失败的**投递**，报告已经落库，
-#: M7 之后由「重新发布」按钮处理，不该再让图跑一遍。
-TERMINAL_STATUSES: frozenset[RunStatus] = frozenset(
-    {
-        RunStatus.PUBLISHED,
-        RunStatus.PUBLISH_FAILED,
-        RunStatus.FAILED,
-        RunStatus.SKIPPED,
-    }
-)
+# ``TERMINAL_STATUSES`` 现在住在 ``sfly_shared.contracts`` —— 它有三个消费方
+# （图、协调协程、SSE 收流），放在编排层会让 API 为了一个 frozenset 去 import
+# 整个 langgraph 栈。见那边的注释。
 
 #: 唤醒选举锁的 TTL。见 :func:`wake_graph` —— 它只需要覆盖一次 ``ainvoke``，
 #: 而那次调用里除了 ``wait`` 的屏障查询就是几条写库，正常在秒级。

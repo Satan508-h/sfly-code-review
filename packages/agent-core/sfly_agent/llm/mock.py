@@ -29,9 +29,9 @@ from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from sfly_agent.diff import DiffLine, iter_added_lines, iter_diff_lines
 from sfly_agent.llm.base import LLMResponse, estimate_tokens
 from sfly_shared.contracts import Finding, Severity, WorkerType, stable_hash
+from sfly_shared.diff import DiffLine, iter_added_lines, iter_diff_lines
 from sfly_shared.logging import get_logger
 
 log = get_logger(__name__)

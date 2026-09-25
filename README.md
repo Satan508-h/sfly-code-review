@@ -14,36 +14,55 @@
 
 ## 当前状态
 
-**M5 已完成**：LangGraph 图（七个节点）跑通了，`wait` 节点的 `interrupt()` 真的会
-挂起、真的能恢复，编排层有了协调协程和超时扫描器，主 Agent 的聚合（去重 / 置信度
-重算 / 阻断决策 / 评论渲染）**全确定性、零 LLM 调用**。验收是一条命令：
+**M6 已完成**：GitHub webhook 入口（HMAC 验签 + 两层去重）、runs 接口、
+SSE 时间线（带 `Last-Event-ID` 补齐）。验收是一条命令 —— **同一份 webhook
+投 3 次，只产生 1 个 run**：
 
 ```bash
-python tasks.py review
+python tasks.py demo
 ```
 
 ```text
-── 时间线（12 条事件）─────────────────────────
-  #23  run.created         files=4 head_sha=fb7353185e1b-… pr_number=1
-  #24  node.finished       node=plan planned_workers=['security','performance','style'] rules=8
-  #25  worker.dispatched   worker_type=security message_id=1790341750660-0
-  #30  worker.result       worker_type=style findings=4 status=ok
-  #31  aggregate.done      findings=14 suppressed=2 degraded=False tokens=6216
-  #32  node.finished       node=finalize decision_reason=secrets_found
-  #33  publish.done        posted=False reason=github_client_not_implemented
-  #34  run.finished        status=published duration_ms=49
+  载荷 fixtures/webhook_pr.json
+  地址 http://localhost:8000/api/webhook
+  签名 未配置密钥（服务端只在 full 模式下放行）
+  投递 3 次
 
-── 审查结果 ─────────────────────────────────────────
-  状态       published
-  结论       🔴 建议修改后再合并（secrets_found）
-  发现       14 条：严重 4 · 高危 5 · 中危 3 · 低危 2
-             另有 2 条置信度不足，只入库不发布
+  -> #1  HTTP 202  accepted  已投递，审查 4 个文件
+  == #2  HTTP 200  duplicate 这次投递之前已经处理过（accepted）
+  == #3  HTTP 200  duplicate 这次投递之前已经处理过（accepted）
 
-  [严重]    app/db.py:17  sqli  置信度 60%  来自 安全
-          SQL 语句用字符串拼接/格式化构造，用户输入可直接改写查询语义
+  去重发生在 投递层（同一个 delivery id）
+  accepted 1  duplicate 2  涉及的 run 1 个
+  run: 01M3CE0H74GSPS8H3JFPZPSJMQ
+
+[OK] 3 次投递 -> 1 个 run + 2 次 duplicate
 ```
 
-报告 JSON 走 stdout（`python tasks.py review | jq` 直接用），时间线和中文摘要走 stderr。
+加上 `--follow` 就能看到这条 run 的完整时间线，`--drop-after 3` 会在第 3 条
+事件后**主动断开**再用 `Last-Event-ID` 重连 —— 断线前后无缺口、无重复：
+
+```bash
+python tasks.py demo --follow --drop-after 3
+```
+
+```text
+  时间线（SSE http://localhost:8000/api/runs/01M3CEFMMZN4TH3CGF7PNCQPKQ/events）
+  #131  run.created        files=4 repo_id=demo/sfly-playground head_sha=fb7353185e1b5e877575a95c8dd… pr_title=重构用户接口并加上备份入口
+  #132  node.finished      node=plan deadline_at=2026-09-25T14:21:06.540797+… files_total=4 diff_truncated=False
+  #133  worker.dispatched  files=4 rules=8 message_id=1790345466547-0 worker_type=security
+  -- 模拟断线：收到 3 条后主动断开 --
+  #134  worker.dispatched  files=4 rules=8 message_id=1790345466549-0 worker_type=performance
+  #135  worker.dispatched  files=4 rules=8 message_id=1790345466552-0 worker_type=style
+  #136  worker.result      status=ok findings=10 latency_ms=1 worker_type=security
+  #137  worker.result      status=ok findings=2 latency_ms=1 worker_type=performance
+  #139  aggregate.done     tokens=6132 cost_usd=0.0 degraded=False findings=14
+  #140  node.finished      node=finalize block_merge=True comment_chars=3113 decision_reason=secrets_found
+  #142  run.finished       status=published cost_usd=0.0 degraded=False findings=14
+
+  SSE 收到 12 条，详情接口 12 条
+[OK] 断线前后无缺口、无重复
+```
 
 下面按里程碑倒序排列，最近完成的在最前。
 
@@ -116,7 +135,120 @@ CI 就只能一律当成失败。
 
 容器内跑同一份 fixture 得到**逐字节相同**的输出（证明规则库随镜像正确分发）。
 
-373 个单测 + 59 个集成测试通过；ruff + mypy strict（含 tests）全绿。
+**当前总数：520 个单测 + 77 个集成测试**通过；ruff + mypy strict（含 tests）全绿。
+（M1 完成时是 373 + 59，之后每个里程碑都在往上加。）
+
+### M6 已完成：webhook 入口 / 两层去重 / SSE 断线补齐
+
+| 接口 | 用途 |
+|---|---|
+| `POST /api/webhook` | GitHub 唯一的入口。验签 → 认领投递 → 构造 bootstrap → 投递 |
+| `GET /api/runs?limit=&offset=` | 运行列表（按 `task_id` 倒序 = 时间倒序，ULID 自带时间戳） |
+| `GET /api/runs/{task_id}` | 状态 + 报告 + **完整时间线**（首屏一次拿全，不必再开流） |
+| `GET /api/runs/{task_id}/events` | SSE。带 `Last-Event-ID` 重连时**从表里补齐缺口** |
+| `GET /api/deliveries` | 投递账本：「我的 PR 为什么没被审」的第一个查询 |
+
+#### 去重是两层，而且两层防的不是同一件事
+
+| 层 | 机制 | 防的是 |
+|---|---|---|
+| 投递层 | `webhook_deliveries.delivery_id` 主键 | GitHub **超时重投**同一个 webhook（重投时 `X-GitHub-Delivery` 这个 GUID **不变**） |
+| run 层 | `review_runs.idempotency_key` 唯一约束 | 不同的投递、**同一个提交** —— 比如 `push` 和 `pull_request` 两个事件同时到达 |
+
+只做第一层的话，「两个事件、一个提交」会审两遍、留两条评论、花两份钱。
+只做第二层的话，重投的那三次会各自走到 `create_run` 才被吸收掉 ——
+结果对，但白跑了几圈。**两层都要有，而且第二层才是正确性保证**
+（第一层只是省一次查询）。
+
+`webhook_deliveries` 还有个别的表都没有的状态：`received` —— 认领了但没结算完。
+它是唯一**可以被下一次重投接管**的状态，也是「记账了但没干成」唯一能被救回来的
+路径（见下面那个 INFLIGHT 窗口）。
+
+#### 验签必须对**原始字节**做
+
+`sha256=HMAC(secret, raw_body)`，不是对 `json.dumps(parsed)` 做。
+重新序列化会改变键顺序、空白、非 ASCII 的转义方式，于是 HMAC 必然对不上 ——
+而症状是「密钥明明配对了却验不过」，排查会先跑偏到密钥上。所以路由里先
+`await request.body()` 拿到字节、再解析，`sfly_api/webhook.py` 里有一条
+专门的单测钉住这件事（三种「看起来一样」的重建方式，字节都不同）。
+
+另外两条：**验签必须在任何写库之前**（未认证的请求能写库的话，任何人都能用
+**未来的** delivery id 提前占位，让真实投递到达时被判成重复而永久丢掉 ——
+那是把去重机制反过来当攻击面用）；`hmac.compare_digest` 而不是 `==`
+（后者在第一个不同的字节上返回）。
+
+密钥没配时会怎样，见下表 —— 这是**默认状态**（这个项目的默认是零密钥跑通全链路）：
+
+| `GITHUB_WEBHOOK_SECRET` | `MODE=full`（本地 compose） | `MODE=lite`（Render，公网） |
+|---|---|---|
+| 配了 | 必须验签，401 拒绝 | 必须验签，401 拒绝 |
+| 没配 | **放行**，每个请求记一条 warning，`/api/health` 回显 `webhook_secret: missing` | **503 拒绝** |
+
+用 `mode` 而不是新加一个开关，是因为它恰好就是「这个进程有没有暴露在公网」的
+代理变量 —— 多一个开关就多一个配错的机会，而配错的方向是「看起来配了、实际没验」。
+lite 模式的防线是访问密钥和每日成本上限，而那是**花钱**的闸、不是**身份**的闸。
+
+#### 每一步的顺序都有理由，而且错了不会报错
+
+```
+1. 验签          不碰数据库
+2. 解析 JSON      不碰数据库
+3. 认领投递       第一次写库
+4. 查重 → XADD    第二次写库
+5. 结算投递
+```
+
+* **认领在干活之前**：并发到达的两条同 id 投递，都想「先查有没有、没有就写」，
+  于是两条都读到「没有」。主键冲突是唯一能在这里定胜负的东西。
+* **结算在最后**：中途崩掉时那一行停在 `received`，而 `received` 可以被下一次
+  重投接管。
+* **队列不可用时释放认领**（而不是留着 `received`）：账本记的是**处置结果**，
+  而那次处置没有发生。释放之后重投就是一次全新的认领，不需要等窗口。
+
+#### 「正在处理」和「死在中途」只能靠时间区分
+
+撞上一条没结算的记录时有两种可能，而正确处置正好相反：**另一个请求此刻正在
+处理它**（不能重复投递），或者**上一次处理到一半就没了**（必须接管，否则那个
+PR 永远不会被审）。区分它们的唯一依据是时间 —— 一次处理只有几次 IO
+（毫秒级），而崩溃留下的是一个**再也不会动**的时间戳。窗口是 60 秒
+（`INFLIGHT_WINDOW_S`）。
+
+这一条是被集成测试逼出来的：并发投同一个 delivery id 时，
+5 个请求里有 4 个撞上主键冲突、看到 `received`，于是「接管」并各自投了一条
+bootstrap —— **5 条消息**。只认状态不看时间的实现在这里一定会错。
+
+#### SSE：表是权威来源，流只是快路径
+
+不是「推送」，而是**一个带游标的轮询循环，把结果按 SSE 的格式吐出去** ——
+`seq > after_seq` 这一条 SQL 同时是实时推送和断线补齐的实现，于是两者不可能不一致。
+（代价是最坏 1 秒延迟；对一条要跑十几秒的审查来说是噪音级的。）
+
+三件必须做对的事：
+
+* **`id` 必须是 `seq`**。它是重连时 `Last-Event-ID` 的来源，也就是唯一的游标。
+  用别的东西（时间戳、随机数）当 id，重连会从错误的位置继续，而那种错误
+  **只在断线时**才出现。
+* **终态之后还要再等 5 秒**（`TERMINAL_GRACE_S`）。`publish` 是先写状态、后写
+  事件的，两步之间有真实的窗口 —— 立刻收流会让客户端**永远看不到最后那条
+  `run.finished`**，而且看起来完全正常（客户端只是没再收到东西）。
+* **首屏要重试到 200 再开流**。run 是**编排器**建的，不是 API 建的，
+  所以投递成功之后有一小段窗口里它还不存在。404 和空流的区别就是
+  「重试」和「永远等下去」的区别。
+
+客户端那边有一条必须知道：**收到 `run.finished` 要自己 `es.close()`** ——
+EventSource 在服务端关流后会**自动重连**（这是规范行为），于是变成
+「连上 → 没有新事件 → 收流 → 再连上」的循环。SSE 协议里没有「别连了」这个信号，
+所以这件事只能由客户端做。
+
+#### 过程中改掉的东西
+
+| 现象 | 真因 |
+|---|---|
+| 并发投同一个 delivery id，5 个请求投出 **5 条 bootstrap** | 「正在处理」和「死在中途」只认状态是分不开的，见上面那一节。加了 `INFLIGHT_WINDOW_S` 之后是 1 条 |
+| 载荷不是合法 JSON 时，**账本里什么都没有** | 记账发生在解析**之后**，而结算一个还不存在的行是 `UPDATE ... 0 rows` —— 不报错、不生效。现在是「先认领再结算」，且只在认领成功时才结算（重复到达的坏载荷不能把一条已了结的记录翻成 `rejected`） |
+| 容器里 `ModuleNotFoundError: No module named 'sfly_agent'` | 网关 import 了 `sfly_agent.diff` 来解析补丁，而 api 的依赖里没有 agent-core（也不该有 —— 那是 LLM/RAG/聚合的包）。**本地永远测不出来**：开发机上的 venv 装了全部 workspace 包。修法是把 `diff.py` 搬到 `sfly_shared`（它只依赖 `contracts.FilePatch` 和标准库）—— 于是网关不再拖进 rapidfuzz / rank_bm25 / LLM 客户端 |
+| `GITHUB_WEBHOOK_SECRET=xxx docker compose up -d api` 之后仍然不验签 | **compose 只把 `env_file` / `environment:` 里的变量传进容器**，命令行前面那个环境变量只用于 compose 文件的 `${VAR}` 插值。所以那次「验证」什么也没验证 —— 是手工改 `.env` 才测出真结果的 |
+| run 的 `block_merge` 和 `totals` 一直是 null | `finalize` 只写了 `review_reports`（jsonb），没写 `review_runs` 上那两列。运行列表要显示「阻断 / 参考」和花了多少钱，而它不该为了两个值去解每一行的 jsonb。补了 `set_decision()` |
 
 ### M5 已完成：LangGraph 图 / 断点恢复 / 主 Agent 聚合
 
@@ -501,7 +633,7 @@ DeepSeek 走 OpenAI 兼容接口，所以换成 OpenAI、vLLM 或本地模型只
 | **两种拓扑共用一套代码** | `python tasks.py test` + `python tasks.py test-int` | **同一份**契约（`tests/contracts/queue_contract.py`）在内存后端与真 Redis 上各跑一遍 —— 14 条 + 6 条，一条都没有为哪一端放宽。集成层还会在真 Postgres 上跑仓储/迁移/消费循环 |
 | 依赖真实可达 | `python tasks.py health` | Postgres / Redis 的**版本号**与毫秒延迟，不是照抄配置 |
 | 依赖挂了不误伤 | `docker pause sfly-postgres-1` | `/healthz` 仍 200、容器仍 healthy、`/api/health` 503；`docker unpause` 后自动恢复 |
-| **表是应用建出来的** | `python tasks.py tables` | 六张业务表 + `schema_version`（第 1 版已应用）。空库上也能建 —— 每个容器启动时都跑一遍幂等 `migrate()` |
+| **表是应用建出来的** | `python tasks.py tables` | 七张业务表 + `schema_version`（第 1、2 版都已应用）。空库上也能建 —— 每个容器启动时都跑一遍幂等 `migrate()` |
 | **副本猝死，同伴接手** | `python tasks.py demo-reclaim` | 4 条任务被两个副本瓜分 → 一个副本中途消失 → PEL 里留下 1 条没人认领的记录 → `reclaim()` 抢回 → 重投的 `attempt` 是 2（不需要全栈，只要一个 Redis） |
 | Worker 水平扩展 | `python tasks.py scale 3` | `worker-security` 变成 3 个副本，**同一个消费者组里三个消费者在竞争**（常驻循环 M4 已就绪，`XINFO CONSUMERS` 数得出来） |
 | **Worker 真的在写库** | `docker compose logs worker-security \| grep worker.consuming` | 每个副本报出消费者组、并发数、回收间隔；收到任务时按「存库 → 发结果 → ack」处理（集成测试逐条验证这个顺序） |
@@ -510,7 +642,11 @@ DeepSeek 走 OpenAI 兼容接口，所以换成 OpenAI、vLLM 或本地模型只
 | **断点恢复靠一条 SQL** | `RUN_DEADLINE_S=10 python tasks.py review`（不启动 Worker） | 15 秒内扫描器捞出这个 run 并唤醒，`wait` 走超时分支给三个掉队的 Worker 各补一条 failed 结果，报告带降级徽章 |
 | 幂等：同一份 diff 只审一次 | `python tasks.py review --replay` | 复用同一个 run（幂等键 = `repo:pr:head_sha`），打印上一次的报告而不是重新审查 |
 | Worker 猝死不影响结果 | `python tasks.py kill-worker` | run 照样跑完并显示降级徽章（M5 起屏障能被编排器闭合了） |
-| Webhook 幂等 | 同一 payload 连投 3 次 | 1 个 run + 2 个 `duplicate` 响应 |
+| **Webhook 幂等（投递层）** | `python tasks.py demo` | 同一份 payload 投 3 次 → 1 个 run + 2 个 `duplicate`，队列上**只有一条** bootstrap |
+| **Webhook 幂等（run 层）** | `python tasks.py demo --new-delivery` | 每次换一个 delivery id，但提交没变 → 还是 1 个 run。这一层由 `review_runs.idempotency_key` 的唯一约束兜住 |
+| **断线无缺口** | `python tasks.py demo --follow --drop-after 3` | 收到 3 条后主动断开，用 `Last-Event-ID` 重连补齐剩下的 9 条；脚本会拿详情接口对一遍，缺一条就报 `[!!]` |
+| **未验签的请求写不进库** | 配好 `GITHUB_WEBHOOK_SECRET` 后用错密钥投一次 | 401，且 `GET /api/deliveries` 里**不会**多出一行 |
+| 投递账本 | `GET /api/deliveries` | 每条投递的结局：`accepted` / `duplicate` / `ignored` / `rejected`，以及它转给了哪个 run |
 | 断点恢复 | `docker restart sfly-orchestrator-1` | 从 Postgres 的 checkpoint 续跑，不重复发评论 |
 | Redis 重启不丢任务 | `docker restart sfly-redis` | 扫描器按 `attempt+1` 重派，消息排空 |
 | Postgres 不可达不丢结果 | `docker pause sfly-postgres` | 消息堆在 PEL 里；`unpause` 后排空（证明「先落库再 ack」的顺序，集成测试里有一条专门钉它） |
@@ -592,6 +728,9 @@ LLM 裁判会引入非确定性，直接毁掉评测的可复现性。四条规�
 ```
 apps/
   api/           FastAPI 网关：HMAC 校验、投递去重、runs 接口、SSE
+                 webhook.py 签名（签发与校验只此一份，回放脚本 import 它）
+                 github_payload.py 载荷 → BootstrapMessage（纯函数）
+                 sse.py 收流条件；routes/ 四组路由；deps.py 依赖注入点
   orchestrator/  graph.py 装配图；nodes/ 七个节点各一个文件
                  runner.py 消费 bootstrap；coordinator.py 屏障 + 唤醒
                  sweeper.py 超时扫描；checkpointer.py **自己一个连接池**
@@ -601,17 +740,20 @@ apps/
   lite/          单事件循环，一个进程跑完整个系统（Render 用）
 packages/
   shared/        领域契约、配置、ID、日志、异常、console（编码）
+                 diff.py unified diff 解析 —— **网关、编排器、Worker 三处共用**，
+                 所以它在这里而不在 agent-core（否则网关要拖进整个 LLM 栈）
   bus/           TaskQueue / RunStore / Lock 协议 + 两种实现
-                 postgres.py 里是池子 + 仓储；migrations/001_init.sql 是六张表
-                 （**迁移 SQL 是数据文件**，靠 Dockerfile 的 COPY packages 进镜像）
+                 postgres.py 里是池子 + 仓储；migrations/*.sql 是全部表结构
+                 （001 六张业务表、002 webhook 投递账本；
+                 **迁移 SQL 是数据文件**，靠 Dockerfile 的 COPY packages 进镜像）
   agent-core/    LLM 抽象与结构化输出（含 pricing.py 的价格表）、RAG、
                  state.py 图状态、risk.py 文件风险排序、
                  aggregate/ 主 Agent 的聚合（fingerprint / confidence /
                  decision / pipeline / render，**全确定性、零 LLM 调用**）
 web/             Vue 3 SPA
 infra/           postgres init（只有扩展，表由应用建）、redis conf、nginx conf、限流桩
-fixtures/        diff 样例、webhook payload、大 PR
-scripts/         运维与演示脚本
+fixtures/        diff 样例、录制的 webhook 载荷（含 /pulls/{n}/files 的响应）、大 PR
+scripts/        运维与演示脚本（replay_webhook.py 是 M6 的验收工具）
 tests/           contracts/（两个后端共用的行为契约，被 unit 与 integration 同时继承）
                  factories.py（领域对象工厂，三层测试共用同一批形状）
                  unit / integration / e2e / eval
@@ -635,6 +777,23 @@ API 不直接写 `review_tasks` —— 文件风险排序和规则检索由编�
   保持为空 —— **没有这个 id 的 run 就是没发过评论**，UI 不该显示「已评论」。
   报告本身是完整的（正文已经在 `review_reports.comment_body` 里），
   M7 只负责把它投出去。
+- **webhook 载荷里的补丁是「录制」的，不是实时取的。** GitHub 的 `pull_request`
+  事件**不带任何代码**，要拿补丁得再调一次 `GET /repos/{owner}/{repo}/pulls/{n}/files`
+  —— 那是 M7 的客户端。所以 `fixtures/webhook_pr.json` 里有一个 `files` 字段，
+  内容是那次 API 调用的录制结果（GitHub 的原始响应形状），
+  `scripts/replay_webhook.py` 回放的就是它。M7 的真实客户端会把 API 响应喂给
+  **同一个转换函数**，所以这两条路径不会分叉。**推论：现在没有任何东西验证过
+  「真实 GitHub 发来的载荷长什么样」** —— 这是 M7 要回答的第一个问题。
+- **SSE 是轮询（1 秒）而不是推送。** 换来的好处是实时与补齐共用同一条
+  `seq > after_seq` 查询，两者不可能不一致。真要更低延迟，`LISTEN/NOTIFY`
+  只该用来**提前唤醒**这个循环，而不是取代它。
+- **`INFLIGHT_WINDOW_S`（60 秒）是猜的。** 它的取值区间很宽（远大于处理耗时、
+  远小于人的反应时间），但真实负载下「一次投递处理多久」没有量过。
+  窗口内崩溃 + 立刻重投的组合下，那次投递会被当成「正在处理」，
+  需要等窗口过去再投一次 —— 这个代价是明确的，只是没有实测过。
+- **投递账本会无限增长。** `webhook_deliveries` 没有清理策略（
+  `purge_older_than` 现在只管 checkpoint / run_events / llm_calls）。
+  每次 push 都是一行，真实仓库上它比 run 表增长得快得多。
 - **聚合只做指纹精确合并，还没有相似度聚类。** 两个 Worker 用不同措辞说同一处
   问题、或者模型这次报第 10 行下次报第 12 行时，指纹不同 —— 而它们其实是同一件事。
   那一步（并查集 + rapidfuzz，同 Worker 0.75 / 跨 Worker 0.55）是 M9。
@@ -647,7 +806,7 @@ API 不直接写 `review_tasks` —— 文件风险排序和规则检索由编�
 - **窗口期内的 `worker.result` 事件可能排在 `aggregate.done` 之后。** Worker 写结果行
   和写事件之间有微秒级的窗口，而图判断屏障读的是**数据库**。这个顺序不该被断言
   （写了就是偶尔会红的测试），客户端也不该依赖它。
-- **数据量没有验证过。** 六张表的索引是按查询形状设计的（部分索引给超时扫描、
+- **数据量没有验证过。** 七张业务表的索引是按查询形状设计的（部分索引给超时扫描、
   复合主键给屏障查询），但整个 M4 阶段的数据都是个位数行。
   真实规模下的表现只有 M9 的评测集能回答。
 - **GitHub 真实二级限流只能用桩模拟。** `infra/github/stub_server.py` 模拟

@@ -46,6 +46,7 @@ BUSINESS_TABLES: tuple[str, ...] = (
     "review_reports",
     "run_events",
     "llm_calls",
+    "webhook_deliveries",
 )
 
 #: 迁移器的记账表。**不参与清空** —— 清了就等于假装这个库没建过表，

@@ -33,6 +33,9 @@ async def finalize(state: ReviewState, ctx: NodeContext) -> dict[str, Any]:
     report = ReviewReport.model_validate(state["report"])
     report = finalize_run(report)
     await ctx.store.save_report(report)
+    # 决定与成本**另写一份到 run 行**：运行列表要显示「阻断 / 供参考」和花了多少钱，
+    # 而它不该为了这两个值去解每一行的报告 jsonb。见 ``set_decision`` 的说明。
+    await ctx.store.set_decision(report.task_id, block_merge=report.block_merge, totals=report.totals)
 
     await ctx.emit(
         state["task_id"],

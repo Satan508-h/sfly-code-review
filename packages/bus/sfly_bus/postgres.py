@@ -46,6 +46,8 @@ from sfly_bus.health import CheckResult, down, ok
 from sfly_bus.migrations import MigrationDriftError, run_migrations
 from sfly_shared.contracts import (
     BootstrapMessage,
+    DeliveryRow,
+    DeliveryStatus,
     ErrorClass,
     Finding,
     ResultStatus,
@@ -417,6 +419,28 @@ class PostgresRunStore:
             if cur.rowcount == 0:
                 log.warning("store.set_plan_missing_run", task_id=task_id)
 
+    async def set_decision(self, task_id: str, *, block_merge: bool, totals: RunTotals) -> None:
+        """写回最终决定与成本汇总。
+
+        这两列在 ``review_runs`` 上（而不是只存在 ``review_reports`` 的 jsonb 里），
+        是因为**运行列表要显示它们**：列表页不该为了显示一次成本去解每一行的
+        jsonb。列注释里写着「``block_merge`` 可空 = 还没做决定，与 ``false``
+        （决定了不阻断）是两件不同的事」—— 这个方法就是让那句话成立的地方。
+
+        幂等（重放安全）：同样的入参重复写得到同样的结果。
+        """
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(
+                """
+                    UPDATE review_runs
+                       SET block_merge = %s, totals = %s, updated_at = now()
+                     WHERE task_id = %s
+                    """,
+                [block_merge, Jsonb(totals.model_dump(mode="json")), task_id],
+            )
+            if cur.rowcount == 0:
+                log.warning("store.set_decision_missing_run", task_id=task_id)
+
     async def due_runs(self, now: datetime) -> list[RunRow]:
         """过期的、还在等屏障的 run。走 ``review_runs_due_idx`` 那个部分索引。
 
@@ -558,6 +582,97 @@ class PostgresRunStore:
                 [task_id, str(worker_type)],
             )
             return await cur.fetchone() is not None
+
+    # -- webhook 投递 ------------------------------------------------------ #
+
+    async def record_delivery(
+        self,
+        delivery_id: str,
+        *,
+        event: str,
+        repo_id: str = "",
+        pr_number: int | None = None,
+    ) -> bool:
+        """认领一次投递。**首次 True，已经见过 False。**
+
+        为什么是 ``DO NOTHING`` 而 ``create_run`` 用的是 ``DO UPDATE``（空更新）：
+        两者的需求正好相反。``create_run`` 要的是**那一行**（老 run 的 task_id），
+        所以愿意为它等对方提交；这里要的只是**「我是不是第一个」**这一个布尔值，
+        而 ``RETURNING`` 在冲突时不返回行，正好就是那个布尔值。
+        """
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(
+                """
+                    INSERT INTO webhook_deliveries (delivery_id, event, repo_id, pr_number)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (delivery_id) DO NOTHING
+                    RETURNING delivery_id
+                    """,
+                [delivery_id, event, repo_id, pr_number],
+            )
+            row: dict[str, Any] | None = await cur.fetchone()
+        return row is not None
+
+    async def list_deliveries(self, limit: int = 50) -> list[DeliveryRow]:
+        """最近的投递，新的在前。不需要分页 —— 这是排查用的视图，
+        真正的问题（「我这次投递怎么了」）永远在最近几条里。
+        """
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                "SELECT * FROM webhook_deliveries ORDER BY received_at DESC LIMIT %s",
+                [limit],
+            )
+            rows: list[dict[str, Any]] = await cur.fetchall()
+        return [_to_delivery(r) for r in rows]
+
+    async def get_delivery(self, delivery_id: str) -> DeliveryRow | None:
+        async with self._pool.connection() as conn:
+            cur = await conn.execute("SELECT * FROM webhook_deliveries WHERE delivery_id = %s", [delivery_id])
+            row: dict[str, Any] | None = await cur.fetchone()
+        return _to_delivery(row) if row is not None else None
+
+    async def release_delivery(self, delivery_id: str) -> None:
+        """撤销一次**还没结算**的认领（删掉那一行），让它能被重新处理。
+
+        只删仍然停在 ``received`` 的那一行。带这个条件是必需的：
+        接管窗口之外可能有另一个请求已经把这次投递接管并结算了，
+        无条件删会把**它的**记录抹掉 —— 而那时它已经把 bootstrap 投出去了。
+        """
+        async with self._pool.connection() as conn, conn.transaction():
+            cur = await conn.execute(
+                "DELETE FROM webhook_deliveries WHERE delivery_id = %s AND status = 'received'",
+                [delivery_id],
+            )
+            if cur.rowcount == 0:
+                log.info("store.delivery_release_noop", delivery_id=delivery_id)
+
+    async def finish_delivery(
+        self,
+        delivery_id: str,
+        status: DeliveryStatus,
+        *,
+        task_id: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """了结一次投递。
+
+        ``COALESCE`` 让 ``None`` 表示「不动这一列」而不是「清空」——
+        与 ``set_status`` 同一个约定。这里尤其要紧：``accepted`` 之后
+        再来一次同 delivery 的投递，走的路径是「读出来、发现是终态、报告重复」，
+        不该顺手把原来的 task_id 抹掉。
+        """
+        async with self._pool.connection() as conn, conn.transaction():
+            await conn.execute(
+                """
+                    UPDATE webhook_deliveries
+                       SET status = %s,
+                           task_id = COALESCE(%s, task_id),
+                           reason = COALESCE(%s, reason),
+                           finished_at = now()
+                     WHERE delivery_id = %s
+                    """,
+                [str(status), task_id, reason, delivery_id],
+            )
 
     # -- 报告 -------------------------------------------------------------- #
 
@@ -889,6 +1004,20 @@ def _to_run(row: dict[str, Any]) -> RunRow:
         # jsonb 读回来是 dict（psycopg 装了加载器），直接喂给 pydantic
         totals=RunTotals.model_validate(totals) if totals is not None else None,
         created_at=row["created_at"],
+    )
+
+
+def _to_delivery(row: dict[str, Any]) -> DeliveryRow:
+    return DeliveryRow(
+        delivery_id=str(row["delivery_id"]),
+        event=str(row["event"]),
+        repo_id=str(row["repo_id"]),
+        pr_number=int(row["pr_number"]) if row["pr_number"] is not None else None,
+        status=DeliveryStatus(str(row["status"])),
+        task_id=row["task_id"],
+        reason=row["reason"],
+        received_at=row["received_at"],
+        finished_at=row["finished_at"],
     )
 
 

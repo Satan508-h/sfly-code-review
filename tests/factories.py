@@ -15,10 +15,10 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sfly_agent.diff import parse_unified_diff
 from sfly_shared.contracts import (
     AggregatedFinding,
     BootstrapMessage,
@@ -28,13 +28,18 @@ from sfly_shared.contracts import (
     ResultStatus,
     ReviewReport,
     Rule,
+    RunEvent,
+    RunRow,
+    RunStatus,
     RunTotals,
     Severity,
     TaskMessage,
     WorkerResult,
     WorkerType,
     idempotency_key_for,
+    stable_hash,
 )
+from sfly_shared.diff import parse_unified_diff
 
 #: 默认的 run id。用 ULID 的字面形态（26 位 Crockford base32），
 #: 因为 ``list_runs`` 的排序依赖它的字典序 == 时间序（见 sfly_shared/ids.py）。
@@ -60,6 +65,88 @@ def demo_patches(name: str = DEMO_DIFF, *, max_patch_chars: int = 8_000) -> list
     """
     text = (FIXTURES_DIR / name).read_text(encoding="utf-8")
     return parse_unified_diff(text, max_patch_chars=max_patch_chars).patches
+
+
+#: 演示用的 webhook 载荷（``scripts/replay_webhook.py`` 的默认输入）。
+DEMO_WEBHOOK = "webhook_pr.json"
+
+#: 演示用的仓库与 PR。**不是真实存在的仓库** —— 载荷里的所有身份都是编的，
+#: 免得有人以为这里真连了 GitHub。
+DEMO_REPO = "demo/sfly-playground"
+DEMO_PR = 42
+
+
+def api_files_from_diff(name: str = DEMO_DIFF) -> list[dict[str, Any]]:
+    """把一份 unified diff 反过来变成 ``/pulls/{n}/files`` 的响应形状。
+
+    **这是反向转换，只用来造 fixture。** 真实世界里这个数组来自 GitHub 的 API，
+    而我们手上只有 diff —— 要造一份「录制下来的载荷」，就得先有那份录制内容。
+
+    两处细节必须是 GitHub 的样子，否则 fixture 就在测一个不存在的输入：
+
+    * ``patch`` 字段**不含** ``diff --git`` / ``---`` / ``+++`` 三行头
+      （GitHub 只给 hunk 片段）。转换回去时要把头补回来 —— 那正是
+      ``sfly_api.github_payload`` 的活儿，这个函数负责造出「缺头」的形态。
+    * ``status`` 用 git 的三种：``added`` / ``removed`` / ``modified``。
+    """
+    text = (FIXTURES_DIR / name).read_text(encoding="utf-8")
+    files: list[dict[str, Any]] = []
+    for patch in parse_unified_diff(text).patches:
+        lines = patch.patch.splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("@@"))
+        status = "added" if patch.is_new_file else "removed" if patch.is_deleted_file else "modified"
+        files.append(
+            {
+                "sha": stable_hash(patch.path)[:40],
+                "filename": patch.path,
+                "status": status,
+                "additions": patch.additions,
+                "deletions": patch.deletions,
+                "changes": patch.additions + patch.deletions,
+                # 只有 hunk，没有文件头 —— 见上面的说明
+                "patch": "\n".join(lines[start:]),
+            }
+        )
+    return files
+
+
+def webhook_payload(
+    *,
+    files: list[dict[str, Any]] | None = None,
+    head_sha: str = "0" * 40,
+    action: str = "opened",
+    draft: bool = False,
+    repo: str = DEMO_REPO,
+    pr_number: int = DEMO_PR,
+) -> dict[str, Any]:
+    """一份 GitHub ``pull_request`` webhook 载荷。
+
+    形状照着 GitHub 真实发的那份裁剪到我们真正读的字段 —— 加上一个
+    ``files`` 数组（GitHub 不发这个，它是 ``/pulls/{n}/files`` 的响应，
+    见 ``sfly_api/github_payload.py`` 的模块文档）。
+    """
+    return {
+        "action": action,
+        "number": pr_number,
+        "pull_request": {
+            "number": pr_number,
+            "node_id": "PR_kwDOAbcdef",
+            "title": "重构用户接口并加上备份入口",
+            "draft": draft,
+            "user": {"login": "contributor"},
+            "head": {"sha": head_sha, "ref": "feature/refactor"},
+            "base": {"sha": "1" * 40, "ref": "main"},
+        },
+        "repository": {
+            "id": 123456,
+            "node_id": "R_kgDOAbcdef",
+            "full_name": repo,
+            "name": repo.split("/")[-1],
+            "owner": {"login": repo.split("/")[0]},
+        },
+        "installation": {"id": 987654},
+        "files": api_files_from_diff() if files is None else files,
+    }
 
 
 def bootstrap(**over: Any) -> BootstrapMessage:
@@ -195,6 +282,32 @@ def conflict(**over: Any) -> ConflictRecord:
     }
     base.update(over)
     return ConflictRecord(**base)
+
+
+def run_row(task_id: str = DEFAULT_TASK_ID, **over: Any) -> RunRow:
+    """``review_runs`` 的一行。
+
+    ``deadline_at`` 是必填的（库里 NOT NULL 且无默认值）—— 那是刻意的，
+    见 ``001_init.sql``：没有 deadline 的 run 永远不会被扫描器捞起来。
+    """
+    base: dict[str, Any] = {
+        "task_id": task_id,
+        "idempotency_key": f"123456:7:{'a' * 40}",
+        "repo_id": "123456",
+        "repo_node_id": "R_kgDOAbcdef",
+        "pr_number": 7,
+        "head_sha": "a" * 40,
+        "base_sha": "b" * 40,
+        "status": RunStatus.QUEUED,
+        "deadline_at": datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=600),
+    }
+    base.update(over)
+    return RunRow(**base)
+
+
+def event(seq: int, kind: str = "node.finished", task_id: str = DEFAULT_TASK_ID, **payload: Any) -> RunEvent:
+    base: dict[str, Any] = {"seq": seq, "task_id": task_id, "kind": kind, "payload": payload}
+    return RunEvent(**base)
 
 
 def report(task_id: str = DEFAULT_TASK_ID, **over: Any) -> ReviewReport:

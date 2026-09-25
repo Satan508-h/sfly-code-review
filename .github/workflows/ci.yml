@@ -22,6 +22,11 @@
 #      数据库查询闭合、扫描器救一个没人叫的 run，这三件事**只有在这种环境里
 #      才验证得了**：内存里的假 checkpointer 测不出序列化和恢复的语义，
 #      而那正是这一层要买的东西。
+#   4. **webhook 入口**（``api/test_webhook_dedup.py``）—— 真 Postgres + 真 Redis。
+#      单测那一层用的是手写的假仓储，所以「``delivery_id`` 的主键约束真的存在」
+#      和「三次投递真的只在流上留下一条消息」只有这里验证得了：迁移文件写错
+#      一个字母，单测全绿。并发投同一个 delivery id 的那条也是在这里才发现
+#      5 个请求投出了 5 条 bootstrap。
 #
 #   testcontainers 用不上（CI 里没有 Docker daemon 可用），所以用 service container。
 #
