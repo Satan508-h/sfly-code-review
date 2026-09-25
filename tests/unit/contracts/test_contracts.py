@@ -9,11 +9,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
+from pydantic import BaseModel
 
 from sfly_shared.contracts import (
     BootstrapMessage,
     ErrorClass,
+    FilePatch,
     Finding,
     ResultStatus,
     RunTotals,
@@ -296,38 +300,21 @@ def test_clean_result_stays_ok() -> None:
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.unit
-def test_stream_fields_are_all_strings() -> None:
-    """Redis Streams 只能存字符串。只要有非 str 值，XADD 就会失败。"""
-    r = WorkerResult(task_id="t1", worker_type="security", findings=[_finding()])
-    fields = r.to_stream_fields()
-    assert all(isinstance(k, str) and isinstance(v, str) for k, v in fields.items())
-
-
-@pytest.mark.unit
-def test_stream_fields_expose_indexable_columns() -> None:
-    """payload 之外还要平铺几个字段，否则消费者必须反序列化整包才能筛选。"""
-    r = WorkerResult(task_id="t1", worker_type="security")
-    fields = r.to_stream_fields()
-    assert {"payload", "task_id", "worker_type", "status", "attempt"} <= set(fields)
-
-
-@pytest.mark.unit
-def test_worker_result_round_trip() -> None:
-    r = WorkerResult(
+def _bootstrap() -> BootstrapMessage:
+    return BootstrapMessage(
         task_id="t1",
-        worker_type="security",
-        findings=[_finding()],
-        tokens_in=1234,
-        tokens_out=567,
-        cached_tokens=1000,
+        idempotency_key=idempotency_key_for("o/r", 3, "sha"),
+        repo_id="o/r",
+        repo_node_id="1",
+        pr_number=3,
+        head_sha="sha",
+        base_sha="base",
+        file_patches=[FilePatch(path="app/db.py", patch="@@ -1 +1 @@\n-x\n+y\n", changed_lines=[1])],
     )
-    assert WorkerResult.from_stream_fields(r.to_stream_fields()) == r
 
 
-@pytest.mark.unit
-def test_task_message_round_trip() -> None:
-    t = TaskMessage(
+def _task_message() -> TaskMessage:
+    return TaskMessage(
         task_id="t1",
         worker_type="performance",
         idempotency_key=idempotency_key_for("o/r", 3, "sha"),
@@ -339,7 +326,63 @@ def test_task_message_round_trip() -> None:
         file_patches=[],
         language="python",
     )
-    assert TaskMessage.from_stream_fields(t.to_stream_fields()) == t
+
+
+def _worker_result() -> WorkerResult:
+    return WorkerResult(
+        task_id="t1",
+        worker_type="security",
+        findings=[_finding()],
+        tokens_in=1234,
+        tokens_out=567,
+        cached_tokens=1000,
+    )
+
+
+#: 三条流上流转的全部消息类型。**每加一种跨进程消息，就加到这里。**
+_STREAM_MESSAGES = [
+    pytest.param(BootstrapMessage, _bootstrap, id="bootstrap"),
+    pytest.param(TaskMessage, _task_message, id="task"),
+    pytest.param(WorkerResult, _worker_result, id="result"),
+]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("cls", "build"), _STREAM_MESSAGES)
+def test_stream_fields_are_all_strings(cls: type[BaseModel], build: Callable[[], BaseModel]) -> None:
+    """Redis Streams 只能存字符串。只要有非 str 值，XADD 就会失败。"""
+    fields = build().to_stream_fields()  # type: ignore[attr-defined]
+    assert all(isinstance(k, str) and isinstance(v, str) for k, v in fields.items())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("cls", "build"), _STREAM_MESSAGES)
+def test_every_cross_process_message_round_trips(
+    cls: type[BaseModel], build: Callable[[], BaseModel]
+) -> None:
+    """每种跨进程消息都必须能原样往返。
+
+    参数化而不是一条一条写：``BootstrapMessage`` 曾经是唯一漏掉平铺编解码的
+    那个类型 —— 因为没有任何地方要求它有，也就没有任何地方会报错，
+    直到有人真的要往 ``review_bootstrap`` 上写消息。
+    """
+    msg = build()
+    assert cls.from_stream_fields(msg.to_stream_fields()) == msg  # type: ignore[attr-defined]
+
+
+@pytest.mark.unit
+def test_stream_fields_expose_indexable_columns() -> None:
+    """payload 之外还要平铺几个字段，否则消费者必须反序列化整包才能筛选。
+
+    这一条对 worker 侧尤其要紧：分发到 ``review_tasks`` 的消息里混着三种
+    ``worker_type``，消费者得靠平铺的 ``worker_type`` 把它们挑出来 ——
+    没有它就只能先解析（而解析正是「坏 payload 进死信」那条路径要避免的事）。
+    """
+    assert {"payload", "task_id", "worker_type", "status", "attempt"} <= set(
+        _worker_result().to_stream_fields()
+    )
+    assert {"payload", "task_id", "worker_type", "attempt"} <= set(_task_message().to_stream_fields())
+    assert {"payload", "task_id", "repo_id", "pr_number"} <= set(_bootstrap().to_stream_fields())
 
 
 # --------------------------------------------------------------------------- #

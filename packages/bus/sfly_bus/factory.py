@@ -1,10 +1,16 @@
-"""**全代码库唯一允许读 ``QUEUE_BACKEND`` / ``LOCK_BACKEND`` 的文件。**
+"""**全代码库唯一允许拿 ``QUEUE_BACKEND`` / ``LOCK_BACKEND`` 做分支的文件。**
 
-    grep -rn "QUEUE_BACKEND" --include=*.py .    # 必须只返回这一个文件
+    grep -rn "queue_backend ==\\|lock_backend ==" --include=*.py packages apps
+    # 只应返回本文件
 
 这条约定是整个项目的中心论点（「一套代码、两种拓扑」）能不能成立的地方。
 一旦某个节点或 Worker 开始判断「我用的是不是 Redis」，两种拓扑就跑在不同的
 代码路径上，共用代码这件事从「事实」退化成「宣传」。
+
+注意上面 grep 的是**分支**而不是名字：这两个名字必然会出现在别处，而且都不算
+违规 —— ``config.py`` 定义它们，``api/main.py`` 把当前值回显到健康页，
+``lite/__main__.py`` 的文档字符串里提到它们。这条约定管的是「谁拿它做判断」。
+可执行的版本在 ``tests/unit/bus/test_protocols.py``（AST 扫描）。
 
 ### 靠结构而不是靠自觉
 
@@ -23,6 +29,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from sfly_bus.health import CheckResult, HealthReport, down, skipped
+from sfly_bus.memory import InMemoryLock, InMemoryQueue
 from sfly_bus.postgres import PostgresPool
 from sfly_bus.redis_streams import RedisStreamsQueue
 from sfly_shared.config import Settings, get_settings
@@ -49,11 +56,19 @@ class Dependencies:
 
     queue: object | None = None
     """``TaskQueue`` 实现。完整模式是 :class:`RedisStreamsQueue`，
-    精简模式是 ``InMemoryQueue``（M2 交付）。
+    精简模式是 :class:`InMemoryQueue`。
 
-    这里标成 ``object`` 而不是 ``TaskQueue`` 是暂时的：M0 的 ``RedisStreamsQueue``
-    还没实现协议里的方法，标成 ``TaskQueue`` 会让 mypy 正确但**没有意义地**报错。
-    M3 补齐后改回 ``TaskQueue | None``。 —— 见 TODO(M3)
+    ``InMemoryQueue`` 已经实现完整协议，可以直接按 ``TaskQueue`` 用；
+    但**这个字段**还标着 ``object``，因为 Redis 那一半要等 M3 补齐协议方法 ——
+    标成 ``TaskQueue | None`` 会让 mypy 正确但**没有意义地**报错。
+    M3 补齐后把 ``queue`` 和 ``lock`` 一起改回 ``TaskQueue | None`` / ``Lock | None``。
+    —— 见 TODO(M3)
+    """
+
+    lock: object | None = None
+    """``Lock`` 实现。精简模式是 :class:`InMemoryLock`；完整模式的
+    ``RedisLock``（``SET NX PX`` + Lua 释放）与队列一起在 M3 交付。
+    原因同上，暂时标 ``object``。 —— 见 TODO(M3)
     """
 
     _probes: list[Probe] = field(default_factory=list, repr=False)
@@ -82,15 +97,16 @@ class Dependencies:
         return HealthReport(checks)
 
     async def close(self) -> None:
-        """释放连接。**先关队列再关数据库** —— 队列的后台回收协程可能会写库，
+        """释放连接。**先关传输再关数据库** —— 队列的后台回收协程可能会写库，
         反过来关会让它在最后几秒里对着一个已关闭的池子报错。
 
         全程吞异常：关机路径上抛错只会让进程带着非零码退出，
         而这时候 Docker 已经在拆容器了，那条错误没人看得到。
         """
-        if self.queue is not None:
-            with contextlib.suppress(Exception):
-                await self.queue.close()  # type: ignore[attr-defined]
+        for handle in (self.queue, self.lock):
+            if handle is not None:
+                with contextlib.suppress(Exception):
+                    await handle.close()  # type: ignore[attr-defined]
         with contextlib.suppress(Exception):
             await self.postgres.close()
 
@@ -117,7 +133,28 @@ async def open_dependencies(settings: Settings | None = None) -> Dependencies:
     await postgres.open()
     probes: list[Probe] = [("postgres", postgres.ping)]
 
+    queue, lock = await _open_transport(s, probes)
+
+    log.info(
+        "deps.opened",
+        mode=s.mode,
+        queue_backend=s.queue_backend,
+        lock_backend=s.lock_backend,
+        queue=type(queue).__name__ if queue is not None else None,
+        lock=type(lock).__name__ if lock is not None else None,
+        database=_safe_dsn(s.database_url),
+    )
+    return Dependencies(postgres=postgres, queue=queue, lock=lock, _probes=probes)
+
+
+async def _open_transport(s: Settings, probes: list[Probe]) -> tuple[object | None, object | None]:
+    """装配队列与锁 —— **本函数是这两个后端变量的唯一分支点。**
+
+    队列和锁是**正交**的配置项（可以队列用 Redis、锁用进程内），所以它们各自
+    独立判断，最后再统一检查一次「混搭是不是配错了」。
+    """
     queue: object | None = None
+    lock: object | None = None
 
     if s.queue_backend == "redis":
         # client_name 会出现在 `redis-cli client list` 里 ——
@@ -126,34 +163,36 @@ async def open_dependencies(settings: Settings | None = None) -> Dependencies:
         await rq.start()
         queue = rq
         probes.append(("redis", rq.ping))
-
-        if s.lock_backend != "redis":
-            # 只有队列在 Redis 上、锁却在进程内，意味着跨副本互斥失效。
-            # 代码是对的（工厂按 lock_backend 装配），但配置几乎肯定是错的。
-            log.warning(
-                "config.lock_backend_mismatch",
-                queue_backend=s.queue_backend,
-                lock_backend=s.lock_backend,
-                hint="队列用 Redis 而锁用进程内实现，跨副本互斥会失效",
-            )
     else:
-        # M2 会在这里装配 InMemoryQueue。现在先明确地报出来，
-        # 而不是返回一个 None 让调用方在很远的地方崩掉。
-        log.warning(
-            "config.memory_backend_pending",
-            queue_backend=s.queue_backend,
-            hint="内存队列在 M2 交付；当前该进程没有可用的 TaskQueue",
+        mq = InMemoryQueue(
+            claim_idle_ms=s.claim_idle_ms,
+            stream_maxlen_tasks=s.stream_maxlen_tasks,
+            stream_maxlen_results=s.stream_maxlen_results,
         )
+        # **必须 start()**：消费者组是在这一步建的，而建组时游标设在流尾。
+        # 漏了它，第一次读写会明确报错而不是安静地少消费几条消息。
+        await mq.start()
+        queue = mq
+        # 精简模式下 Redis 不是「连不上」，而是**不存在**。报 skipped 而不是 down：
+        # 这个依赖在当前拓扑下本就不需要，报故障是撒谎，报正常也是撒谎。
         probes.append(("redis", _redis_not_needed))
 
-    log.info(
-        "deps.opened",
-        mode=s.mode,
-        queue_backend=s.queue_backend,
-        lock_backend=s.lock_backend,
-        database=_safe_dsn(s.database_url),
-    )
-    return Dependencies(postgres=postgres, queue=queue, _probes=probes)
+    if s.lock_backend == "memory":
+        lock = InMemoryLock()
+
+    if s.queue_backend != s.lock_backend:
+        # 代码是对的（两边按各自的设置装配），但配置几乎肯定是写错了：
+        # 队列在 Redis 而锁在进程内 → 跨副本互斥失效（--scale 之后形同没有锁）；
+        # 队列在进程内而锁在 Redis → 精简模式里根本没有 Redis 可连。
+        # 所以这里不停下来，但要喊一声 —— 这类错配的症状是「偶尔重复处理」。
+        log.warning(
+            "config.backend_mismatch",
+            queue_backend=s.queue_backend,
+            lock_backend=s.lock_backend,
+            hint="队列与锁不在同一个后端上；除非你确实想这样，否则多半是配错了",
+        )
+
+    return queue, lock
 
 
 async def _redis_not_needed() -> CheckResult:

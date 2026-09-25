@@ -81,7 +81,35 @@ CI 就只能一律当成失败。
 
 容器内跑同一份 fixture 得到**逐字节相同**的输出（证明规则库随镜像正确分发）。
 
-280 个单测通过；ruff + mypy strict（含 tests）全绿。
+345 个单测通过；ruff + mypy strict（含 tests）全绿。
+
+### M2 已完成：传输层（队列 / 锁 / 指纹）
+
+「一套代码、两种拓扑」这句话在 M2 之前只是一个声明 —— 因为那时只有一种传输
+实现（Redis），另一种还不存在。M2 交出的是**第二种实现**和**它必须满足的契约**：
+
+* `InMemoryQueue` / `InMemoryLock` —— 精简模式的实现
+* `tests/unit/bus/queue_contract.py` —— 两个后端**共用**的行为契约。
+  M3 的 `test_redis_streams.py` 只要继承同一个类，下面每一条就都会在 Redis 上
+  再跑一遍。**这个文件才是卖点的证据**，不是那两个类。
+* 发现指纹（`sfly_agent/aggregate/fingerprint.py`）—— 去重快速路径的键，
+  全确定性，跨进程稳定
+
+`InMemoryQueue` **不是「一个 asyncio 队列加几个方法」**，否则契约就只能断言
+「能收发消息」。它实现的是真正的 Streams 语义：
+
+| 语义 | 为什么不能省 |
+|---|---|
+| 每组独立游标，**发布是扇出** | 组是独立游标而不是分工：一条任务三个组各读一遍，各自按 `worker_type` 过滤并 ack。做成「谁先抢到归谁」的话，`--scale` 和 lag 口径全错 |
+| 每组的 PEL + 投递计数 | `attempt` 是死信判定的依据，必须跨回收保留 |
+| 回收是「放回可投递」而非直接返回 | `reclaim()` 返回计数，所以消费者的消息来源只有一个 |
+| 裁剪留下墓碑 | 被裁掉的条目仍可能留在别人的 PEL 里 —— 消费循环必须 ack 掉它，而不是把空 payload 交给解析器 |
+
+**契约测试自己也做了验证**：拿两个故意坏掉的实现跑了一遍 ——
+一个让每次投递都重复一遍、一个让 `ack()` 变成空操作 —— 各自都被抓住
+（`test_one_group_delivers_each_message_to_exactly_one_consumer`、
+`test_acked_message_is_not_reclaimed`）。一份永远通过的契约测试比没有更糟，
+因为它让人以为有人在守。
 
 ### 在此之前（M0）
 
@@ -98,8 +126,10 @@ Redis 7.4.11 的真实版本与毫秒级延迟。依赖故障行为逐条验过�
 那只会把一次数据库抖动放大成一次全站重启，且 `restart: unless-stopped` 会让
 日志被退避重启信息冲掉。详见 [CLAUDE.md](CLAUDE.md) 约定 #6。
 
-**分布式部分尚未接入** —— Worker 的常驻消费循环、`review_bootstrap →
-review_tasks → review_results → dead_letter` 四条流、LangGraph 图都是 M2 之后的交付物。
+**还差什么**：传输层已经有了（M2），但 Redis 那一半要等 M3，
+所以现在**还演示不了** `--scale` 与 `docker kill` 那些场景。
+Worker 的常驻消费循环、`review_bootstrap → review_tasks → review_results →
+dead_letter` 四条的端到端流转、LangGraph 图分别是 M3 / M5 的交付物。
 现在每个 Worker 只能对着一份 diff 跑一次。
 
 进度见 [CLAUDE.md](CLAUDE.md) 末尾的清单，或前端首页。
@@ -237,6 +267,7 @@ DeepSeek 走 OpenAI 兼容接口，所以换成 OpenAI、vLLM 或本地模型只
 | **零密钥就能审代码** | `python -m sfly_workers --spec security --diff fixtures/security_demo.diff` | 10 条 finding，行号全部落在变更行上；`\| jq` 直接可用 |
 | **干净代码上不乱报** | 同上，换成 `fixtures/clean.diff` | 三个 Worker 都返回 `{"findings": []}` |
 | **坏 JSON 不会毁掉结果** | `MOCK_LLM_FAILURE_RATE=1.0` 再跑上一条 | 每一次调用都返回坏 JSON，仍然出结果（修复阶梯接住了） |
+| **两种拓扑共用一套代码** | `python tasks.py test` 里的 `tests/unit/bus/queue_contract.py` | 同一份契约测试，M3 之后会在内存与 Redis 两个后端上各跑一遍 |
 | 依赖真实可达 | `python tasks.py health` | Postgres / Redis 的**版本号**与毫秒延迟，不是照抄配置 |
 | 依赖挂了不误伤 | `docker pause sfly-postgres-1` | `/healthz` 仍 200、容器仍 healthy、`/api/health` 503；`docker unpause` 后自动恢复 |
 | Worker 水平扩展 | `python tasks.py scale 3` | `worker-security` 变成 3 个副本，日志里出现 3 个消费者实例 |

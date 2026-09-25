@@ -27,8 +27,9 @@ from sfly_bus.health import (
     redact,
     skipped,
 )
+from sfly_bus.memory import InMemoryLock, InMemoryQueue
 from sfly_bus.postgres import PostgresPool
-from sfly_bus.redis_streams import RedisStreamsQueue, _safe_url, group_for
+from sfly_bus.redis_streams import RedisStreamsQueue, _safe_url
 from sfly_shared.config import Settings
 
 #: 保证连不上的地址。见模块文档。
@@ -270,13 +271,6 @@ async def test_redis_start_does_not_retry_when_unreachable() -> None:
     assert elapsed < 8.0, f"start() 耗时 {elapsed:.2f}s，容器启动会被拖住"
 
 
-@pytest.mark.unit
-def test_group_name_is_derived_from_worker_type() -> None:
-    """消费者组名必须能从 worker_type 推出来 —— ``--scale`` 靠它做同组竞争消费。"""
-    assert group_for("security") == "security-group"
-    assert group_for("performance") == "performance-group"
-
-
 # --------------------------------------------------------------------------- #
 # 工厂：唯一的拓扑分支点
 # --------------------------------------------------------------------------- #
@@ -308,10 +302,15 @@ async def test_memory_backend_opens_no_redis_connection() -> None:
 
     报 ``skipped`` 而不是 ``down``：这个依赖在当前拓扑下不存在，
     报故障是撒谎，报正常也是撒谎。
+
+    这里用的是连不上的 Postgres 地址，所以队列必须**不依赖任何外部服务**
+    就能装起来 —— 否则 ``deps.queue is not None`` 那句会先因为连不上 Redis
+    而失败，测到的就不是「内存队列不需要 Redis」了。
     """
     deps = await open_dependencies(_dead_settings(queue_backend="memory", lock_backend="memory"))
     try:
-        assert deps.queue is None
+        assert isinstance(deps.queue, InMemoryQueue), "M2 之后这里必须真的有一个可用的队列"
+        assert isinstance(deps.lock, InMemoryLock)
         report = await deps.probe()
     finally:
         await deps.close()

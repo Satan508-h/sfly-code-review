@@ -1,8 +1,9 @@
 """传输层协议 —— 决定「一套代码、两种拓扑」能否成立。
 
-这个文件里**没有实现**，只有 Protocol。两个实现分别是：
+这个文件里**没有业务实现**，只有 Protocol 和两种实现必须共用的命名约定。
+两个实现分别是：
   * ``redis_streams.py`` — 完整模式（消费者组、XAUTOCLAIM、死信）
-  * ``memory.py``        — 精简模式（asyncio 队列，单进程）
+  * ``memory.py``        — 精简模式（进程内，单事件循环）
 
 ### 为什么 ``consume_*`` 返回 ``(handle, message)`` 而不是 ``(msg_id, message)``
 
@@ -36,6 +37,44 @@ from sfly_shared.contracts import (
     WorkerResult,
     WorkerType,
 )
+
+# --------------------------------------------------------------------------- #
+# 命名约定 —— 两种实现必须用同一套名字
+# --------------------------------------------------------------------------- #
+#
+# 这不是为了整齐。精简模式的日志、健康页、以及「用 XINFO 排查线上问题」的
+# 手法，都要能和完整模式一一对上；名字一分叉，「同一套代码」在**出故障的时候**
+# 就不是同一套了 —— 而那正是唯一要紧的时候。
+
+STREAMS: dict[str, str] = {
+    "bootstrap": "review_bootstrap",
+    "tasks": "review_tasks",
+    "results": "review_results",
+    "dead_letter": "dead_letter",
+}
+
+#: 只有**独占消费**的流在这里。``review_tasks`` 的组按 worker_type 动态生成，
+#: 见 :func:`group_for`。
+CONSUMER_GROUPS: dict[str, str] = {
+    "bootstrap": "orchestrator-group",
+    "results": "orchestrator-group",
+}
+
+#: ``dead_letter`` 刻意**不在**上面那张表里 —— 死信不建消费者组。
+#: 它的全部价值是「事后能回看」，而消费组的语义是一读一 ack、游标只往前挪；
+#: 建了组就一定会有人用 ``XREADGROUP`` 去读它，读完那条死信就从组的视角消失了。
+#: 正确的访问方式是 ``XRANGE dead_letter - +`` —— 只读，不推进任何游标。
+
+
+def group_for(worker_type: WorkerType | str) -> str:
+    """每个 ``worker_type`` 一个消费者组。
+
+    同组的多个进程/协程**竞争消费**：一条消息只会投递给组内一个成员。
+    这就是 ``docker compose up --scale worker-security=3`` 能工作的机制 ——
+    它不依赖任何应用层代码，只是消费者组的定义。
+    """
+    return f"{worker_type}-group"
+
 
 # --------------------------------------------------------------------------- #
 # 消费句柄
@@ -149,11 +188,26 @@ class TaskQueue(Protocol):
         由每个 Worker 每 30s 调用一次（``CLAIM_IDLE_MS=180000``）。回收早了
         只是浪费 token —— 重复结果会被 ``worker_results`` 的主键吸收 ——
         所以这个阈值可以实测调参，不必证明。
+
+        .. important::
+           **回收不等于投递。** 本方法只把消息重新变回「可投递」，它必须经由
+           ``consume_tasks`` / ``consume_results`` 才交到消费者手里。
+
+           这不是随手定的：``reclaim`` 返回**计数**，所以它是维护动作，
+           而消费者的消息来源因此只有一个。代价由实现自己扛 —— Redis 的
+           ``XAUTOCLAIM`` 是**直接返回消息**的（与 ``XREADGROUP`` 是两条不同的
+           读路径），所以那个实现要把 CLAIM 到的消息先缓冲起来，
+           等下一次 ``consume_*`` 时再交出。
         """
         ...
 
     async def lag(self, worker_type: WorkerType | str) -> int:
-        """该消费者组的积压条数，用于健康检查和 UI 展示。"""
+        """该消费者组的积压条数，用于健康检查和 UI 展示。
+
+        口径同 Redis 的 ``XINFO GROUPS``：**还有多少条没投给这个组**，
+        不是「还有多少条没被 ack」。两者只在消费者卡住时才分叉 ——
+        那时前者是 0、后者在涨，而这个区别恰好是排查时最需要分清的一件事。
+        """
         ...
 
 

@@ -84,9 +84,15 @@ Worker 放弃之前**必须先发一条 `status="failed"` 的 `WorkerResult` 再
 
 ### 4. 只有 factory.py 分支环境变量
 
-`QUEUE_BACKEND` / `LOCK_BACKEND` 这两个环境变量名在整个代码库里**只能出现在 `packages/bus/sfly_bus/factory.py`**。评审时 `grep -rn "QUEUE_BACKEND" --include=*.py` 应该只返回一个文件。
+**`QUEUE_BACKEND` / `LOCK_BACKEND` 这两个值，只允许 `packages/bus/sfly_bus/factory.py` 拿来分支。**
 
-一旦某个节点或 Worker 开始判断「我用的是不是 Redis」，两种拓扑共用代码这条就废了。
+一旦某个节点或 Worker 开始判断「我用的是不是 Redis」，两种拓扑就跑在不同的代码路径上，共用代码这件事从「事实」退化成「宣传」—— 而且不会有任何东西报错。
+
+这条约定现在有**可执行的检查**：`tests/unit/bus/test_protocols.py::test_only_the_factory_branches_on_the_transport_backend` 用 AST 扫 `packages/` 和 `apps/`，找出所有「拿这两个设置做判断」的位置（`if` / `elif` / 三元 / `match` / 推导式的 `if`）。
+
+> 早先这条写的是「grep 应该只返回一个文件」，那句话已经不准了，现在改成上面这条 —— 因为这两个名字**必然**会出现在别处，而且都不算违规：`config.py` 里定义它们，`api/main.py` 把当前值回显给健康页和前端（`App.vue` 顶部的后端回显），`lite/__main__.py` 的文档字符串里提到它们。把定义和展示也算成违规，这条约定就只能靠人肉判断，最后一定会漂移。
+>
+> 检查也**不是防火墙**：把 `s.queue_backend` 先存进一个变量再判断，它就抓不到了。真正的防线仍然是评审 —— 它是烟雾报警器。
 
 ### 5. 契约变更先改 contracts.py
 
@@ -220,7 +226,7 @@ python tasks.py demo           # 端到端：投递 3 次同一 webhook → 1 ru
 - [x] Step 0 — 文档、契约、目录骨架、compose
 - [x] M0 — workspace、`sfly_bus` 连接层、`/api/health` 真实依赖探测
 - [x] M1 — diff 解析、Mock LLM、修复阶梯、规则库、`--diff` 独立 CLI
-- [ ] M2 — 队列协议 + InMemoryQueue + 指纹
+- [x] M2 — 队列协议 + InMemoryQueue / InMemoryLock + 指纹 + 两后端的契约测试骨架
 - [ ] M3 — RedisStreamsQueue（含 XAUTOCLAIM / 死信 / 重试计数）
 - [ ] M4 — Postgres schema + 幂等 migrate
 - [ ] M5 — LangGraph 图（高风险：`interrupt()`）

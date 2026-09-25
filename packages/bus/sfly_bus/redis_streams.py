@@ -42,25 +42,9 @@ from sfly_shared.logging import get_logger
 
 log = get_logger(__name__)
 
-STREAMS = {
-    "bootstrap": "review_bootstrap",
-    "tasks": "review_tasks",
-    "results": "review_results",
-    "dead_letter": "dead_letter",
-}
-
-#: 消费者组名。``orchestrator-group`` 独占 bootstrap 与 results；
-#: 另外三个是每个 worker_type 一个组 —— ``--scale`` 时同组成员竞争消费。
-CONSUMER_GROUPS = {
-    "bootstrap": "orchestrator-group",
-    "results": "orchestrator-group",
-    "dead_letter": "ops-group",
-}
-
-
-def group_for(worker_type: str) -> str:
-    return f"{worker_type}-group"
-
+# 四条流的名字与消费者组名**不在这里定义** —— 它们是两种传输实现共用的命名
+# 约定，放在 ``base.py``（和 Protocol 在一起）。审校时能看到「memory 和 redis
+# 用的是同一套名字」，这一点比少写一行 import 重要得多。
 
 #: 启动探测的连接超时。故意短：它只决定「多久之后放弃记录那条连通日志」，
 #: 不决定任何功能是否可用。见 ``start()``。

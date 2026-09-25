@@ -461,6 +461,21 @@ class BootstrapMessage(_Contract):
         assert_idempotency_key(self.repo_id, self.pr_number, self.head_sha, self.idempotency_key)
         return self
 
+    def to_stream_fields(self) -> dict[str, str]:
+        """平铺字段。除 ``payload`` 外都是给**过滤与运维**用的 ——
+        ``XRANGE review_bootstrap`` 时不必反序列化整包就能看出「这是哪个 PR 的」。"""
+        return {
+            "payload": self.model_dump_json(),
+            "task_id": self.task_id,
+            "repo_id": self.repo_id,
+            "pr_number": str(self.pr_number),
+            "idempotency_key": self.idempotency_key,
+        }
+
+    @classmethod
+    def from_stream_fields(cls, fields: dict[str, str]) -> Self:
+        return cls.model_validate_json(fields["payload"])
+
 
 class TaskMessage(_Contract):
     """orchestrator → worker。``review_tasks`` 流。"""
