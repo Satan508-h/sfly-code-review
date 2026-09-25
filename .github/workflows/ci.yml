@@ -17,6 +17,11 @@
 #      所以不是契约（理由写在那个文件的文档字符串里）。它们需要的是一个
 #      **真的** Postgres：空库上建表、五个进程并发迁移、失败回滚、
 #      jsonb 往返。拿假对象测这些等于测了个寂寞。
+#   3. **整张图**（``orchestrator/test_graph_end_to_end.py``）—— 真 Redis + 真
+#      Postgres + 真 checkpointer。``interrupt()`` 的挂起与恢复、屏障靠一次
+#      数据库查询闭合、扫描器救一个没人叫的 run，这三件事**只有在这种环境里
+#      才验证得了**：内存里的假 checkpointer 测不出序列化和恢复的语义，
+#      而那正是这一层要买的东西。
 #
 #   testcontainers 用不上（CI 里没有 Docker daemon 可用），所以用 service container。
 #
