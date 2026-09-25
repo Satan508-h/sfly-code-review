@@ -1,5 +1,10 @@
 # sfly — 基于多 Agent 的分布式代码审查系统
 
+[![CI](https://github.com/Satan508-h/sfly-code-review/actions/workflows/ci.yml/badge.svg)](https://github.com/Satan508-h/sfly-code-review/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
+[![Vue 3](https://img.shields.io/badge/vue-3-42b883.svg)](https://vuejs.org/)
+
 > 分布式执行，集中式决策。GitHub PR 一提交，安全 / 性能 / 风格三个专业 Agent 并行开审，
 > 主 Agent 汇总去重、消解冲突、重算置信度，把结论写回 PR 评论。
 
