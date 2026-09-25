@@ -454,7 +454,7 @@ python tasks.py demo --follow --drop-after 3   # 断开重连，SSE 无缺口
   而报错指向 jq 的语法错误 —— 完全看不出真正的原因。
   注意日志级别不能用 `logging.getLogger().setLevel()` 调：structlog 的
   `PrintLogger` 不经过标准库的 root logger，那一行看着像在静音，实际无效。
-- 类型标注必须完整，`mypy` 在 CI 中跑（覆盖 `packages` `apps` `tests` 三处）
+- 类型标注必须完整，`mypy` 在 CI 中跑（覆盖 `packages` `apps` `tests` `scripts` 四处）
 - 时间统一 UTC，`datetime.now(UTC)`
 
 ## 当前进度

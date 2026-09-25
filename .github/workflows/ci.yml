@@ -76,7 +76,9 @@ jobs:
       - name: 类型检查（mypy strict）
         # CLAUDE.md 里写着「mypy 在 CI 中跑」，这个步骤是让那句话成立的那一步。
         # 声明了却在别处不执行的门槛，比没有门槛更糟：它会让人以为有保护。
-        run: uv run mypy packages apps tests
+        # scripts/ 也在内：它是交付物的一部分（replay_webhook.py 是 M6 的验收工具），
+        # 而「没被任何东西检查的代码」正是最容易长歪的那种。
+        run: uv run mypy packages apps tests scripts
 
       - name: 单测
         # 默认 addopts 已排除 integration / e2e 标记，所以不需要额外参数

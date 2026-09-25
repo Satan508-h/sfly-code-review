@@ -448,7 +448,7 @@ def cmd_fmt(_: argparse.Namespace) -> None:
 def cmd_typecheck(_: argparse.Namespace) -> None:
     # tests 也一起检查：测试里的类型错误同样是错误，而且它们最容易被漏掉 ——
     # CI 只跑 packages/apps 的话，测试代码会长期处于无人检查的状态。
-    run([_uv(), "run", "mypy", "packages", "apps", "tests"])
+    run([_uv(), "run", "mypy", "packages", "apps", "tests", "scripts"])
 
 
 # -- 演示 ------------------------------------------------------------------- #
