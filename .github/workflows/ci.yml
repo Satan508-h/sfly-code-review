@@ -1,0 +1,58 @@
+# CI：lint + 单测。
+#
+# 刻意**只跑单测**，不需要 Docker、不需要任何密钥 —— 这是刻意的门槛设计：
+# 一个需要外部依赖才能跑的 CI，在被 fork 或在新环境里第一次跑就会红，
+# 然后人们就开始忽略它。集成测试（需要 Docker 和 testcontainers）和
+# 端到端测试（需要真实 DeepSeek 密钥，会花钱）留给本地和 M9 的夜间任务。
+#
+# 命令与本地完全一致（见 Makefile / tasks.py），所以「本地过了 CI 挂了」
+# 这种事不会发生。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支连续推送时取消上一次未完成的运行，省 CI 额度
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # CI 里不需要 uv 去下载 Python，直接用 runner 自带的
+  UV_PYTHON_DOWNLOADS: "never"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: 按 lock 文件同步依赖
+        # --frozen：lock 与 pyproject 不一致时直接失败，而不是静默重新解析。
+        # 这正是我们想要的 —— 改了 pyproject 却忘了提交 uv.lock 应该在 CI 里暴露。
+        run: uv sync --frozen --all-packages
+
+      - name: Lint（ruff check + format）
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: 单测
+        # 默认 addopts 已排除 integration / e2e 标记，所以不需要额外参数
+        run: uv run pytest
+
+      - name: 校验 docker-compose 可解析
+        # 构建整栈太重，但配置文件语法错误应该在 CI 里就拦住 ——
+        # 这类错误只会在别人 clone 下来跑 `docker compose up` 时才暴露。
+        run: docker compose config --quiet
