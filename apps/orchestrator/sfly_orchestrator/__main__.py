@@ -34,13 +34,14 @@ from typing import Any
 
 from langgraph.graph.state import CompiledStateGraph
 
+from sfly_agent.github import GitHubClient
 from sfly_agent.labels import SEVERITY_LABEL, SEVERITY_ORDER, STATUS_LABEL, worker_label
 from sfly_agent.state import ReviewState
 from sfly_bus.base import TaskQueue
 from sfly_bus.factory import Dependencies, open_dependencies
 from sfly_bus.postgres import migrate_on_startup
 from sfly_orchestrator.checkpointer import open_checkpointer, setup_on_startup
-from sfly_orchestrator.context import NodeContext
+from sfly_orchestrator.context import NodeContext, build_github_client
 from sfly_orchestrator.coordinator import Coordinator
 from sfly_orchestrator.graph import NODES, build_graph
 from sfly_orchestrator.runner import GraphRunner
@@ -131,9 +132,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # --------------------------------------------------------------------------- #
 
 
-async def _serve(stop: asyncio.Event, deps: Dependencies, graph: CompiledStateGraph[ReviewState]) -> None:
+async def _serve(
+    stop: asyncio.Event,
+    deps: Dependencies,
+    graph: CompiledStateGraph[ReviewState],
+    ctx: NodeContext,
+) -> None:
     """三条长驻协程。**任何一条结束都算异常** —— 它们都是 ``while True`` 的形态。"""
-    ctx = _context(deps)
     workers = [
         asyncio.create_task(GraphRunner(ctx=ctx, graph=graph).run(stop), name="graph-runner"),
         asyncio.create_task(Coordinator(ctx=ctx, graph=graph).run(stop), name="coordinator"),
@@ -156,7 +161,10 @@ async def _serve(stop: asyncio.Event, deps: Dependencies, graph: CompiledStateGr
 
 
 async def _run_once(
-    args: argparse.Namespace, deps: Dependencies, graph: CompiledStateGraph[ReviewState]
+    args: argparse.Namespace,
+    deps: Dependencies,
+    graph: CompiledStateGraph[ReviewState],
+    ctx: NodeContext,
 ) -> int:
     msg, code = _load_task(args)
     if msg is None:
@@ -180,7 +188,6 @@ async def _run_once(
     await queue.publish_bootstrap(msg)
     log.info("cli.published", task_id=run.task_id, pr=f"{run.repo_id}#{run.pr_number}")
 
-    ctx = _context(deps)
     stop = asyncio.Event()
     pipeline = [
         asyncio.create_task(GraphRunner(ctx=ctx, graph=graph).run(stop), name="graph-runner"),
@@ -434,8 +441,8 @@ def _short(value: Any) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _context(deps: Dependencies) -> NodeContext:
-    return NodeContext(store=deps.store, queue=_require_queue(deps), lock=deps.lock)
+def _context(deps: Dependencies, *, github: GitHubClient | None = None) -> NodeContext:
+    return NodeContext(store=deps.store, queue=_require_queue(deps), lock=deps.lock, github=github)
 
 
 def _require_queue(deps: Dependencies) -> TaskQueue:
@@ -452,14 +459,27 @@ def _require_queue(deps: Dependencies) -> TaskQueue:
 @asynccontextmanager
 async def _prepared(
     settings: Settings,
-) -> AsyncIterator[tuple[Dependencies, CompiledStateGraph[ReviewState]]]:
+    github: GitHubClient | None,
+) -> AsyncIterator[tuple[Dependencies, CompiledStateGraph[ReviewState], NodeContext]]:
     """打开依赖 → 建表 → 开 checkpointer → 编译图。
 
     两种运行形态共用这一段。``finally`` 里关依赖：停机信号、异常、取消三条
     路径都要走到 —— 漏掉的话容器停止时会留下没关的连接，而 Postgres 侧要等到
-    TCP 超时才发现（表现为重启后的第一波查询变慢）。
+    TCP 超时才发现（表现为重启后的第一波查询变慢）。GitHub 客户端同理
+    （它自己一条连接池）。
+
+    ``github`` 由调用方决定（``None`` = dry-run），**不在这里自己造**：
+    ``--diff`` 那条路必须强制 dry-run，而那是个只有调用方知道的区别 ——
+    见 :func:`_cli_github`。
+
+    产出里带上 ``ctx``：图是**用**它编译的（节点闭包捕获的就是这一个），
+    三条长驻协程也该用同一个 —— 各建各的会得到两个客户端、两个连接池。
     """
     deps = await open_dependencies(settings)
+    # **一个进程一个 ctx**，图和三条协程共用它。早先是各建各的（两处
+    # ``_context(deps)``），那意味着两个 GitHub 客户端、两个连接池 ——
+    # 其中一个永远不会被关掉，而它「多余的」这件事不会以任何方式表现出来。
+    ctx = _context(deps, github=github)
     try:
         # 建表（幂等）。五个容器同时启动时会一起走到这里 —— 串行化靠
         # pg_advisory_xact_lock，见 sfly_bus/migrations/。
@@ -469,21 +489,38 @@ async def _prepared(
         # 生命周期也只到这里为止。
         async with open_checkpointer(settings.database_url) as saver:
             await setup_on_startup(saver)
-            yield deps, build_graph(_context(deps), checkpointer=saver)
+            yield deps, build_graph(ctx, checkpointer=saver), ctx
     finally:
+        if github is not None:
+            await github.aclose()
         await deps.close()
 
 
 async def _once(args: argparse.Namespace) -> int:
     """``--task`` / ``--diff``：投一条任务，跟到终态，打报告。"""
-    async with _prepared(get_settings()) as (deps, graph):
-        return await _run_once(args, deps, graph)
+    settings = get_settings()
+    async with _prepared(settings, _cli_github(args, settings)) as (deps, graph, ctx):
+        return await _run_once(args, deps, graph, ctx)
+
+
+def _cli_github(args: argparse.Namespace, settings: Settings) -> GitHubClient | None:
+    """单次运行用哪个 GitHub 客户端。**``--diff`` 恒为 dry-run。**
+
+    从 diff 直接跑时，那个 ``repo_id`` 是为了让幂等键成立而编出来的字符串，
+    它**不是一个真实仓库** —— 拿它去调 GitHub 会稳定地 404，于是本地那条验收
+    命令（``python tasks.py review``）会从「跑通」变成「publish_failed」，
+    而那个红色和代码质量毫无关系。真实发布走 ``--task``（载荷里有真的
+    repo/pr）或 webhook。
+    """
+    if args.diff:
+        return None
+    return build_github_client(settings)
 
 
 async def _serve_body(stop: asyncio.Event) -> None:
     """常驻模式。三条长驻协程，Worker 是另外三个容器。"""
     settings = get_settings()
-    async with _prepared(settings) as (deps, graph):
+    async with _prepared(settings, build_github_client(settings)) as (deps, graph, ctx):
         log.info(
             "orchestrator.ready",
             wait_strategy=settings.wait_strategy,
@@ -492,7 +529,7 @@ async def _serve_body(stop: asyncio.Event) -> None:
             conflict_resolver=settings.conflict_resolver,
             pipeline=" → ".join(NODES),
         )
-        await _serve(stop, deps, graph)
+        await _serve(stop, deps, graph, ctx)
 
 
 def main(argv: list[str] | None = None) -> None:

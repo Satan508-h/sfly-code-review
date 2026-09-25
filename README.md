@@ -14,6 +14,11 @@
 
 ## 当前状态
 
+**M7 进行中**（已完成前两步）：GitHub 客户端（重试策略 / 分页 / 三条降级路）
++ `publish` 节点（三道防重复闸 + 阶梯降级），评论**真的发得出去**了 ——
+证据见下面「[M7 进行中](#m7-进行中github-客户端--publish-节点)」那一节。
+第三步（真实靶场仓库验收）还没做。
+
 **M6 已完成**：GitHub webhook 入口（HMAC 验签 + 两层去重）、runs 接口、
 SSE 时间线（带 `Last-Event-ID` 补齐）。验收是一条命令 —— **同一份 webhook
 投 3 次，只产生 1 个 run**：
@@ -249,6 +254,72 @@ EventSource 在服务端关流后会**自动重连**（这是规范行为），�
 | 容器里 `ModuleNotFoundError: No module named 'sfly_agent'` | 网关 import 了 `sfly_agent.diff` 来解析补丁，而 api 的依赖里没有 agent-core（也不该有 —— 那是 LLM/RAG/聚合的包）。**本地永远测不出来**：开发机上的 venv 装了全部 workspace 包。修法是把 `diff.py` 搬到 `sfly_shared`（它只依赖 `contracts.FilePatch` 和标准库）—— 于是网关不再拖进 rapidfuzz / rank_bm25 / LLM 客户端 |
 | `GITHUB_WEBHOOK_SECRET=xxx docker compose up -d api` 之后仍然不验签 | **compose 只把 `env_file` / `environment:` 里的变量传进容器**，命令行前面那个环境变量只用于 compose 文件的 `${VAR}` 插值。所以那次「验证」什么也没验证 —— 是手工改 `.env` 才测出真结果的 |
 | run 的 `block_merge` 和 `totals` 一直是 null | `finalize` 只写了 `review_reports`（jsonb），没写 `review_runs` 上那两列。运行列表要显示「阻断 / 参考」和花了多少钱，而它不该为了两个值去解每一行的 jsonb。补了 `set_decision()` |
+
+### M7 进行中：GitHub 客户端 + publish 节点
+
+**M7 有三步，这里完成的是前两步**（客户端 + 发评论），第三步是拿真实靶场
+仓库验收。但前两步的证据已经足够硬 —— 下面这次是**真的 HTTP**，
+评论从**容器里**发出去，而且限流退避是真的等过：
+
+```bash
+python tasks.py stub-github                 # 另一个终端：前 2 次发布返回 429
+# .env 里把 GITHUB_API_BASE 指向这个桩，重启编排器
+python tasks.py demo
+```
+
+桩收到的请求序列（`GET http://127.0.0.1:8099/__state`）：
+
+```text
+GET  /repos/demo/sfly-playground/pulls/42/reviews     ← 闸 2：查有没有带标记的正文
+GET  /repos/demo/sfly-playground/issues/42/comments   ← 闸 2 的另一半
+GET  /user                                            ← 判断我是不是 PR 作者
+POST /repos/demo/sfly-playground/pulls/42/reviews     ← 429（二级限流）
+POST /repos/demo/sfly-playground/pulls/42/reviews     ← 429
+POST /repos/demo/sfly-playground/pulls/42/reviews     ← 201 ✓
+```
+
+编排器日志里那两次退避（`retry-after: 1`，实测就等了 1 秒）：
+
+```json
+{"event": "github.retry", "attempt": 1, "status": 429, "wait_s": 1.0}
+{"event": "github.retry", "attempt": 2, "status": 429, "wait_s": 1.0}
+{"event": "node.publish", "posted": true, "form": "review:request_changes+inline",
+ "comment_id": 1001, "inline_sent": 14, "inline_skipped": 0, "block_merge": true}
+```
+
+数据库里那一行：`status=published`、`github_comment_id=1001`。
+`inline_sent=14` 说明 **14 条行内评论全部落在真实的变更行上** ——
+桩在这方面比真 GitHub 还严（行号对不上就拒**整个** review，连汇总正文一起）。
+
+#### 三道闸，各挡一种不同的重复评论
+
+1. **`review_runs.github_comment_id`** —— 数据库说发过了。挡的是节点重放
+   （LangGraph 恢复时重跑节点是**正常路径**）。
+2. **正文里的隐藏标记** `<!-- sfly:run:{task_id} -->` —— PR 上已经有这条正文了。
+   挡的是第 1 道挡不住的那种：**评论发出去了、写库那一步失败了**。
+3. **`mark_published` 是 UPDATE** —— 重放时写的是同一行的同一列，天然幂等。
+
+签发（`render.marker_for`）和识别（`publish`）**必须是同一个函数** —— 它们曾经
+是两处字面量，而那种重复的失效方式很安静：格式一改，新标记照常写进正文，
+查找的那一边却永远匹配不上，于是闸 2 变成一句空话。
+
+#### 被拒了就退一格，不去解析错误消息
+
+GitHub 拒绝一次 review（422）有两个来源，处置方式**正好相反**：给自己的 PR
+请求修改（改用 `COMMENT`）、行号不在 diff 里（去掉行内评论）。所以这里是
+一个从完整到保守的阶梯：`review+行内` → `review` → `COMMENT` →
+**普通评论**（换端点，没有行号可以不对）。最后一格还能失败就只剩权限和网络了。
+
+解析错误消息字符串来决定怎么办是脆的（GitHub 改个措辞就失效），而且
+**两个来源可能同时出现**。阶梯不需要知道是哪一个。
+
+#### 过程中改掉的（都是**测试逼出来**的）
+
+| 现象 | 真因 |
+|---|---|
+| `publish` 真的把 `GitHubError` 抛了出去 | 模块文档写着「绝不向上抛」，代码里却没有那个 `try`。抛出去的表现是 run 停在 `aggregating`，而扫描器的 `due_runs` 只看 `dispatched`/`waiting` —— **没有任何东西能唤醒它** |
+| dry-run 被记成了 `publish_failed` | `posted=False` 有两种来源：没配 token（本来就没打算发）和真的发失败了。用一个字段表示两件事，于是「本地不需要密钥就能跑通全链路」这句话在状态层面变成假的 —— 每个 run 都带着一个红灯。现在由 `delivery_failed` 决定状态和事件类型 |
+| `python tests/github_stub.py` 报 `No module named 'sfly_api'` | 系统 Python ≠ 项目解释器。桩 import 了 `apps/api` 的补丁转换函数（避免把 diff 重建逻辑抄第二遍）。现在有 `python tasks.py stub-github`，它走 `_py()` |
 
 ### M5 已完成：LangGraph 图 / 断点恢复 / 主 Agent 聚合
 
@@ -646,8 +717,10 @@ DeepSeek 走 OpenAI 兼容接口，所以换成 OpenAI、vLLM 或本地模型只
 | **Webhook 幂等（run 层）** | `python tasks.py demo --new-delivery` | 每次换一个 delivery id，但提交没变 → 还是 1 个 run。这一层由 `review_runs.idempotency_key` 的唯一约束兜住 |
 | **断线无缺口** | `python tasks.py demo --follow --drop-after 3` | 收到 3 条后主动断开，用 `Last-Event-ID` 重连补齐剩下的 9 条；脚本会拿详情接口对一遍，缺一条就报 `[!!]` |
 | **未验签的请求写不进库** | 配好 `GITHUB_WEBHOOK_SECRET` 后用错密钥投一次 | 401，且 `GET /api/deliveries` 里**不会**多出一行 |
+| **限流了真的会退避重发** | `python tasks.py stub-github` + 把 `GITHUB_API_BASE` 指向它 + `python tasks.py demo` | 桩先回两次 429（带 `retry-after`），编排器日志里出现两条 `github.retry`，第三次成功；评论**真的发出去了**（桩的 `/__state` 里能看到） |
+| 投递账户上不会重复评论 | 同上，再投一次 | 桩里仍然只有 1 条 review：`github_comment_id` 已经是同一行的 UPDATE，重放写的是同一列 |
 | 投递账本 | `GET /api/deliveries` | 每条投递的结局：`accepted` / `duplicate` / `ignored` / `rejected`，以及它转给了哪个 run |
-| 断点恢复 | `docker restart sfly-orchestrator-1` | 从 Postgres 的 checkpoint 续跑，不重复发评论 |
+| 断点恢复 | `docker restart sfly-orchestrator-1` | 从 Postgres 的 checkpoint 续跑 |
 | Redis 重启不丢任务 | `docker restart sfly-redis` | 扫描器按 `attempt+1` 重派，消息排空 |
 | Postgres 不可达不丢结果 | `docker pause sfly-postgres` | 消息堆在 PEL 里；`unpause` 后排空（证明「先落库再 ack」的顺序，集成测试里有一条专门钉它） |
 | 质量可被度量 | `python tasks.py eval` | `reports/eval-<sha>.md`：精确率 / 召回率 / 误报率 / 单次成本 |
@@ -811,6 +884,16 @@ API 不直接写 `review_tasks` —— 文件风险排序和规则检索由编�
   真实规模下的表现只有 M9 的评测集能回答。
 - **GitHub 真实二级限流只能用桩模拟。** `tests/github_stub.py` 模拟
   429/403 → 退避 → 201 的序列。桩是模型，不是真相。
+- **M7 的第三步（真实靶场仓库）还没做。** 所以现在 `python tasks.py demo`
+  走完 publish 会得到 `publish_failed` + 一个 404 —— 因为
+  `fixtures/webhook_pr.json` 里的仓库（`demo/sfly-playground`）**是个编出来的
+  名字**，真实 GitHub 上不存在。这不是 bug，是「载荷还是录制的」这件事的
+  直接后果；第三步会用真实 PR 重新录一份。另外 `python tasks.py review`
+  （从 diff 直接跑）**恒为 dry-run**：那条路上的 `repo_id` 是为了让幂等键
+  成立而编的，拿它去调 GitHub 只会稳定 404。
+- **闸 1 的真实重放路径没有在端到端里走到。** 「数据库里已有 comment id 就
+  不重发」由单测覆盖，端到端只验证到「id 真的落库了」。要在真实栈上触发它，
+  得让图重放 `publish` 节点（比如发布过程中重启编排器），这个场景没有构造。
 - **Render 冷启动无法自动化测试。** 免费版休眠后首次请求约需 60 秒（Render 唤醒
   约 60s + Neon 唤醒约 1s）。需要人工冒烟测试并记录实测耗时。
 - **Neon 免费版空闲 5 分钟挂起且无法关闭。** 连接池必须传

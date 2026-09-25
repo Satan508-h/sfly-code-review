@@ -38,10 +38,21 @@ MAX_LISTED = 25
 MAX_QUOTE_CHARS = 300
 
 
+def marker_for(task_id: str) -> str:
+    """正文第一行的隐藏标记。
+
+    **签发（这里）和识别（``publish`` 节点）必须是同一个函数。** 它们曾经是
+    两处字面量，而那种重复的失效方式很安静：格式一改，新写的标记还在
+    （正文照常发出去），老的那行查找却永远匹配不上 —— 于是防重复评论的
+    第二道闸变成了一句空话，而它「不工作」和「没有重复可防」看起来一模一样。
+    """
+    return f"<!-- sfly:run:{task_id} -->"
+
+
 def render_comment(report: ReviewReport) -> str:
     """把报告渲染成 PR 评论的 Markdown 正文。"""
     lines: list[str] = [
-        f"<!-- sfly:run:{report.task_id} -->",
+        marker_for(report.task_id),
         "## 🤖 sfly 审查报告",
         "",
         _verdict(report),
@@ -137,9 +148,9 @@ def _finding_block(finding: AggregatedFinding) -> str:
         finding.message,
     ]
     if finding.evidence:
-        out.append(f"> 证据：`{_clip(finding.evidence)}`")
+        out.append(f"> 证据：`{clip_quote(finding.evidence)}`")
     if finding.suggestion:
-        out.append(f"> 建议：{_clip(finding.suggestion)}")
+        out.append(f"> 建议：{clip_quote(finding.suggestion)}")
     if finding.rule_id:
         out.append(f"> 依据规则：`{finding.rule_id}`")
     if finding.needs_human_review:
@@ -161,8 +172,12 @@ def _sources(finding: AggregatedFinding) -> str:
     return f"{'、'.join(names)} 共 {len(names)} 个 Worker 独立报出"
 
 
-def _clip(text: str) -> str:
-    """截断并**说明截断了**。一个戛然而止的引用看起来像渲染坏了。"""
+def clip_quote(text: str) -> str:
+    """截断并**说明截断了**。一个戛然而止的引用看起来像渲染坏了。
+
+    公开（没有下划线）是因为 ``publish`` 节点也要用它拼行内评论的正文 ——
+    同一段 LLM 证据在两个地方出现，两处的截断规则必须是同一个数字。
+    """
     flat = " ".join(text.split())
     if len(flat) <= MAX_QUOTE_CHARS:
         return flat

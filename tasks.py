@@ -10,6 +10,7 @@
     python tasks.py test-int    集成测试：同一份队列契约对着真 Redis + Postgres 再跑一遍
     python tasks.py tables      看数据库建了哪些表、迁移到第几版（M4 验收）
     python tasks.py demo-reclaim 队列容错演示：副本猝死 → 回收 → 重投（不需要全栈）
+    python tasks.py stub-github 起一个 GitHub 桩：手工演示「被限流 → 退避 → 重发」
     python tasks.py demo        端到端演示：同一份 webhook 投 3 次 → 1 个 run
     python tasks.py scale 3     把 worker-security 扩到 3 个副本
     python tasks.py kill-worker 杀掉一个 Worker，验证容错
@@ -372,6 +373,35 @@ def cmd_demo_reclaim(_: argparse.Namespace) -> None:
     run([_py(), str(script)])
 
 
+def cmd_stub_github(args: argparse.Namespace) -> None:
+    """起 GitHub 桩，用来手工看「被限流之后真的会退避重试」。
+
+    **必须走 ``_py()``**（项目解释器）：那个脚本 import 了 ``apps/api`` 的
+    补丁转换函数（避免把 diff 重建逻辑抄第二遍），所以系统 Python 跑它会报
+    ``No module named 'sfly_api'`` —— 一个看起来像缺依赖、其实是解释器不对的错。
+
+    配合的用法（另一个终端）：
+
+        python tests/github_stub.py             # 本命令
+        # .env 里把 GITHUB_API_BASE 指向宿主机的 8099，然后重启编排器
+        python tasks.py demo --new-delivery     # 日志里会出现两条 github.retry
+    """
+    script = ROOT / "tests" / "github_stub.py"
+    _step(f"GitHub 桩：前 {args.rate_limit_times} 次发布返回限流（retry-after={args.retry_after}）")
+    run(
+        [
+            _py(),
+            str(script),
+            "--port",
+            str(args.port),
+            "--rate-limit-times",
+            str(args.rate_limit_times),
+            "--retry-after",
+            args.retry_after,
+        ]
+    )
+
+
 def cmd_tables(_: argparse.Namespace) -> None:
     """看数据库里建了哪些表、迁移到第几个版本 —— **M4 的验收就是这条命令**。
 
@@ -648,6 +678,17 @@ def build_parser() -> argparse.ArgumentParser:
     add("test-int", cmd_test_int, "集成测试（需要 Docker）")
     add("test-e2e", cmd_test_e2e, "端到端测试（需要真实密钥，会花钱）")
     add("eval", cmd_eval, "评测集：精确率/召回率/成本")
+
+    add(
+        "stub-github",
+        cmd_stub_github,
+        "起一个 GitHub 桩（限流 / 422 / 分页），手工演示退避重试用",
+        [
+            (("--port",), {"type": int, "default": 8099}),
+            (("--rate-limit-times",), {"type": int, "default": 2, "help": "前几次发布返回限流（默认 2）"}),
+            (("--retry-after",), {"default": "1", "help": "retry-after 头的值（秒）"}),
+        ],
+    )
 
     add("lint", cmd_lint, "ruff 检查 + 格式校验")
     add("fmt", cmd_fmt, "自动格式化")

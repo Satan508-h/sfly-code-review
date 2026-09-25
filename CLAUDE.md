@@ -284,6 +284,28 @@ M5 实测踩到：报告显示 `degraded=True` 而 `missing_workers=[]`，前端
 `worker.result` 排在 `run.finished` 后面。那不是排序问题，是**写事件的人站错了
 位置**：这件事的因果起点是「Worker 写完了结果」，就该由 Worker 在那一刻记下来。
 
+**「投递失败」和「审查失败」是两个终态，而且 dry-run 不是失败。**
+`publish` 发不出去时写 `publish_failed` 而**不是** `failed`：报告已经落库、
+钱也花了，重算一遍只会再花一次 —— 而两者在 UI 上的处置完全不同（一个该有
+「重新发布」按钮，一个该去查 Worker）。同一个判断还有两个容易写错的地方：
+
+* **`posted=false` 有两种来源** —— 没配 token（本来就没打算发）和真的发失败了。
+  用一个字段表示两件事的后果是：dry-run 的 run 被记成 `publish_failed`，于是
+  「本地不需要密钥就能跑通全链路」这句话在**状态层面**变成假的（每个 run 都
+  带着一个红灯）。现在状态和事件类型都由 `_Outcome.delivery_failed` 决定。
+* **节点绝不向上抛异常。** 抛出去的表现是 run 停在 `aggregating`，而扫描器的
+  `due_runs` 只看 `dispatched`/`waiting` —— **没有任何东西能唤醒它**。
+  M7 实测就漏了这个 `try`（模块文档写着「绝不向上抛」，代码里却没有），
+  是单测逼出来的。
+
+**review 被拒（422）时退一格重发，不解析错误消息。**
+两种 422 —— 给自己的 PR 请求修改、行号不在 diff 里 —— 处置方式正好相反，
+而且**可能同时出现**；解析 GitHub 的措辞来决定怎么办是脆的（它改个说法就失效）。
+阶梯是 `review+行内` → `review` → `COMMENT` → **普通评论**（换端点，没有行号
+可以不对），最后一格没有可以被拒的地方。**只有 422 往下走**：403/5xx 是
+「这次不行」，不是「这样发不行」，退到最后一格也一样，那只是白费几次请求。
+降级是**可见**的（事件里的 `form` 和 `reason`），不是悄悄换个行为。
+
 **验签必须对原始字节做，不对重新序列化后的 JSON 做。**
 `sha256=HMAC(secret, raw_body)`。先 `json.loads` 再 `json.dumps` 回去验签，
 键顺序/空白/非 ASCII 转义都可能变，于是 HMAC 一定对不上 —— 而症状是
@@ -416,6 +438,9 @@ python tasks.py test-int   # 集成测试（需 Docker 里的 Redis + Postgres�
 python tasks.py test-e2e   # 端到端（需真实密钥，会花钱，有 $2 上限）
 python tasks.py eval       # 评测集 → reports/eval-<sha>.md
 python tasks.py demo-reclaim  # 队列容错演示：副本猝死 → 回收 → attempt=2（只要 Redis）
+python tasks.py stub-github   # 起 GitHub 桩（限流/422/分页），手工看退避重发
+                              # **必须走 tasks.py**：那个脚本 import 了 apps/api 的
+                              # 转换函数，用系统 python 直接跑会报 No module named 'sfly_api'
 
 python tasks.py lint       # ruff check + format --check
 python tasks.py fmt        # 自动格式化

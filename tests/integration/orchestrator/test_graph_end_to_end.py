@@ -31,8 +31,10 @@ import pytest
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph.state import CompiledStateGraph
 
-from factories import bootstrap, demo_patches
+from factories import api_files_from_diff, bootstrap, demo_patches
+from github_stub import GitHubStub, recorded_repo
 from redis_support import redis_test_url
+from sfly_agent.github import GitHubClient
 from sfly_agent.state import ReviewState
 from sfly_bus.base import Lock, TaskQueue
 from sfly_bus.postgres import PostgresRunStore
@@ -559,3 +561,58 @@ async def test_the_run_row_records_the_plan(
     assert planned.files_reviewed == len(msg.file_patches)
     assert planned.deadline_at > datetime.now(UTC), "deadline 应当是未来（跑完时还没到）"
     assert planned.dispatched_at is not None
+
+
+# --------------------------------------------------------------------------- #
+# 7. publish 真的把评论发出去了 —— 对着 GitHub 桩的**真 HTTP**
+# --------------------------------------------------------------------------- #
+
+
+async def test_publish_posts_a_real_comment_over_real_http(
+    ctx: NodeContext, store: PostgresRunStore, checkpointer: AsyncPostgresSaver
+) -> None:
+    """**M7 的验收测试（不需要 token 的那一半）。**
+
+    ``tests/unit/orchestrator/test_publish.py`` 用的是手写的假客户端，所以它
+    验证不了「我们拼出来的请求体 GitHub 收不收」—— 而那正是这一层要买的东西。
+    这里发的是**真 HTTP**，桩按真实 GitHub 的规则校验：行内评论的行号必须
+    落在变更行上，否则拒**整个** review（连汇总正文一起）。
+
+    桩的文件列表取自**同一个 fixture**（``api_files_from_diff`` 把
+    ``security_demo.diff`` 转成 ``/pulls/{n}/files`` 的响应形状）。所以桩认得的
+    变更行和 ``plan`` 节点算出来的完全一致 —— 「行内评论被接受」才是真的被
+    验证了，而不是因为桩根本不检查。
+    """
+    with GitHubStub(files=api_files_from_diff()) as stub:
+        client = GitHubClient(token="test-token", base_url=stub.base_url)
+        try:
+            wired = NodeContext(
+                store=ctx.store, queue=ctx.queue, lock=ctx.lock, settings=ctx.settings, github=client
+            )
+            graph = _build(wired, checkpointer)
+            # repo_id 必须是桩认得的那个仓库（桩对别的仓库一律 404，
+            # 和真实 GitHub 对无权访问的仓库是同一种回答）。
+            msg = bootstrap(repo_id=recorded_repo(), file_patches=demo_patches())
+            run = await store.create_run(msg)
+
+            async with running_pipeline(wired, graph, workers=True):
+                await wired.queue.publish_bootstrap(msg)
+                await _wait_event(store, run.task_id, "run.finished")
+        finally:
+            await client.aclose()
+
+        assert len(stub.state.reviews) == 1, f"应该只发一条 review，实际请求：{stub.state.requests}"
+        review = stub.state.reviews[0]
+        assert f"<!-- sfly:run:{run.task_id} -->" in review["body"]
+        assert review["comments"] > 0, "行内评论被拒了 —— 桩认得的变更行和 plan 算出来的对不上"
+
+    stored = await store.get_run(run.task_id)
+    assert stored is not None
+    assert stored.status is RunStatus.PUBLISHED
+    # **id 落库了** —— 这是防重复评论的第一道闸，也是「重放不会重发」的前提。
+    assert stored.github_comment_id == review["id"]
+
+    published = next(e for e in await store.events_since(run.task_id, 0) if e.kind == "publish.done")
+    assert published.payload["posted"] is True
+    assert published.payload["comment_id"] == review["id"]
+    assert published.payload["inline_skipped"] == 0
