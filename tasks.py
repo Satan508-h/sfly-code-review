@@ -7,6 +7,8 @@
 
     python tasks.py up          一键起全部服务并等健康检查通过
     python tasks.py test        全量单测（不需要 Docker、不需要密钥）
+    python tasks.py test-int    集成测试：同一份队列契约对着真 Redis 再跑一遍
+    python tasks.py demo-reclaim 队列容错演示：副本猝死 → 回收 → 重投（不需要全栈）
     python tasks.py demo        端到端演示：投递 3 次 webhook
     python tasks.py scale 3     把 worker-security 扩到 3 个副本
     python tasks.py kill-worker 杀掉一个 Worker，验证容错
@@ -308,8 +310,22 @@ def cmd_test(_: argparse.Namespace) -> None:
 
 
 def cmd_test_int(_: argparse.Namespace) -> None:
-    _step("集成测试（需要 Docker，用 Mock LLM）")
-    _pytest("integration")
+    """集成测试。**依赖不可达时是失败，不是 skip** —— 见 tests/integration/conftest.py。"""
+    _step("集成测试（需要 Docker 里的 Redis，用 Mock LLM）")
+    # -ra：把 skip/失败的原因打出来。默认的 -q 会把「30 个测试因为依赖不在
+    # 而全部跳过」显示成一行绿字，那是最容易骗过自己的输出形态。
+    _pytest("integration", extra=["-ra"])
+
+
+def cmd_demo_reclaim(_: argparse.Namespace) -> None:
+    """队列层容错演示：一个消费者猝死，同伴把它手里的活接过去跑完。
+
+    M3 的可运行证据。完整的 `kill-worker` 演示要等 M4/M5（Worker 常驻循环需要
+    Postgres 仓储、屏障闭合需要编排器），但它依赖的机制就是这里跑的这几步。
+    """
+    script = ROOT / "scripts" / "demo_reclaim.py"
+    _step("队列容错演示：副本猝死 -> XAUTOCLAIM 回收 -> 重投 attempt=2")
+    run([_py(), str(script)])
 
 
 def cmd_test_e2e(_: argparse.Namespace) -> None:
@@ -502,6 +518,7 @@ def build_parser() -> argparse.ArgumentParser:
         [(("replicas",), {"type": int, "nargs": "?", "default": 3})],
     )
     add("kill-worker", cmd_kill_worker, "容错演示：杀死一个 worker-security")
+    add("demo-reclaim", cmd_demo_reclaim, "队列容错演示：副本猝死 → 回收重投（不需全栈）")
 
     add("test", cmd_test, "单测（默认，无需 Docker/密钥）")
     add("test-int", cmd_test_int, "集成测试（需要 Docker）")

@@ -19,18 +19,26 @@ import ast
 from pathlib import Path
 
 import pytest
-from queue_contract import bootstrap
 
+from contracts.queue_contract import bootstrap
 from sfly_bus.base import (
     CONSUMER_GROUPS,
     STREAMS,
+    WORKER_TYPES,
     Lock,
     MessageHandle,
     TaskQueue,
     group_for,
 )
-from sfly_bus.memory import WORKER_TYPES, InMemoryLock, InMemoryQueue
+from sfly_bus.memory import InMemoryLock, InMemoryQueue
+from sfly_bus.redis_streams import RedisLock, RedisStreamsQueue
 from sfly_shared.contracts import WorkerType
+
+#: 一个没人监听的 Redis 地址。**这里刻意连不上任何东西** ——
+#: 下面几条测的是「形状对不对」，不是「能不能跑」，而两个实现的构造函数
+#: 都不产生网络 IO（连是 ``start()`` 才做的事），所以不需要真的 Redis。
+#: 这也让这几条测试留在单测层（无 Docker、毫秒级）。
+DEAD_URL = "redis://127.0.0.1:1/15"
 
 # --------------------------------------------------------------------------- #
 # 结构一致性
@@ -43,8 +51,37 @@ def test_memory_queue_satisfies_the_task_queue_protocol() -> None:
 
 
 @pytest.mark.unit
+def test_redis_queue_satisfies_the_task_queue_protocol() -> None:
+    """Redis 实现也必须满足协议 —— 不需要真的 Redis 就能查。
+
+    ``@runtime_checkable`` 只查「有没有这个名字」、不查签名，所以它抓不到
+    「``reclaim`` 少了个参数」这类漂移。真正查签名的是 mypy 和那份共用契约，
+    这条是第三道、也是最便宜的一道：对着一个连不上的地址构造出来即可。
+    """
+    assert isinstance(RedisStreamsQueue(DEAD_URL), TaskQueue)
+
+
+@pytest.mark.unit
 def test_memory_lock_satisfies_the_lock_protocol() -> None:
     assert isinstance(InMemoryLock(), Lock)
+
+
+@pytest.mark.unit
+def test_redis_lock_satisfies_the_lock_protocol() -> None:
+    assert isinstance(RedisLock(DEAD_URL), Lock)
+
+
+@pytest.mark.unit
+def test_both_implementations_expose_the_same_maintenance_methods() -> None:
+    """两种实现各自的自省接口**必须同名同义**。
+
+    它们不在 Protocol 里（契约测试用不上），但排查手法的价值恰恰在于
+    「两种模式用的是同一套动作」—— 名字一分叉，线上出问题时就会有人去
+    ``redis-cli`` 里数一遍 PEL，而精简模式那边根本没有这个动作。
+    """
+    for name in ("pending_count", "trim", "reclaim", "lag"):
+        assert hasattr(InMemoryQueue(), name), f"内存实现缺 {name}"
+        assert hasattr(RedisStreamsQueue(DEAD_URL), name), f"Redis 实现缺 {name}"
 
 
 @pytest.mark.unit

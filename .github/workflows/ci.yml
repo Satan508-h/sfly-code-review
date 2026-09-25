@@ -1,9 +1,17 @@
-# CI：lint + 单测。
+# CI：lint + 单测 + 队列契约（对着真 Redis 跑）。
 #
-# 刻意**只跑单测**，不需要 Docker、不需要任何密钥 —— 这是刻意的门槛设计：
-# 一个需要外部依赖才能跑的 CI，在被 fork 或在新环境里第一次跑就会红，
-# 然后人们就开始忽略它。集成测试（需要 Docker 和 testcontainers）和
-# 端到端测试（需要真实 DeepSeek 密钥，会花钱）留给本地和 M9 的夜间任务。
+# 两个 job 的分工是刻意的：
+#
+# * **check** 不需要任何外部依赖、不需要密钥 —— 这是门槛设计：一个需要外部
+#   依赖才能跑的 CI，在被 fork 或在新环境里第一次跑就会红，然后人们就开始
+#   忽略它。端到端测试（真实 DeepSeek 密钥，会花钱）仍然留给本地和 M9 的
+#   夜间任务。
+# * **contract** 起一个真的 Redis，把**同一份**队列契约再跑一遍。
+#   这一条不是「多一份测试」——它是项目中心论点（一套代码、两种拓扑）的证据。
+#   没有这个 job，那份契约会慢慢退化成「只有内存后端在跑」，而
+#   **不会有任何东西报错**：测试全绿、覆盖率不降，只是证据没了。
+#   testcontainers 用不上（CI 里没有 Docker daemon 可用），所以这里用
+#   service container —— 契约测试只需要一个能连上的 REDIS_URL。
 #
 # 命令与本地完全一致（见 Makefile / tasks.py），所以「本地过了 CI 挂了」
 # 这种事不会发生。
@@ -61,3 +69,40 @@ jobs:
         # 构建整栈太重，但配置文件语法错误应该在 CI 里就拦住 ——
         # 这类错误只会在别人 clone 下来跑 `docker compose up` 时才暴露。
         run: docker compose config --quiet
+
+  contract:
+    # 队列/锁协议的契约测试，对着**真 Redis** 再跑一遍。
+    # 这是「一套代码、两种拓扑」这个论点的证据本身，所以它值得一个 job。
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      redis:
+        image: redis:7-alpine
+        # 起 redis-server 自己；健康检查等 PING 通 —— 不等的话测试会撞上
+        # 一个还没起来的实例，然后报出一个看起来像代码问题的连接错误。
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+        ports:
+          - 6379:6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: 按 lock 文件同步依赖
+        run: uv sync --frozen --all-packages
+
+      - name: 队列/锁契约（真 Redis）
+        # REDIS_URL 指向 service container。测试自己会用 db 15，
+        # 并且**只在确认库号是 15 时**才 flushdb（见 tests/redis_support.py）。
+        env:
+          REDIS_URL: redis://localhost:6379/0
+        run: uv run pytest -m integration -o addopts="-q --strict-markers -ra"

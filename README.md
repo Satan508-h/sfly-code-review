@@ -81,17 +81,57 @@ CI 就只能一律当成失败。
 
 容器内跑同一份 fixture 得到**逐字节相同**的输出（证明规则库随镜像正确分发）。
 
-345 个单测通过；ruff + mypy strict（含 tests）全绿。
+354 个单测 + 30 个集成测试通过；ruff + mypy strict（含 tests）全绿。
 
-### M2 已完成：传输层（队列 / 锁 / 指纹）
+### M3 已完成：Redis Streams（队列 / 锁 / 回收）
 
-「一套代码、两种拓扑」这句话在 M2 之前只是一个声明 —— 因为那时只有一种传输
-实现（Redis），另一种还不存在。M2 交出的是**第二种实现**和**它必须满足的契约**：
+M2 交出了「第二种实现」，M3 交出的是**第一种实现的真实版本** ——
+`RedisStreamsQueue`（`XADD` / `XREADGROUP` / `XACK` / `XAUTOCLAIM` / `MAXLEN`
+/ 死信 / 重试计数）和 `RedisLock`（`SET NX PX` + Lua 比对释放）。
+
+关键不在于写了多少行，而在于**证据现在是被执行出来的**：
+
+```
+tests/contracts/queue_contract.py       ← 一份契约（14 条）
+tests/contracts/lock_contract.py        ← 一份契约（6 条）
+   ├── tests/unit/bus/test_memory_queue.py          → InMemoryQueue（无 Docker）
+   ├── tests/unit/bus/test_memory_lock.py           → InMemoryLock
+   ├── tests/integration/bus/test_redis_queue.py    → RedisStreamsQueue（真 Redis）
+   └── tests/integration/bus/test_redis_lock.py     → RedisLock
+```
+
+**两个后端继承同一个类，一行断言都没有为 Redis 放宽。** CI 里有一个专门的
+`contract` job 起一个真 Redis 跑这条路径 —— 因为「只有一种后端在跑」这件事
+不会报错，它只会让测试全绿、覆盖率不降，而证据悄悄消失。
+
+M3 找到并修掉的三处问题，都不是写代码时能想到的：
+
+| 现象 | 真因 |
+|---|---|
+| 内存实现 `reclaim()` 返回 1，Redis 返回 0 | 内存实现给被裁掉的条目留了「墓碑」，而 Redis 里那条消息**已经不存在了**，没有东西可以重投。改的是内存实现，见 `memory.py` 的 `_purge` |
+| 契约里「无参回收覆盖全部组」在内存实现上漏了 `review_bootstrap` | 编排器在 `ingest` 中途崩掉时，那条 bootstrap 会永远躺在 PEL 里 —— 症状是「这个 run 再也不动了」，没有任何日志 |
+| `InMemoryQueue.start()` 的顺序：先判 `_started` 再判 `_closed` | 「start → close → start」会命中捷径、安静地返回，于是一个已经关闭的队列看起来启动成功了 |
+
+另外实测纠正了一个**我一开始读错的现象**：第一次跑 `redis-cli` 时看到
+「`XTRIM` 之后 `XPENDING` 少了一条」，于是照着「Redis 在裁剪时会清 PEL」去写了
+内存实现。真相是那段脚本里紧跟着的 `XAUTOCLAIM` 干的 —— `XTRIM` 只从流里删条目，
+PEL 里那个 id 会悬着，直到下一次回收才被清掉。这类错误没有报错、没有异常，
+只有一条会红的测试能挡住它，所以现在有这么一条。
+
+**可运行的演示**（不需要全栈，只要一个 Redis）：
+
+```bash
+python tasks.py demo-reclaim
+```
+
+它跑的是「`--scale` 与 `docker kill` 那些场景」依赖的机制本身：两个消费者竞争
+同一个消费者组 → 一个副本在处理中途猝死（不 ack）→ 现场只剩 PEL 里一条没人认领的
+记录 → 同伴 `reclaim()` 抢回来 → **重投时 `attempt` 变成 2**。
+
+### M2 已完成：传输层的内存实现与共用契约
 
 * `InMemoryQueue` / `InMemoryLock` —— 精简模式的实现
-* `tests/unit/bus/queue_contract.py` —— 两个后端**共用**的行为契约。
-  M3 的 `test_redis_streams.py` 只要继承同一个类，下面每一条就都会在 Redis 上
-  再跑一遍。**这个文件才是卖点的证据**，不是那两个类。
+* `tests/contracts/` —— 两个后端**共用**的行为契约（M3 已把 Redis 接进来）
 * 发现指纹（`sfly_agent/aggregate/fingerprint.py`）—— 去重快速路径的键，
   全确定性，跨进程稳定
 
@@ -103,7 +143,7 @@ CI 就只能一律当成失败。
 | 每组独立游标，**发布是扇出** | 组是独立游标而不是分工：一条任务三个组各读一遍，各自按 `worker_type` 过滤并 ack。做成「谁先抢到归谁」的话，`--scale` 和 lag 口径全错 |
 | 每组的 PEL + 投递计数 | `attempt` 是死信判定的依据，必须跨回收保留 |
 | 回收是「放回可投递」而非直接返回 | `reclaim()` 返回计数，所以消费者的消息来源只有一个 |
-| 裁剪留下墓碑 | 被裁掉的条目仍可能留在别人的 PEL 里 —— 消费循环必须 ack 掉它，而不是把空 payload 交给解析器 |
+| 裁剪是从所有人的视角消失 | 被裁掉的条目既不会被投递，也不会永久卡在 PEL 里。清理**时机**两个后端不同（内存即时、Redis 惰性），但可观察的结果必须一样 |
 
 **契约测试自己也做了验证**：拿两个故意坏掉的实现跑了一遍 ——
 一个让每次投递都重复一遍、一个让 `ack()` 变成空操作 —— 各自都被抓住
@@ -126,11 +166,17 @@ Redis 7.4.11 的真实版本与毫秒级延迟。依赖故障行为逐条验过�
 那只会把一次数据库抖动放大成一次全站重启，且 `restart: unless-stopped` 会让
 日志被退避重启信息冲掉。详见 [CLAUDE.md](CLAUDE.md) 约定 #6。
 
-**还差什么**：传输层已经有了（M2），但 Redis 那一半要等 M3，
-所以现在**还演示不了** `--scale` 与 `docker kill` 那些场景。
-Worker 的常驻消费循环、`review_bootstrap → review_tasks → review_results →
-dead_letter` 四条的端到端流转、LangGraph 图分别是 M3 / M5 的交付物。
-现在每个 Worker 只能对着一份 diff 跑一次。
+**还差什么**：传输层两种实现都齐了（M2/M3），队列层的容错已经是可运行的
+（`python tasks.py demo-reclaim`）。还差的是**把它们串起来的那一层**：
+
+* Worker 的常驻消费循环要等 **M4** —— 投递顺序铁律要求「先落库、再 XADD、
+  最后 XACK」，而落库要 Postgres 仓储
+* `review_bootstrap → review_tasks → review_results → dead_letter` 四条的端到端
+  流转、屏障闭合、`docker kill` 之后 run 照样跑完，要等 **M5** 的 LangGraph 图
+  与 coordinator
+
+所以现在每个 Worker 只能对着一份 diff 跑一次；`--scale` 与 `docker kill` 那两个
+场景的**机制**已经验证过了，但还没有一条真正的 run 从它们上面走过去。
 
 进度见 [CLAUDE.md](CLAUDE.md) 末尾的清单，或前端首页。
 
@@ -267,11 +313,12 @@ DeepSeek 走 OpenAI 兼容接口，所以换成 OpenAI、vLLM 或本地模型只
 | **零密钥就能审代码** | `python -m sfly_workers --spec security --diff fixtures/security_demo.diff` | 10 条 finding，行号全部落在变更行上；`\| jq` 直接可用 |
 | **干净代码上不乱报** | 同上，换成 `fixtures/clean.diff` | 三个 Worker 都返回 `{"findings": []}` |
 | **坏 JSON 不会毁掉结果** | `MOCK_LLM_FAILURE_RATE=1.0` 再跑上一条 | 每一次调用都返回坏 JSON，仍然出结果（修复阶梯接住了） |
-| **两种拓扑共用一套代码** | `python tasks.py test` 里的 `tests/unit/bus/queue_contract.py` | 同一份契约测试，M3 之后会在内存与 Redis 两个后端上各跑一遍 |
+| **两种拓扑共用一套代码** | `python tasks.py test` + `python tasks.py test-int` | **同一份**契约（`tests/contracts/queue_contract.py`）在内存后端与真 Redis 上各跑一遍 —— 14 条 + 6 条，一条都没有为哪一端放宽 |
 | 依赖真实可达 | `python tasks.py health` | Postgres / Redis 的**版本号**与毫秒延迟，不是照抄配置 |
 | 依赖挂了不误伤 | `docker pause sfly-postgres-1` | `/healthz` 仍 200、容器仍 healthy、`/api/health` 503；`docker unpause` 后自动恢复 |
-| Worker 水平扩展 | `python tasks.py scale 3` | `worker-security` 变成 3 个副本，日志里出现 3 个消费者实例 |
-| Worker 猝死不影响结果 | `python tasks.py kill-worker` | run 照样跑完，UI 显示「1 个 Worker 降级」徽章 |
+| **副本猝死，同伴接手** | `python tasks.py demo-reclaim` | 4 条任务被两个副本瓜分 → 一个副本中途消失 → PEL 里留下 1 条没人认领的记录 → `reclaim()` 抢回 → 重投的 `attempt` 是 2（不需要全栈，只要一个 Redis） |
+| Worker 水平扩展 | `python tasks.py scale 3` | `worker-security` 变成 3 个副本 —— **但 3 个消费者实例要等 M4**：常驻消费循环需要 Postgres 仓储 |
+| Worker 猝死不影响结果 | `python tasks.py kill-worker` | run 照样跑完，UI 显示「1 个 Worker 降级」徽章 —— **等 M5**：屏障闭合需要编排器 |
 | Webhook 幂等 | 同一 payload 连投 3 次 | 1 个 run + 2 个 `duplicate` 响应 |
 | 断点恢复 | `docker restart sfly-orchestrator-1` | 从 Postgres 的 checkpoint 续跑，不重复发评论 |
 | Redis 重启不丢任务 | `docker restart sfly-redis` | 扫描器按 `attempt+1` 重派，消息排空 |
@@ -381,6 +428,11 @@ API 不直接写 `review_tasks` —— 文件风险排序和规则检索由编�
 写在前面而不是藏在最后：一个未被说明的限制会被当成经验不足，一个被说明的限制
 则是严谨。
 
+- **worker 容器现在会退出并重启。** 队列层（M3）已经就绪，但常驻消费循环要等
+  M4 的 Postgres 仓储（投递顺序铁律要求先落库）。它退出时会打一条说明，不是
+  静默失败 —— 而 `docker compose ps` 里它们仍然显示 `healthy`，因为健康检查看的是
+  心跳文件、不探测依赖（约定 #6）。这个「看起来健康其实在重启」的状态会在 M4 消失，
+  在那之前它是本项目最容易被误读的一处输出。
 - **GitHub 真实二级限流只能用桩模拟。** `infra/github/stub_server.py` 模拟
   429 → 退避 → 201 的序列。桩是模型，不是真相。
 - **Render 冷启动无法自动化测试。** 免费版休眠后首次请求约需 60 秒（Render 唤醒

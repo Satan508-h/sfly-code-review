@@ -39,14 +39,23 @@ apps/
 packages/
   shared/        sfly_shared — 领域契约（contracts.py）、配置、ID 生成
   bus/           sfly_bus — TaskQueue / RunStore / Lock 协议 + 两种实现 + migrations
+                 （锁和队列放在一起：memory.py 有 InMemoryQueue + InMemoryLock，
+                   redis_streams.py 有 RedisStreamsQueue + RedisLock）
   agent-core/    sfly_agent — LLM 抽象与结构化输出、RAG、聚合算法、GitHub 客户端
 web/             Vue 3 + Element Plus + Vite SPA
 infra/           postgres init.sql、redis.conf、nginx 配置、GitHub 限流桩
 fixtures/        diff 样例、webhook payload、大 PR fixture
-scripts/         replay_webhook.py、measure_overhead.py、seed_db.py
-tests/           unit（无 Docker 无密钥）/ integration（需 Docker）/ e2e（需真实密钥）/ eval
+scripts/         replay_webhook.py、measure_overhead.py、seed_db.py、demo_reclaim.py
+tests/           contracts/（两后端共用的契约，被 unit 与 integration 同时导入）
+                 unit（无 Docker 无密钥）/ integration（需 Docker 里的 Redis）/ e2e / eval
 reports/         评测报告，提交进仓库
 ```
+
+**`tests/contracts/` 是「两种拓扑」这个卖点的证据本身**：`queue_contract.py`
+和 `lock_contract.py` 各是一份行为契约，两种实现各继承一次 ——
+`tests/unit/bus/test_memory_*.py` 与 `tests/integration/bus/test_redis_*.py`。
+在下面加一条测试，四个文件同时受益；而**放宽某一条断言就等于毁掉证据**，
+所以契约里只准用 Protocol 上的方法（见该文件开头的三条纪律）。
 
 **数据流**：`review_bootstrap → review_tasks → review_results → dead_letter`
 
@@ -144,6 +153,25 @@ DeepSeek 的 `json_schema` 未文档化，`strict` 工具模式要 Beta 端点�
 **任何可能卡住的状态都必须是一行带 `deadline_at` 的记录。**
 写不成一条 `SELECT` 的恢复查询，说明状态藏在了会丢失的地方。
 
+**裁剪和回收是两件事，别把它们当成一件事。** 实测（Redis 7.4）：`XTRIM` 只从流里
+删条目，**不动 PEL** —— 被裁掉的消息的 id 会悬在 PEL 上，直到下一次 `XAUTOCLAIM`
+才被摘掉并在返回值的第三段里报出来。两个后端的**清理时机**因此不同（内存实现在
+裁剪那一刻就清，Redis 惰性），但**可观察的结果必须一样**：既不会被投递，也不会
+被当成「待重投」送回来。契约只断言结果，不断言时机。
+
+> 这条是被一次读错纠正的：第一次跑 `redis-cli` 看到「`XTRIM` 之后 `XPENDING`
+> 少了一条」，就照着「Redis 在裁剪时会清 PEL」去写了内存实现 —— 而那个读数是
+> 同一段脚本里紧跟着的 `XAUTOCLAIM` 造成的。**照着读错的现象写实现不会有任何
+> 报错**，只会让两个后端在某条路径上悄悄分叉。现在 `tests/integration/bus/
+> test_redis_queue.py` 里有一条专门钉住真实机制的测试。
+
+**`redis.exceptions.ConnectionError` 不是内置的 `ConnectionError`。**
+它继承自 `RedisError`，与内置的那个没有关系 —— 写 `except ConnectionError` 时
+捕到的是内置的，于是 redis-py 的连接错误会**穿过**这个分支。同一件事也发生在
+`retry_on_error=[ConnectionError, TimeoutError]` 上：redis-py 的 `Retry` 默认就认
+它自己那两个异常，写内置版本不但没有效果，还会让人以为已经配了重试。
+`redis_streams.py` 里用 `RedisConnectionError` / `RedisTimeoutError` 别名区分。
+
 **Windows 上必须用 `sfly_shared.aio.run()`，不能用 `asyncio.run()`。**
 Windows 默认的 `ProactorEventLoop` 不支持 `add_reader`，而 psycopg v3 的异步模式正是靠它实现的 —— 不换循环，进程能起来、日志正常、然后在第一次查询时炸掉，报
 `Psycopg cannot use the 'ProactorEventLoop' to run in async mode`。所有 `__main__.py` 和
@@ -173,9 +201,10 @@ python tasks.py ps         # 各容器健康状态
 python tasks.py health     # 依赖真实连通性（探 /api/health，不是 /healthz）
 
 python tasks.py test       # 单测（无 Docker、无密钥；Linux/CI 约 2s，Windows 约 16s）
-python tasks.py test-int   # 集成测试（需 Docker，Mock LLM）
+python tasks.py test-int   # 集成测试（需 Docker 里的 Redis；用 db 15，跑前 flushdb）
 python tasks.py test-e2e   # 端到端（需真实密钥，会花钱，有 $2 上限）
 python tasks.py eval       # 评测集 → reports/eval-<sha>.md
+python tasks.py demo-reclaim  # 队列容错演示：副本猝死 → 回收 → attempt=2（只要 Redis）
 
 python tasks.py lint       # ruff check + format --check
 python tasks.py fmt        # 自动格式化
@@ -227,7 +256,7 @@ python tasks.py demo           # 端到端：投递 3 次同一 webhook → 1 ru
 - [x] M0 — workspace、`sfly_bus` 连接层、`/api/health` 真实依赖探测
 - [x] M1 — diff 解析、Mock LLM、修复阶梯、规则库、`--diff` 独立 CLI
 - [x] M2 — 队列协议 + InMemoryQueue / InMemoryLock + 指纹 + 两后端的契约测试骨架
-- [ ] M3 — RedisStreamsQueue（含 XAUTOCLAIM / 死信 / 重试计数）
+- [x] M3 — RedisStreamsQueue（含 XAUTOCLAIM / 死信 / 重试计数）+ RedisLock + 契约跑真 Redis
 - [ ] M4 — Postgres schema + 幂等 migrate
 - [ ] M5 — LangGraph 图（高风险：`interrupt()`）
 - [ ] M6 — FastAPI + SSE 带 Last-Event-ID 补齐

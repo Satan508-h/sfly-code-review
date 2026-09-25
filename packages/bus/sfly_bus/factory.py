@@ -28,10 +28,11 @@ import contextlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
+from sfly_bus.base import Lock, TaskQueue
 from sfly_bus.health import CheckResult, HealthReport, down, skipped
 from sfly_bus.memory import InMemoryLock, InMemoryQueue
 from sfly_bus.postgres import PostgresPool
-from sfly_bus.redis_streams import RedisStreamsQueue
+from sfly_bus.redis_streams import RedisLock, RedisStreamsQueue
 from sfly_shared.config import Settings, get_settings
 from sfly_shared.logging import get_logger
 
@@ -54,22 +55,13 @@ class Dependencies:
     postgres: PostgresPool
     """两种拓扑都有。``RunStore`` 的实现挂在这上面（M4）。"""
 
-    queue: object | None = None
+    queue: TaskQueue | None = None
     """``TaskQueue`` 实现。完整模式是 :class:`RedisStreamsQueue`，
-    精简模式是 :class:`InMemoryQueue`。
+    精简模式是 :class:`InMemoryQueue`。"""
 
-    ``InMemoryQueue`` 已经实现完整协议，可以直接按 ``TaskQueue`` 用；
-    但**这个字段**还标着 ``object``，因为 Redis 那一半要等 M3 补齐协议方法 ——
-    标成 ``TaskQueue | None`` 会让 mypy 正确但**没有意义地**报错。
-    M3 补齐后把 ``queue`` 和 ``lock`` 一起改回 ``TaskQueue | None`` / ``Lock | None``。
-    —— 见 TODO(M3)
-    """
-
-    lock: object | None = None
-    """``Lock`` 实现。精简模式是 :class:`InMemoryLock`；完整模式的
-    ``RedisLock``（``SET NX PX`` + Lua 释放）与队列一起在 M3 交付。
-    原因同上，暂时标 ``object``。 —— 见 TODO(M3)
-    """
+    lock: Lock | None = None
+    """``Lock`` 实现。完整模式是 :class:`RedisLock`（``SET NX PX`` + Lua 释放），
+    精简模式是 :class:`InMemoryLock`。"""
 
     _probes: list[Probe] = field(default_factory=list, repr=False)
 
@@ -106,7 +98,7 @@ class Dependencies:
         for handle in (self.queue, self.lock):
             if handle is not None:
                 with contextlib.suppress(Exception):
-                    await handle.close()  # type: ignore[attr-defined]
+                    await handle.close()
         with contextlib.suppress(Exception):
             await self.postgres.close()
 
@@ -147,22 +139,32 @@ async def open_dependencies(settings: Settings | None = None) -> Dependencies:
     return Dependencies(postgres=postgres, queue=queue, lock=lock, _probes=probes)
 
 
-async def _open_transport(s: Settings, probes: list[Probe]) -> tuple[object | None, object | None]:
+async def _open_transport(s: Settings, probes: list[Probe]) -> tuple[TaskQueue | None, Lock | None]:
     """装配队列与锁 —— **本函数是这两个后端变量的唯一分支点。**
 
     队列和锁是**正交**的配置项（可以队列用 Redis、锁用进程内），所以它们各自
     独立判断，最后再统一检查一次「混搭是不是配错了」。
     """
-    queue: object | None = None
-    lock: object | None = None
+    queue: TaskQueue | None = None
+    lock: Lock | None = None
+    #: 「Redis 可达吗」这个探测只有一个，谁在用 Redis 就由谁回答。
+    redis_probe: Probe | None = None
 
     if s.queue_backend == "redis":
         # client_name 会出现在 `redis-cli client list` 里 ——
         # `--scale worker-security=3` 之后能一眼数出三个副本。
-        rq = RedisStreamsQueue(s.redis_url, client_name=_client_name(s))
+        # 队列行为的参数**两种实现同名同义**，所以它们从同一处配置来：
+        # 换后端不该意味着换一套调参。
+        rq = RedisStreamsQueue(
+            s.redis_url,
+            client_name=_client_name(s),
+            claim_idle_ms=s.claim_idle_ms,
+            stream_maxlen_tasks=s.stream_maxlen_tasks,
+            stream_maxlen_results=s.stream_maxlen_results,
+        )
         await rq.start()
         queue = rq
-        probes.append(("redis", rq.ping))
+        redis_probe = ("redis", rq.ping)
     else:
         mq = InMemoryQueue(
             claim_idle_ms=s.claim_idle_ms,
@@ -175,10 +177,21 @@ async def _open_transport(s: Settings, probes: list[Probe]) -> tuple[object | No
         queue = mq
         # 精简模式下 Redis 不是「连不上」，而是**不存在**。报 skipped 而不是 down：
         # 这个依赖在当前拓扑下本就不需要，报故障是撒谎，报正常也是撒谎。
-        probes.append(("redis", _redis_not_needed))
+        redis_probe = ("redis", _redis_not_needed)
 
-    if s.lock_backend == "memory":
+    if s.lock_backend == "redis":
+        rl = RedisLock(s.redis_url, client_name=f"{_client_name(s)}-lock")
+        await rl.start()
+        lock = rl
+        # 只在队列用的是进程内实现时才由锁来回答 —— 否则健康页上会出现两条
+        # 同名的 redis 检查，而 `HealthReport.as_dict()` 按名字展平，第二条会
+        # 把第一条挤掉（汇总的 ok 还是两者都得健康，所以不会误报，但页面会少一行）。
+        if s.queue_backend != "redis":
+            redis_probe = ("redis", rl.ping)
+    else:
         lock = InMemoryLock()
+
+    probes.append(redis_probe)
 
     if s.queue_backend != s.lock_backend:
         # 代码是对的（两边按各自的设置装配），但配置几乎肯定是写错了：

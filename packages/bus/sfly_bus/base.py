@@ -38,6 +38,15 @@ from sfly_shared.contracts import (
     WorkerType,
 )
 
+#: 全部 ``worker_type``。从枚举推导而不是写字面量：将来加第四个 Worker 时，
+#: 漏掉这里的后果是「它的任务永远没人消费」—— 而那是「往枚举里加了个值」
+#: 这类看起来最无害的改动最容易漏掉的地方。
+#:
+#: 放在这里而不是某个实现里：两种实现都要给每个 ``worker_type`` 建一个消费者组，
+#: 而**漏建一个组**在 Redis 上表现为 ``NOGROUP`` 报错、在内存实现里表现为
+#: 那条消息永远没人消费 —— 同一个疏漏、两种完全不同的症状。推导一次，两边共用。
+WORKER_TYPES: tuple[WorkerType, ...] = tuple(WorkerType)
+
 # --------------------------------------------------------------------------- #
 # 命名约定 —— 两种实现必须用同一套名字
 # --------------------------------------------------------------------------- #
@@ -74,6 +83,46 @@ def group_for(worker_type: WorkerType | str) -> str:
     它不依赖任何应用层代码，只是消费者组的定义。
     """
     return f"{worker_type}-group"
+
+
+#: 死信里保留的错误文本长度。LLM 的失败信息经常是一整篇散文 ——
+#: 不截断的话，死信流会慢慢变成第二个日志系统。
+MAX_ERROR_CHARS = 2000
+
+
+def dead_letter_fields(
+    source_fields: dict[str, str],
+    *,
+    source_stream: str,
+    source_id: str,
+    group: str,
+    attempt: int,
+    error: str,
+    error_class: ErrorClass,
+    failed_at: datetime,
+) -> dict[str, str]:
+    """构造一条死信条目的字段。**两种实现共用这一份。**
+
+    理由和 ``STREAMS`` 一样：``XRANGE dead_letter - +`` 在两种拓扑下必须长得
+    一模一样。排障时你只有一次看的机会（死信是「事后回看」的东西，现场早没了），
+    字段名对不上就等于这条死信不存在。
+
+    字段要够到「不用翻日志就能判断该不该手动重跑」—— 死信唯一的用途是运维可见性，
+    它**不是**完成机制（见 CLAUDE.md 约定 #2）。
+    """
+    return {
+        # 原 payload 留一份：没有它，复盘时连「它当时想干什么」都不知道
+        "payload": source_fields.get("payload", ""),
+        "source_stream": source_stream,
+        "source_id": source_id,
+        "group": group,
+        "task_id": source_fields.get("task_id", ""),
+        "worker_type": source_fields.get("worker_type", ""),
+        "attempt": str(attempt),
+        "error": error[:MAX_ERROR_CHARS],
+        "error_class": str(error_class),
+        "failed_at": failed_at.isoformat(),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -207,6 +256,45 @@ class TaskQueue(Protocol):
         口径同 Redis 的 ``XINFO GROUPS``：**还有多少条没投给这个组**，
         不是「还有多少条没被 ack」。两者只在消费者卡住时才分叉 ——
         那时前者是 0、后者在涨，而这个区别恰好是排查时最需要分清的一件事。
+        """
+        ...
+
+    async def trim(self, stream_key: str, maxlen: int = 0) -> int:
+        """**精确**裁剪一条流（Redis 的 ``XTRIM MAXLEN n``，不带 ``~``），返回删掉的条数。
+
+        生产代码不该调它 —— 生产靠发布时的**近似**裁剪（``XADD ... MAXLEN ~ n``），
+        因为精确裁剪要数条目，而近似裁剪不用。它存在的两个理由：
+
+        * 运维：积压太多时手动清一次。
+        * 测试：让「消息在消费者手里被裁掉」这条路径能被**确定性地**复现。
+          ``MAXLEN ~`` 裁不裁、裁几条都不保证，拿它写断言等于写一个偶尔红的测试。
+
+        .. important::
+           被裁掉的条目**对所有人都消失了**，包括还持有它的消费者：它既不会被
+           投递，也不会被当成「待重投」的消息送回来。两个后端在这一点上必须一致，
+           而**清理时机**是不同的 —— 见下面这段实测记录。
+
+           Redis（实测 7.4）的清理是**惰性**的：``XTRIM`` 只从流里删条目，
+           PEL 里那个 id 会悬在那里；真正把它摘掉的是下一次 ``XAUTOCLAIM``，
+           它把悬空的 id 从 PEL 里删除并在返回值的第三段报出来
+           （``min-idle-time`` 多大都不影响这件事）。内存实现在裁剪那一刻就
+           一并清掉 PEL 与回收区（``memory.py`` 的 ``_purge``）—— 两者的
+           中间状态不同，但对调用方可观察的结果相同。
+
+           > 这段是被一次实测纠正过的。第一次读到的现象是「``XTRIM`` 之后
+           > ``XPENDING`` 少了一条」，于是照着「Redis 会立刻清 PEL」去写了内存
+           > 实现 —— 而那个读数是同一段脚本里紧跟着的 ``XAUTOCLAIM`` 造成的。
+           > 把清理时机写进契约是错的，把结果写进契约是对的。
+        """
+        ...
+
+    async def dead_letters(self) -> list[dict[str, str]]:
+        """死信列表，按写入顺序。等价于 ``XRANGE dead_letter - +``。
+
+        **只读**，不消费、不推进任何游标 —— 死信刻意没有消费者组（见 ``base.py``
+        里 ``CONSUMER_GROUPS`` 之上那段）。字段集合由 :func:`dead_letter_fields`
+        固定，两种实现逐字一致：线上排查时只有一次看的机会，字段名对不上就等于
+        这条死信不存在。契约测试逐字段断言这一点。
         """
         ...
 

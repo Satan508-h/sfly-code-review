@@ -1,20 +1,22 @@
 """``InMemoryQueue`` 的测试。
 
 上面一大半（继承自 :class:`QueueContract`）**不是内存实现专属的** ——
-M3 会用同一份契约去测 Redis。这个文件里只有三类东西：
+同一份契约在 ``tests/integration/bus/test_redis_queue.py`` 里对着真 Redis
+再跑一遍。这个文件里只有三类东西：
 
 1. 后端装配（``make_queue``）
-2. 内存实现**能直接观察、而 Redis 观察不到**的行为（裁剪、死信内容）
-3. 故意注入**生产路径不会产生**的输入（坏 payload）
+2. 内存实现**能直接观察、而 Redis 观察不到**的行为（自动裁剪的条数、死信内容）
+3. 故意注入**生产路径不会产生**的输入（坏 payload、空 payload）
 
-第 2 类里有一条（裁剪）是刻意留在这里而不是放进契约的，理由见那条测试的注释。
+第 2 类里剩下的那一条（自动裁剪）是刻意留在这里而不是放进契约的，理由见那条
+测试的注释；「在消费者手里被裁掉」那条已经回到契约文件里了。
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from queue_contract import (
+from contracts.queue_contract import (
     QueueContract,
     bootstrap,
     collect,
@@ -23,7 +25,6 @@ from queue_contract import (
     result,
     task,
 )
-
 from sfly_bus.base import STREAMS
 from sfly_bus.memory import InMemoryQueue
 from sfly_shared.contracts import ErrorClass, WorkerType
@@ -36,49 +37,20 @@ class TestInMemoryQueue(QueueContract[InMemoryQueue]):
         await q.start()
         return q
 
-    # -- 裁剪（后端专属：Redis 的 MAXLEN ~ 不裁到精确条数） ------------------ #
+    # -- 自动裁剪（后端专属：Redis 的 MAXLEN ~ 不裁到精确条数） -------------- #
 
-    async def test_a_trimmed_pending_message_is_acked_never_delivered(self) -> None:
-        """已被裁剪的消息：消费循环拿不到它，但它**必须**被 ack。
-
-        两个失败方向都要防：
-
-        * 把它交给调用方 → 空 payload 流进解析器，报一个和真因毫无关系的错
-        * 不 ack → 它永远留在 PEL 里，``reclaim`` 一遍遍捞回来，每次都重新
-          走一遍「payload 坏了」的分支
-
-        Redis 那边测得同样的事，但方式不同：它的近似裁剪（``MAXLEN ~``）不保证
-        裁到精确条数，所以契约里不能写「第 N 条一定被裁掉」这种断言 ——
-        真要在 Redis 上跑，得用 ``XTRIM MAXLEN 0`` 精确裁。那条测试在 M3
-        实现 XTRIM 之后再补，补的时候放回契约文件。
-        """
-        async with self.open_queue(claim_idle_ms=0, stream_maxlen_tasks=1) as q:
-            await q.publish_task(task("run-1"))
-            h, first = await next_message(q.consume_tasks(WorkerType.SECURITY))
-            assert first.task_id == "run-1"
-
-            # 再发一条，把上一条挤出 maxlen=1 的窗口 —— 等价于 XTRIM
-            await q.publish_task(task("run-2"))
-
-            assert await q.reclaim(WorkerType.SECURITY) == 1, "被裁掉的那条还在 PEL 里，所以会被回收"
-
-            got = await collect(q.consume_tasks(WorkerType.SECURITY))
-            assert [msg.task_id for _, msg in got] == ["run-2"], "墓碑不该被交出来，后面那条正常投递"
-            for handle, _ in got:
-                await handle.ack()
-
-            assert await q.reclaim(WorkerType.SECURITY) == 0, "墓碑已经被 ack，不该再被回收"
-            assert q.pending_count(WorkerType.SECURITY) == 0
-
-            await h.ack()  # 幂等：它早就被回收并作废了，但 ack 不能报错
-
-    async def test_a_message_trimmed_before_delivery_is_never_delivered(self) -> None:
+    async def test_auto_trimming_keeps_exactly_maxlen_entries(self) -> None:
         """还没投出去就被裁掉的消息，消费循环根本看不到它。
 
         maxlen 是「这个流最多记住几条」，超过的部分对**所有人**都消失了 ——
         包括还没读的消费者。这正是 CLAUDE.md 里那条「``review_results``
         在 M5 通过前不裁剪」的由来：裁剪会静默丢任务，而丢的方式是
         「这条任务从来不存在」。
+
+        **这条留在内存专属文件里**：它靠 ``stream_maxlen_tasks=1`` 触发自动裁剪，
+        而 Redis 的自动裁剪走 ``MAXLEN ~``（近似），实际留几条是不保证的
+        （实测 maxlen=1 时一条都没裁 —— 条目数少到不够一个宏节点）。
+        契约里那条用 Protocol 上的 ``trim()`` 精确裁，两个后端都能跑。
         """
         async with self.open_queue(stream_maxlen_tasks=1) as q:
             for i in range(3):
@@ -86,42 +58,62 @@ class TestInMemoryQueue(QueueContract[InMemoryQueue]):
             got = await collect(q.consume_tasks(WorkerType.SECURITY))
             assert [msg.task_id for _, msg in got] == ["run-2"]
 
-    # -- 死信内容（后端专属：契约只断言「死信同时是一次 ack」） -------------- #
+    async def test_the_dropped_entries_leave_no_trace_in_the_pending_list(self) -> None:
+        """被裁掉的消息也从 PEL 里消失 —— 实测的 Redis 行为，见 ``_purge``。
 
-    async def test_dead_letter_keeps_enough_context_to_debug(self) -> None:
-        """死信里必须留下「什么失败了、为什么、第几次」。
-
-        只留一句「失败了」等于没有死信 —— 而运维可见性正是死信**唯一**的用途
-        （它不是完成机制，见约定 #2）。所以字段要够到「不用翻日志就能判断
-        该不该手动重跑」。
+        如果只从流日志里删、留着 PEL 不管，那条消息就会永远被 ``reclaim``
+        捞回来重走一遍「payload 坏了」的分支。所以这里同时断言 PEL 是干净的：
+        ``pending_count`` 是内存实现的自省接口，Redis 那边有同名方法。
         """
-        async with self.open_queue(claim_idle_ms=0) as q:
+        async with self.open_queue(claim_idle_ms=0, stream_maxlen_tasks=1) as q:
             await q.publish_task(task("run-1"))
             h, _ = await next_message(q.consume_tasks(WorkerType.SECURITY))
-            await h.to_dead_letter("模型连续三次返回散文", ErrorClass.SCHEMA_UNRECOVERABLE)
+            assert q.pending_count(WorkerType.SECURITY) == 1
 
-            letters = q.dead_letters()
-            assert len(letters) == 1
-            letter = letters[0]
-            assert letter["task_id"] == "run-1"
-            assert letter["worker_type"] == "security"
-            assert letter["error"] == "模型连续三次返回散文"
-            assert letter["error_class"] == "schema_unrecoverable"
-            assert letter["attempt"] == "1"
-            assert letter["source_stream"] == STREAMS["tasks"]
-            assert letter["failed_at"]
-            # 原 payload 也要留一份：没有它，复盘时连「它当时想干什么」都不知道
-            assert "run-1" in letter["payload"]
+            await q.publish_task(task("run-2"))  # 把上一条挤出 maxlen=1 的窗口
+
+            assert q.pending_count(WorkerType.SECURITY) == 0, "被裁掉的条目不该留在 PEL 里"
+            assert await q.reclaim(WorkerType.SECURITY) == 0
+            await h.ack()  # 幂等：它早就没了，但 ack 不能报错
+
+    # -- 死信顺序（字段集合由契约测试钉住，见 queue_contract） ----------------- #
 
     async def test_dead_letters_are_listed_in_order(self) -> None:
+        """死信按写入顺序 —— ``XRANGE`` 的语义是「从旧到新」，回看时这个顺序
+        就是失败发生的时间线。"""
         async with self.open_queue(claim_idle_ms=0) as q:
             for i in range(2):
                 await q.publish_task(task(f"run-{i}"))
                 h, _ = await next_message(q.consume_tasks(WorkerType.SECURITY))
                 await h.to_dead_letter(f"第 {i} 个失败", ErrorClass.TRANSIENT)
-            assert [x["task_id"] for x in q.dead_letters()] == ["run-0", "run-1"]
+            assert [x["task_id"] for x in await q.dead_letters()] == ["run-0", "run-1"]
 
     # -- 坏 payload（生产路径产生不了，只能注入） --------------------------- #
+
+    async def test_an_entry_without_a_payload_is_acked_never_delivered(self) -> None:
+        """空 payload 的条目：ack 掉、继续，**绝不交给调用方**。
+
+        真实来路是「消息在投递和消费之间被删掉了」—— Redis 上表现为
+        ``XAUTOCLAIM`` 返回一个 nil payload 的条目（``XADD`` 允许显式指定 id，
+        所以一条消息完全可以在被投出去之后消失）。
+
+        空 payload 和坏 payload 的处理**刻意不同**：坏 payload 要进死信（它有可能
+        是别的东西发错了），空 payload 只留一条 warning —— 它没有任何可复盘的内容，
+        往死信里塞一条空的只会稀释真正有价值的死信。
+        """
+        async with self.open_queue() as q:
+            q._append(STREAMS["tasks"], {"worker_type": "security", "task_id": "run-x"})
+            await q.publish_task(task("run-ok"))
+
+            got = await collect(q.consume_tasks(WorkerType.SECURITY))
+            assert [msg.task_id for _, msg in got] == ["run-ok"], "空消息之后的正常消息必须照常投递"
+            assert await q.dead_letters() == [], "空 payload 不该进死信"
+            # 只有正常那条留在 PEL 里（它还没被 ack）；空 payload 那条必须已经走了 ——
+            # 没走的话它会永远卡在 PEL 里被 reclaim 一遍遍捞回来。
+            assert q.pending_count(WorkerType.SECURITY) == 1
+            for handle, _ in got:
+                await handle.ack()
+            assert q.pending_count(WorkerType.SECURITY) == 0
 
     async def test_a_poison_payload_is_dead_lettered_not_fatal(self) -> None:
         """解析不了的消息进死信并继续，而不是把消费循环带崩。
@@ -153,7 +145,7 @@ class TestInMemoryQueue(QueueContract[InMemoryQueue]):
             got = await collect(q.consume_tasks(WorkerType.SECURITY))
             assert [msg.task_id for _, msg in got] == ["run-ok"], "坏消息之后的正常消息必须照常投递"
 
-            letters = q.dead_letters()
+            letters = await q.dead_letters()
             assert len(letters) == 1
             assert letters[0]["error_class"] == "schema_unrecoverable"
             assert "payload 无法解析" in letters[0]["error"]

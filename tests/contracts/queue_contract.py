@@ -1,9 +1,16 @@
 """两种传输实现**共用**的行为契约 —— 「一套代码、两种拓扑」的证据本身。
 
-M3 会加一个 ``test_redis_streams.py``，同样继承 :class:`QueueContract`，
-于是下面每一条测试都会在两个后端上各跑一遍。**这就是为什么这个文件比
-它的体积重要得多**：让契约测试退化成「只有 Redis 跑得通」的套件，
-等于把项目的中心论点从「事实」降级成「宣传」。
+同一个类被两个地方继承，每条测试因此在两个后端上各跑一遍：
+
+    tests/unit/bus/test_memory_queue.py            → InMemoryQueue（无 Docker）
+    tests/integration/bus/test_redis_queue.py      → RedisStreamsQueue（真 Redis）
+
+**这就是为什么这个文件比它的体积重要得多**：让契约测试退化成「只有 Redis
+跑得通」的套件，等于把项目的中心论点从「事实」降级成「宣传」。
+
+放在 ``tests/contracts/`` 而不是某一端的目录里，也是为了这一点 —— 它在目录
+结构上就不属于任何一端。（``tests/conftest.py`` 里那行 ``sys.path`` 是为了
+让两层都能 ``from contracts.queue_contract import ...``。）
 
 ### 写这里的测试时的三条纪律
 
@@ -16,6 +23,15 @@ M3 会加一个 ``test_redis_streams.py``，同样继承 :class:`QueueContract`�
    裁到精确条数、``XADD`` 的 id 格式和这里不同 —— 这类差异应该让实现去
    适配契约，而不是让契约绕开它。真绕不过去时，把那条测试降级到
    某一端的专属文件里，**并在两边都写上为什么**。
+
+   M3 真的撞上过一次这样的差异，结果是**改实现**而不是放宽断言：内存实现
+   原先给被裁掉的条目留了一个「墓碑」，``reclaim()`` 会把它回收出来再让消费者
+   自己 ack 掉（返回 1）；而 Redis 那一端的 ``reclaim()`` 返回 0 —— 那条消息
+   已经不存在了，没有什么可以重投。两个后端在同一个动作上返回不同的数字，
+   而**不会有任何东西报错**。改的是内存实现，见 ``memory.py`` 的 ``_purge``。
+
+   两边清理的**时机**仍然不同（Redis 惰性、内存即时），所以这条测试断言的是
+   结果而不是时机 —— 见下面那条裁剪测试的说明。
 
 3. **断言可观察的结果，不断言机制。** 「回收之后消息能再次被消费到」
    比「回收之后 PEL 里少了一条」更接近契约 —— 后者是 Redis 的实现细节，
@@ -32,7 +48,7 @@ from typing import Any
 
 import pytest
 
-from sfly_bus.base import MessageHandle, TaskQueue
+from sfly_bus.base import STREAMS, MessageHandle, TaskQueue
 from sfly_shared.contracts import (
     BootstrapMessage,
     ErrorClass,
@@ -372,17 +388,24 @@ class QueueContract[Q: TaskQueue]:
             assert await q.reclaim(WorkerType.SECURITY) == 0
 
     async def test_reclaim_without_a_type_covers_every_group(self) -> None:
-        """``reclaim()`` 不带参数时要覆盖全部组。
+        """``reclaim()`` 不带参数时要覆盖**全部**组，包括 ``review_bootstrap``。
 
         编排器的扫描器用的是无参形式 —— 它不关心「哪个 worker_type 掉队了」，
         只关心「有没有该重投的」。
+
+        bootstrap 组在这里是**必须**被数进去的：编排器在 ``ingest`` 中途崩掉时，
+        那条 bootstrap 就是靠无参回收捞回来的。漏掉它不会报任何错，只会让那个
+        run 永远停在那里（而且因为 run 的状态是「waiting」，连超时扫描器都看不出
+        异常）。这条断言在 M3 之前是假的 —— 内存实现当时漏了 bootstrap 组。
         """
         async with self.open_queue(claim_idle_ms=0) as q:
+            await q.publish_bootstrap(bootstrap())
             await q.publish_task(task("run-1"))
             await q.publish_result(result("run-1"))
+            await next_message(q.consume_bootstrap())
             await next_message(q.consume_tasks(WorkerType.SECURITY))
             await next_message(q.consume_results())
-            assert await q.reclaim() == 2
+            assert await q.reclaim() == 3
 
     # -- 死信 --------------------------------------------------------------- #
 
@@ -399,6 +422,83 @@ class QueueContract[Q: TaskQueue]:
             await h.to_dead_letter("模型连续三次返回散文", ErrorClass.SCHEMA_UNRECOVERABLE)
             assert await q.reclaim(WorkerType.SECURITY) == 0
             assert await q.lag(WorkerType.SECURITY) == 0
+
+    async def test_the_dead_letter_schema_is_identical_in_both_topologies(self) -> None:
+        """死信的**字段集合**是契约的一部分。
+
+        这是本文件里少有的「断言结构而非行为」的一条，值得说明为什么：死信的
+        唯一用途是事后回看（它不是完成机制，见约定 #2），而回看时人只有一个入口 ——
+        ``XRANGE dead_letter - +``。字段名或数量在两种拓扑下分叉，等于「线上排障
+        手册」在精简模式下是错的，而**不会有任何东西报错**。
+
+        字段集合因此由 ``base.dead_letter_fields()`` 统一构造，两种实现都调它，
+        这条测试把结果钉死。
+        """
+        async with self.open_queue(claim_idle_ms=0) as q:
+            await q.publish_task(task("run-1"))
+            h, _ = await next_message(q.consume_tasks(WorkerType.SECURITY))
+            await h.to_dead_letter("模型连续三次返回散文", ErrorClass.SCHEMA_UNRECOVERABLE)
+
+            letters = await q.dead_letters()
+            assert len(letters) == 1
+            letter = letters[0]
+            assert set(letter) == {
+                "payload",
+                "source_stream",
+                "source_id",
+                "group",
+                "task_id",
+                "worker_type",
+                "attempt",
+                "error",
+                "error_class",
+                "failed_at",
+            }
+            assert letter["task_id"] == "run-1"
+            assert letter["worker_type"] == "security"
+            assert letter["error"] == "模型连续三次返回散文"
+            assert letter["error_class"] == "schema_unrecoverable"
+            assert letter["attempt"] == "1"
+            assert letter["source_stream"] == STREAMS["tasks"]
+            assert letter["group"] == "security-group"
+            assert letter["source_id"] == h.id
+            assert letter["failed_at"]
+            # 原 payload 也要留一份：没有它，复盘时连「它当时想干什么」都不知道
+            assert "run-1" in letter["payload"]
+
+    # -- 裁剪（消息在消费者手里消失） ----------------------------------------- #
+
+    async def test_a_message_trimmed_out_from_under_a_consumer_vanishes_cleanly(self) -> None:
+        """已经投出去、还没 ack 的消息被裁掉之后，必须**干净地消失**。
+
+        这是 CLAUDE.md 里点名的危险路径之一，两个失败方向都很糟：
+
+        * 把它交给调用方 → 空 payload 流进解析器，报一个和真因毫无关系的错
+        * 不 ack → 它永远卡在 PEL 里，``reclaim`` 一遍遍捞回来，每次都重走
+          一遍「payload 坏了」的分支
+
+        M2 时这条测试只能放在内存实现的专属文件里，因为 ``MAXLEN ~`` 不能保证
+        裁到精确条数（redis-py 的默认就是近似裁剪，实测 maxlen=1 时一条都没裁）。
+        现在它回到契约里，靠的是 Protocol 上的 ``trim()`` —— 精确裁剪，
+        两个后端都能确定性地复现。
+
+        注意这条**不是**在断言「谁负责清理」：内存实现和 Redis 清理的时机不同
+        （前者在裁剪时摘 PEL，后者在裁剪/回收时），但两端可观察的结果必须一样 ——
+        既送不出去，也不会永久卡住。
+        """
+        async with self.open_queue(claim_idle_ms=0) as q:
+            await q.publish_task(task("run-1"))
+            h, first = await next_message(q.consume_tasks(WorkerType.SECURITY))
+            assert first.task_id == "run-1"
+
+            assert await q.trim(STREAMS["tasks"], 0) >= 1
+
+            assert await collect(q.consume_tasks(WorkerType.SECURITY)) == [], "空 payload 不该流出去"
+            assert await q.reclaim(WorkerType.SECURITY) == 0, "它已经不在流里了，没有东西可以重投"
+            assert await collect(q.consume_tasks(WorkerType.SECURITY)) == []
+
+            # 原消费者事后才 ack —— 必须幂等，不能报错
+            await h.ack()
 
     # -- 生命周期 ----------------------------------------------------------- #
 
@@ -422,3 +522,16 @@ class QueueContract[Q: TaskQueue]:
             await q.close()
             with pytest.raises(RuntimeError):
                 await q.publish_task(task("run-1"))
+
+    async def test_start_after_close_is_refused(self) -> None:
+        """生命周期是**一次性**的：``close()`` 之后不能再 ``start()``。
+
+        Redis 实现本身并不在意这件事（再建一个客户端而已），内存实现则天然做不到
+        （关掉就是把消息放走了）。**故意把它写进契约**：一个能重启的队列会让
+        「关机期间投进来的消息去哪了」变成一个没有答案的问题 —— 而调用方
+        迟早会有人这么用。
+        """
+        q = await self.make_queue()
+        await q.close()
+        with pytest.raises(RuntimeError):
+            await q.start()

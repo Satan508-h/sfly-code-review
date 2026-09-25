@@ -1,102 +1,86 @@
 """``InMemoryLock`` 的测试。
 
-锁只防重复劳动，不保证正确性（正确性靠数据库唯一约束）—— 但「释放了别人的锁」
-这件事会**静默地**把互斥变回没有互斥。所以这里测的重点全部围绕持有者校验。
+上面大半（继承自 :class:`LockContract`）**不是内存实现专属的** —— 同一份契约
+在 ``tests/integration/bus/test_redis_lock.py`` 里对着真 Redis 再跑一遍。
+
+这里只留两样东西：后端装配，以及内存实现**能直接观察、而 Redis 观察不到**的
+记账细节（``held()`` 与 ``close()`` 的语义）。后者见契约文件里那段说明。
 """
 
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 import pytest
 
+from contracts.lock_contract import LockContract
 from sfly_bus.memory import InMemoryLock
 
 
-async def _acquire(lock: InMemoryLock, key: str, ttl_ms: int = 60_000) -> bool:
-    """在**另一个 Task** 里抢锁。持有者的身份是 Task，所以「别人来抢」这件事
-    必须真的换个 Task 才能测到。"""
-    return await lock.acquire(key, ttl_ms)
-
-
-async def _release(lock: InMemoryLock, key: str) -> None:
-    await lock.release(key)
+class TestInMemoryLock(LockContract[InMemoryLock]):
+    async def make_lock(self, **kwargs: Any) -> InMemoryLock:
+        return InMemoryLock()
 
 
 @pytest.mark.unit
-async def test_lock_is_exclusive_across_tasks() -> None:
-    lock = InMemoryLock()
-    assert await lock.acquire("run-1", 60_000) is True
-    assert await asyncio.create_task(_acquire(lock, "run-1")) is False
-    await lock.release("run-1")
-    assert await asyncio.create_task(_acquire(lock, "run-1")) is True
+async def test_held_lists_what_this_process_holds() -> None:
+    """``held()`` 是给测试和排查用的自省接口（不在 Protocol 里）。
 
-
-@pytest.mark.unit
-async def test_release_by_a_non_owner_is_refused() -> None:
-    """**这条是这个类存在的理由。**
-
-    A 拿了锁 → 超时 → B 拿到 → A 来释放。不做持有者校验的话，B 的锁就没了，
-    于是两个执行体同时认为自己独占 —— 而症状是「偶尔重复处理同一件事」，
-    既不报错也不稳定复现。
+    Redis 实现有一个同名同义的方法，但它只能看到**本进程**拿过的键 ——
+    这也是内存实现的天然口径（内存实现里不存在「别的进程」）。
     """
-    lock = InMemoryLock()
-    assert await lock.acquire("run-1", 60_000) is True
-
-    await asyncio.create_task(_release(lock, "run-1"))  # 别的 Task 来释放
-
-    assert lock.held() == ["run-1"], "不是持有者就不能释放"
-    assert await asyncio.create_task(_acquire(lock, "run-1")) is False
-
-
-@pytest.mark.unit
-async def test_an_expired_lock_can_be_taken_over_and_the_old_owner_cannot_release_it() -> None:
-    """超时之后可以被别人接管，而**原持有者随后不能再释放它**。
-
-    这两件事必须一起成立：只测「能接管」会漏掉「接管之后又被原持有者删掉」
-    这条路径 —— 那正是把互斥悄悄变回没有互斥的那条路径。
-    """
-    lock = InMemoryLock()
-    assert await lock.acquire("run-1", ttl_ms=0) is True
-    assert lock.held() == [], "过期是惰性判定的：没人申请时不会有人去清理，但 held() 看得见"
-
-    assert await asyncio.create_task(_acquire(lock, "run-1")) is True, "已过期的锁应该能被接管"
-
-    await lock.release("run-1")  # 原持有者（当前 Task）来释放 —— 但持有者已经换人了
-    assert lock.held() == ["run-1"]
-
-
-@pytest.mark.unit
-async def test_the_same_owner_cannot_acquire_twice() -> None:
-    """**不可重入**，和 ``SET NX PX`` 一致。
-
-    按 ``asyncio.Lock`` 的直觉用它会踩坑：同一个 Task 里嵌套着去拿同一把锁，
-    第二次会直接失败 —— 而失败是返回值，不抛异常。
-    """
-    lock = InMemoryLock()
-    assert await lock.acquire("k", 60_000) is True
-    assert await lock.acquire("k", 60_000) is False
-
-
-@pytest.mark.unit
-async def test_different_keys_do_not_block_each_other() -> None:
     lock = InMemoryLock()
     assert await lock.acquire("run-1", 60_000) is True
     assert await lock.acquire("run-2", 60_000) is True
     assert lock.held() == ["run-1", "run-2"]
 
+    await lock.release("run-1")
+    assert lock.held() == ["run-2"]
+
 
 @pytest.mark.unit
-async def test_release_of_an_unknown_key_is_a_noop() -> None:
-    """释放一个从来没拿过的键不能报错 —— 关机路径上会走到这里。"""
+async def test_an_expired_lock_is_invisible_to_held() -> None:
+    """过期是**惰性**判定的：没有后台定时器，没人申请就没人清理。
+
+    但 ``held()`` 必须看得见这件事 —— 否则排查时看到的是一份「还在持有」的
+    假账，而它和真实状态已经分叉了。
+    """
     lock = InMemoryLock()
-    await lock.release("从来没有人拿过")
+    assert await lock.acquire("run-1", ttl_ms=0) is True
     assert lock.held() == []
 
 
 @pytest.mark.unit
 async def test_close_clears_everything() -> None:
+    """内存实现的 ``close()`` 清空本地记账 —— 进程内的锁没有别的地方可活。
+
+    **这处是两种实现有意的差异**，所以它不在契约里：Redis 实现的 ``close()``
+    只关连接，远端键交给 TTL 过期（关机路径上多发一批释放命令，换来的只是
+    少等几秒 TTL，代价是关机可能卡在网络上）。对调用方的实际影响是一样的：
+    ``release()`` 在 ``close()`` 之后都只是什么都不做。
+    """
     lock = InMemoryLock()
     await lock.acquire("run-1", 60_000)
     await lock.close()
     assert lock.held() == []
+    await lock.release("run-1")  # 关掉之后释放不能报错
+
+
+@pytest.mark.unit
+async def test_a_child_task_cannot_release_its_parents_lock() -> None:
+    """内存实现的持有者是 **Task**，所以子协程释放不了父协程拿的锁。
+
+    这不是 bug 而是规则（Redis 实现用同一条规则，见契约文件）。写下来是因为
+    它会让人意外：`create_task` 一下再释放，看起来完全正常，而锁纹丝不动。
+    """
+    lock = InMemoryLock()
+    assert await lock.acquire("run-1", 60_000) is True
+
+    await asyncio.create_task(_release(lock, "run-1"))
+
+    assert lock.held() == ["run-1"]
+
+
+async def _release(lock: InMemoryLock, key: str) -> None:
+    await lock.release(key)

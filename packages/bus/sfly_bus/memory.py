@@ -23,10 +23,20 @@
   ``consume_*`` 才交到消费者手里，而那时 ``handle.attempt`` 已经是 2。
   这是 Protocol 的决定（``reclaim`` 返回计数），见 ``base.py``。
 
-* **裁剪留下墓碑。** 条目被 ``maxlen`` 裁掉之后，仍然持有它的 PEL 读到的是一条
-  ``trimmed=True`` 的条目 —— 对应 Redis 里 ``XAUTOCLAIM`` 返回 null payload 的
-  id。消费循环必须把它当「已处理」ack 掉（否则它会永远卡在 PEL 里，
-  ``reclaim`` 一遍遍把它捞回来），绝不能让 ``None`` 流进解析器。
+* **裁剪是从所有人的视角消失。** 条目被 ``maxlen`` 裁掉之后，任何组都再也
+  读不到它 —— 包括**已经把它投出去、正等着 ack 的那个消费者**。它同时会从
+  每个组的 PEL 与回收区里被摘掉，所以它既不会被重投、也不会永远卡在 PEL 里
+  被 reclaim 一遍遍捞回来。
+
+  最后这一条是**实测**出来的，不是推的。早先这里的实现走的是「留一个墓碑
+  对象，等消费者读到时自己 ack」—— 那是照着一个错误的心智模型写的，症状是
+  两个后端在同一条路径上行为不同（内存版 ``reclaim()`` 返回 1，Redis 版返回 0）。
+  两个后端的行为差异是不会有报错的，只会让「一套代码」这句话慢慢变假。
+
+  清理的**时机**和 Redis 不同，这一点是刻意选的、也写在 ``base.py`` 的
+  ``trim()`` 说明里：Redis 的清理是惰性的（``XTRIM`` 只删流里的条目，
+  悬空的 id 等下一次 ``XAUTOCLAIM`` 才摘掉），这里则在裁剪的那一刻就清干净。
+  中间状态不同，可观察的结果相同 —— 而契约只断言结果。
 
 ### 单事件循环让「检查—修改」天然原子
 
@@ -55,7 +65,15 @@ from typing import TypeVar
 
 from pydantic import ValidationError
 
-from sfly_bus.base import CONSUMER_GROUPS, STREAMS, MessageHandle, group_for
+from sfly_bus.base import (
+    CONSUMER_GROUPS,
+    MAX_ERROR_CHARS,
+    STREAMS,
+    WORKER_TYPES,
+    MessageHandle,
+    dead_letter_fields,
+    group_for,
+)
 from sfly_shared.contracts import (
     BootstrapMessage,
     ErrorClass,
@@ -67,36 +85,27 @@ from sfly_shared.logging import get_logger
 
 log = get_logger(__name__)
 
-#: 全部 ``worker_type``。从枚举推导而不是写字面量：将来加第四个 Worker 时，
-#: 漏掉这里的后果是「它的任务永远没人消费」—— 而那是「往枚举里加了个值」
-#: 这类看起来最无害的改动最容易漏掉的地方。
-WORKER_TYPES: tuple[WorkerType, ...] = tuple(WorkerType)
-
 MsgT = TypeVar("MsgT", BootstrapMessage, TaskMessage, WorkerResult)
-
-#: 错误信息与死信字段里保留的文本长度
-_MAX_ERROR_CHARS = 2000
 
 
 @dataclass(slots=True)
 class _Entry:
     """一条流条目。
 
-    **流日志和 PEL 持有的是同一个对象。** 所以裁剪只需要把它标成墓碑，
-    还引用着它的 PEL 立刻就能看见 —— 这正是 Redis 里「``XTRIM`` 之后再
-    ``XAUTOCLAIM``，拿到的是一个 payload 为 nil 的 id」的等价物。
-    （``fields`` 刻意不清空：内存里没有任何理由丢掉它，死信还能带上原文。）
+    **流日志和 PEL 持有的是同一个对象** —— 所以裁剪只需要把它从流日志里摘掉，
+    再按 id 清一遍各组的 PEL 与回收区（见 :meth:`InMemoryQueue._purge`），
+    所有持有者就同时看不见它了。
     """
 
     id: str
     seq: int
     fields: dict[str, str]
-    trimmed: bool = False
-    #: 投递次数。跨「回收 → 重投」保留，等价于 Redis 侧的
-    #: ``HINCRBY sfly:attempts:{msg_id}``，是死信判定的依据。
+    #: 投递次数。跨「回收 → 重投」保留，等价于 Redis 侧的 attempts 计数器，
+    #: 是死信判定的依据。
     deliveries: int = 0
     #: 已经被哪些组 ack 过。用于识别「回收之后原消费者才 ack」的重投 ——
-    #: 那种情况下这条消息不该再被投递给别人。
+    #: 那种情况下这条消息不该再被投递给别人（Redis 侧靠「还在不在 PEL 里」
+    #: 回答同一个问题）。
     acked_by: set[str] = field(default_factory=set)
 
 
@@ -182,11 +191,17 @@ class InMemoryQueue:
     # -- 生命周期 ---------------------------------------------------------- #
 
     async def start(self) -> None:
-        """建组。幂等；``close()`` 之后调用会报错（生命周期是一次性的）。"""
-        if self._started:
-            return
+        """建组。幂等；``close()`` 之后调用会报错（生命周期是一次性的）。
+
+        **``_closed`` 必须在 ``_started`` 之前判**：反过来的话，
+        「start → close → start」会命中 ``_started`` 那条捷径、安静地返回，
+        于是一个已经关闭的队列看起来启动成功了。这个顺序是契约测试
+        （``test_start_after_close_is_refused``）抓出来的。
+        """
         if self._closed:
             raise RuntimeError("这份 InMemoryQueue 已经 close() 过，生命周期是一次性的")
+        if self._started:
+            return
         self._started = True
         for stream_key, group in CONSUMER_GROUPS.items():
             self._group(STREAMS[stream_key], group)
@@ -279,6 +294,17 @@ class InMemoryQueue:
         stream = self._streams[group.stream]
         return sum(1 for e in stream.entries if e.seq > group.cursor)
 
+    async def trim(self, stream_key: str, maxlen: int = 0) -> int:
+        """精确裁剪。见 Protocol 里关于「为什么生产代码不该调它」的说明。"""
+        self._require_usable()
+        stream = self._streams.get(stream_key)
+        if stream is None:
+            # Redis 那边对不存在的键执行 XTRIM 就是返回 0，这里保持同样的行为，
+            # 但留一条 warning —— 流名写错的后果在两种模式下都是「安静地什么都没发生」。
+            log.warning("memory_queue.trim_unknown_stream", stream=stream_key)
+            return 0
+        return self._trim(stream, maxlen)
+
     # -- 实现自省（不在 Protocol 里，给测试与本机排查用） -------------------- #
 
     def pending_count(self, worker_type: WorkerType | str) -> int:
@@ -286,8 +312,12 @@ class InMemoryQueue:
         而 ``lag`` 数的是「还没投出去的」。消费者卡住时前者在涨、后者是 0。"""
         return len(self._group(STREAMS["tasks"], group_for(worker_type)).pending)
 
-    def dead_letters(self) -> list[dict[str, str]]:
-        """死信，按投递顺序。等价于 ``XRANGE dead_letter - +``。"""
+    async def dead_letters(self) -> list[dict[str, str]]:
+        """死信，按写入顺序。等价于 ``XRANGE dead_letter - +``。
+
+        是 ``async`` 而这里没有任何 IO，只为和 Redis 实现签名一致 ——
+        契约测试要能对两个后端写同一行 ``await q.dead_letters()``。
+        """
         return [dict(e.fields) for e in self._streams[STREAMS["dead_letter"]].entries]
 
     # -- 内部：写入 -------------------------------------------------------- #
@@ -304,10 +334,7 @@ class InMemoryQueue:
         )
         stream = self._streams[stream_name]
         stream.entries.append(entry)
-        if stream.maxlen is not None:
-            while len(stream.entries) > stream.maxlen:
-                # 标记墓碑而不是直接丢弃：还持有它的 PEL 会读到「已被裁剪」。
-                stream.entries.popleft().trimmed = True
+        self._trim(stream, stream.maxlen)
         for group in stream.groups.values():
             group.notify.set()
         return entry.id
@@ -322,9 +349,9 @@ class InMemoryQueue:
         """
         while group.redeliver:
             entry = group.redeliver.popleft()
-            if entry.trimmed or group.name in entry.acked_by:
-                # 回收之后原消费者才 ack 的，或条目已被裁剪 —— 作废，不重投。
-                # 它已经不在 PEL 里了，所以这里不需要 ack，也不写 pending。
+            if group.name in entry.acked_by:
+                # 回收之后原消费者才 ack 的 —— 作废，不重投。它已经不在 PEL 里了，
+                # 所以这里不需要 ack，也不写 pending。
                 log.debug("memory_queue.redelivery_dropped", msg_id=entry.id, group=group.name)
                 continue
             return self._deliver(group, entry)
@@ -336,12 +363,6 @@ class InMemoryQueue:
             if entry.seq <= group.cursor:
                 continue
             group.cursor = entry.seq
-            if entry.trimmed:
-                # 已被裁剪的条目：**消费循环不该看到它**。在这里就 ack 掉，
-                # 否则它会永远留在 PEL 里被 reclaim 一遍遍捞回来。
-                self.ack(group, entry)
-                log.warning("memory_queue.trimmed_entry_acked", msg_id=entry.id, group=group.name)
-                continue
             return self._deliver(group, entry)
         return None
 
@@ -390,6 +411,13 @@ class InMemoryQueue:
             if only_worker_type is not None and entry.fields.get("worker_type") != only_worker_type:
                 self.ack(group, entry)
                 continue
+            if not entry.fields.get("payload"):
+                # 空 payload：这条消息已经不在流里了，只剩一个 id 挂在 PEL 上。
+                # **绝不能交给调用方** —— 报出来会是一个和真因毫无关系的
+                # 「缺字段」错误，而真因在传输层。摘掉它，继续。
+                log.warning("memory_queue.empty_payload_acked", msg_id=entry.id, group=group.name)
+                self.ack(group, entry)
+                continue
             try:
                 msg = model.from_stream_fields(entry.fields)
             except ValidationError as exc:
@@ -403,7 +431,7 @@ class InMemoryQueue:
                     msg_id=entry.id,
                     group=group.name,
                     task_id=entry.fields.get("task_id", "?"),
-                    error=str(exc)[:_MAX_ERROR_CHARS],
+                    error=str(exc)[:MAX_ERROR_CHARS],
                 )
                 continue
             yield _MemoryHandle(self, group, entry, attempt=entry.deliveries), msg
@@ -425,18 +453,16 @@ class InMemoryQueue:
         """
         self._append(
             STREAMS["dead_letter"],
-            {
-                "payload": entry.fields.get("payload", ""),
-                "source_stream": group.stream,
-                "source_id": entry.id,
-                "group": group.name,
-                "task_id": entry.fields.get("task_id", ""),
-                "worker_type": entry.fields.get("worker_type", ""),
-                "attempt": str(entry.deliveries),
-                "error": error[:_MAX_ERROR_CHARS],
-                "error_class": str(error_class),
-                "failed_at": datetime.now(UTC).isoformat(),
-            },
+            dead_letter_fields(
+                entry.fields,
+                source_stream=group.stream,
+                source_id=entry.id,
+                group=group.name,
+                attempt=entry.deliveries,
+                error=error,
+                error_class=error_class,
+                failed_at=datetime.now(UTC),
+            ),
         )
 
     # -- 内部：杂项 -------------------------------------------------------- #
@@ -456,10 +482,53 @@ class InMemoryQueue:
         return group
 
     def _target_groups(self, worker_type: WorkerType | str | None) -> list[_Group]:
-        stream = self._streams[STREAMS["tasks"]]
-        if worker_type is None:
-            return list(stream.groups.values()) + list(self._streams[STREAMS["results"]].groups.values())
-        return [self._group(STREAMS["tasks"], group_for(worker_type))]
+        """``reclaim()`` 要扫的组。
+
+        ``None`` 时是**全部**组，包括 ``review_bootstrap``。漏掉 bootstrap 组
+        曾经是个真实的缺口：编排器在 ``ingest`` 中途崩掉时，那条 bootstrap
+        会永远躺在 PEL 里没人回收，而唯一的症状是这个 run 再也不动了 ——
+        没有任何日志、没有任何报错。契约测试里那条「无参回收要覆盖全部组」
+        现在连 bootstrap 一起断言，就是为了钉住这件事。
+        """
+        if worker_type is not None:
+            return [self._group(STREAMS["tasks"], group_for(worker_type))]
+        return [self._group(STREAMS[key], name) for key, name in CONSUMER_GROUPS.items()] + [
+            self._group(STREAMS["tasks"], group_for(wt)) for wt in WORKER_TYPES
+        ]
+
+    def _trim(self, stream: _Stream, maxlen: int | None) -> int:
+        """从头部删到不超过 ``maxlen``，并把删掉的条目从各组的 PEL 与回收区里摘掉。"""
+        if maxlen is None:
+            return 0
+        removed: list[_Entry] = []
+        while len(stream.entries) > maxlen:
+            removed.append(stream.entries.popleft())
+        self._purge(stream, removed)
+        return len(removed)
+
+    def _purge(self, stream: _Stream, removed: list[_Entry]) -> None:
+        """把已被裁掉的条目从**所有**组的 PEL 与回收区里摘掉。
+
+        结果与 Redis 一致（被裁掉的消息既不会被投递、也不会被重投），**时机**
+        比 Redis 早：Redis 的 ``XTRIM`` 不动 PEL，那些 id 会悬在 PEL 上，
+        直到下一次 ``XAUTOCLAIM`` 把它们当「已删条目」清掉（``redis_streams.py``
+        的 ``_claim`` 处理这一段）。这里在裁剪的那一刻就清干净 —— 内存里没有
+        任何理由留一个保证不会再被用到的引用。
+
+        只摘 PEL 是不够的：``reclaim()`` 已经把一部分条目搬到了 ``redeliver``
+        区，它们同样必须消失，否则那是一条从「空气」里被投出来的消息。
+        """
+        if not removed:
+            return
+        ids = {e.id for e in removed}
+        for group in stream.groups.values():
+            for msg_id in ids:
+                group.pending.pop(msg_id, None)
+            if group.redeliver:
+                kept = deque(e for e in group.redeliver if e.id not in ids)
+                if len(kept) != len(group.redeliver):
+                    group.redeliver = kept
+        log.debug("memory_queue.trimmed", stream=stream.name, count=len(ids))
 
     def _require_usable(self) -> None:
         if self._closed:

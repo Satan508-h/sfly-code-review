@@ -267,9 +267,17 @@ async def _review_once(args: argparse.Namespace, settings: Settings) -> int:
 
 
 async def _consume_forever(spec: WorkerSpec, stop: object) -> None:
-    """常驻消费循环。M3 实现。
+    """常驻消费循环。**M4 交付，不是 M3。**
 
-    M3 的形态大致是：
+    队列那一层（M3）已经就绪 —— ``bus.consume_tasks`` 在真 Redis 上跑得通，
+    回收、重试计数、死信都有测试。这个循环之所以还差一步，缺的是
+    ``store.save_result()``：投递顺序铁律要求「先落库、再 XADD、最后 XACK」，
+    而落库要等 M4 的 Postgres schema 和仓储。
+
+    先落库这一条不能省：反过来（先 XADD）会让编排器被唤醒去读一个还不存在的
+    结果，屏障检查失败；先 XACK 则会让结果同时从 PEL 和数据库消失。
+
+    形态是（顺序即约定 #1）：
         async for handle, task in bus.consume_tasks(spec.worker_type):
             if await already_done(task):          # 幂等快路径
                 await handle.ack(); continue
@@ -291,11 +299,12 @@ async def _consume_forever(spec: WorkerSpec, stop: object) -> None:
         categories=len(spec.categories),
         concurrency=settings.worker_concurrency,
         claim_idle_ms=settings.claim_idle_ms,
-        status="消费循环将在 M3 接入；当前可用 --diff 跑单次审查",
+        status="消费循环等 M4 的 RunStore；队列层（M3）已就绪",
     )
     raise SystemExit(
-        "常驻消费模式还没实现（M3 交付）。\n"
-        f"  现在可以用：python -m sfly_workers --spec {spec.name} --diff fixtures/security_demo.diff"
+        "常驻消费模式还没实现（等 M4 的 Postgres 仓储）。\n"
+        f"  现在可以用：python -m sfly_workers --spec {spec.name} --diff fixtures/security_demo.diff\n"
+        "  想看队列层已经能做到什么（Worker 猝死 → 副本回收）：python scripts/demo_reclaim.py"
     )
 
 
