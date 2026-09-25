@@ -751,7 +751,7 @@ packages/
                  aggregate/ 主 Agent 的聚合（fingerprint / confidence /
                  decision / pipeline / render，**全确定性、零 LLM 调用**）
 web/             Vue 3 SPA
-infra/           postgres init（只有扩展，表由应用建）、redis conf、nginx conf、限流桩
+infra/           postgres init（只有扩展，表由应用建）、redis conf、nginx conf
 fixtures/        diff 样例、录制的 webhook 载荷（含 /pulls/{n}/files 的响应）、大 PR
 scripts/        运维与演示脚本（replay_webhook.py 是 M6 的验收工具）
 tests/           contracts/（两个后端共用的行为契约，被 unit 与 integration 同时继承）
@@ -809,8 +809,8 @@ API 不直接写 `review_tasks` —— 文件风险排序和规则检索由编�
 - **数据量没有验证过。** 七张业务表的索引是按查询形状设计的（部分索引给超时扫描、
   复合主键给屏障查询），但整个 M4 阶段的数据都是个位数行。
   真实规模下的表现只有 M9 的评测集能回答。
-- **GitHub 真实二级限流只能用桩模拟。** `infra/github/stub_server.py` 模拟
-  429 → 退避 → 201 的序列。桩是模型，不是真相。
+- **GitHub 真实二级限流只能用桩模拟。** `tests/github_stub.py` 模拟
+  429/403 → 退避 → 201 的序列。桩是模型，不是真相。
 - **Render 冷启动无法自动化测试。** 免费版休眠后首次请求约需 60 秒（Render 唤醒
   约 60s + Neon 唤醒约 1s）。需要人工冒烟测试并记录实测耗时。
 - **Neon 免费版空闲 5 分钟挂起且无法关闭。** 连接池必须传

@@ -57,11 +57,15 @@ packages/
                  state.py 图状态、risk.py 文件风险排序、labels.py 显示层标签、
                  aggregate/ 主 Agent 的聚合（全确定性、零 LLM 调用）、GitHub 客户端
 web/             Vue 3 + Element Plus + Vite SPA
-infra/           postgres init.sql、redis.conf、nginx 配置、GitHub 限流桩
+infra/           postgres init.sql、redis.conf、nginx 配置
 fixtures/        diff 样例、webhook payload、大 PR fixture
 scripts/         replay_webhook.py、measure_overhead.py、seed_db.py、demo_reclaim.py
 tests/           contracts/（两后端共用的契约，被 unit 与 integration 同时导入）
                  unit（无 Docker 无密钥）/ integration（需 Docker 里的 Redis）/ e2e / eval
+                 github_stub.py —— GitHub API 的桩（限流 / 422 / 分页）。
+                 **住在 tests/ 而不是 infra/**：它的消费者只有测试和手工演示，
+                 放进 infra/ 会被读成部署的一部分。`python tests/github_stub.py --port 8099`
+                 就能让容器指着它跑，看真实的退避重试。
 reports/         评测报告，提交进仓库
 ```
 

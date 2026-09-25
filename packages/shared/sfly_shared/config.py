@@ -160,12 +160,25 @@ class Settings(BaseSettings):
     # -- GitHub ------------------------------------------------------------ #
 
     github_token: str = ""
+    """留空 = **dry-run**：publish 节点照样渲染正文、写事件，但不发任何请求，
+    事件里 ``posted=false``。这是刻意的 —— 「不需要任何密钥就能跑通全链路」
+    是本地开发和 CI 的前提（见 README 的默认值那一段）。"""
     github_webhook_secret: str = ""
     github_api_base: str = "https://api.github.com"
-    """**从第一天就可配**。这不只是为了限流桩：指向
-    ``infra/github/stub_server.py`` 是 ``publish`` 节点能被单测的前提。"""
+    """**从第一天就可配**。这不只是为了限流桩：指向 ``tests/github_stub.py``
+    是 ``publish`` 节点能被单测的前提，也是手工演示「限流后退避重试」的开关。"""
 
     github_max_retries: int = 3
+    github_connect_timeout_s: int = 10
+    github_read_timeout_s: int = 30
+    """读超时比 LLM 那个（120s）短得多：GitHub 的响应是毫秒级的，一次 25 条
+    行内评论的 review 请求也就几秒。设成 120 秒会让「网络断了」表现为
+    「GitHub 很慢」，而 publish 节点卡在那里会拖到 run 的 deadline 之后。"""
+
+    github_max_wait_s: float = 60.0
+    """单次限流等待的上限。超过它就直接判 ``publish_failed`` ——
+    **在 publish 节点里睡一小时比直接失败更糟**：图会停在那儿，
+    而报告早就落库了、重新发布随时可以点。"""
 
     # -- 可观测性 ---------------------------------------------------------- #
 

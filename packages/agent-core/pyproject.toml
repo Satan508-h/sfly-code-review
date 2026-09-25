@@ -9,10 +9,12 @@ dependencies = [
     "langgraph>=1.2",
     "langgraph-checkpoint-postgres>=3.1",
     # 走 OpenAI 兼容接口，所以同一套客户端能对接 DeepSeek / OpenAI / vLLM。
-    # 刻意**不**直接依赖 httpx：openai 3.x 自带的是 httpx2，两套并存在同一个
-    # 进程里会得到两份连接池和两种超时语义，而把一方的对象传给另一方不会报错。
-    # M7 的 GitHub 客户端再决定用哪个（届时是一处显式选择，而不是默认混着）。
     "openai>=3.19",
+    # GitHub 客户端用它。**M7 的那个决定**：openai 3.x 自带的是 httpx2
+    # （包名不同，两者能共存），但这里显式选 httpx —— 因为 apps/api、
+    # scripts/、tests/ 用的都是它，整个仓库因此只有一种超时语义、
+    # 一种 Timeout 类。理由写在 sfly_agent/github/client.py 的模块文档里。
+    "httpx>=0.28",
     # 去重靠 rapidfuzz 而非 embedding：确定性、可复现、无模型下载、微秒级
     "rapidfuzz>=3.9",
     # RAG v1 用 BM25 而非向量库：60-120 条手写规则上词法检索完全够用
