@@ -11,14 +11,40 @@
  *      是 mock 还是 deepseek。排查「为什么本地是这样、线上是那样」时省事。
  *   2. 流水线节点图 —— 把架构印在首页上，面试官点开链接就知道你在做什么。
  */
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 
-import { API_BASE, fetchHealth, type HealthResponse } from '@/api/client'
+import { API_BASE, fetchHealth, type CheckStatus, type HealthResponse } from '@/api/client'
 
 const health = ref<HealthResponse | null>(null)
 const error = ref<string | null>(null)
 const loading = ref(true)
 const elapsedMs = ref(0)
+
+/** 依赖检查按固定顺序展示，不按后端的返回顺序 —— 位置稳定才扫得快。 */
+const DEP_ORDER = ['postgres', 'redis']
+const DEP_LABEL: Record<string, string> = {
+  postgres: 'PostgreSQL',
+  redis: 'Redis',
+}
+
+const deps = computed(() => {
+  const checks = health.value?.checks ?? {}
+  return Object.values(checks).sort(
+    (a, b) => DEP_ORDER.indexOf(a.name) - DEP_ORDER.indexOf(b.name),
+  )
+})
+
+/** 三态各自的样式。`skipped` 用中性灰，不能是红 —— 它表示「本就不需要」。 */
+const TAG_TYPE: Record<CheckStatus, 'success' | 'danger' | 'info'> = {
+  ok: 'success',
+  down: 'danger',
+  skipped: 'info',
+}
+const STATUS_TEXT: Record<CheckStatus, string> = {
+  ok: '正常',
+  down: '不可达',
+  skipped: '不适用',
+}
 
 const PIPELINE = [
   { name: 'ingest', desc: '解析 diff、算出变更行集合' },
@@ -38,7 +64,7 @@ const WORKERS = [
 
 const MILESTONES = [
   { id: 'Step 0', label: '文档 · 契约 · 骨架 · compose', done: true },
-  { id: 'M0', label: 'workspace + 数据存储 + /healthz', done: false },
+  { id: 'M0', label: 'workspace + 依赖连通 + /api/health', done: true },
   { id: 'M1', label: '契约 + Mock LLM + security worker CLI', done: false },
   { id: 'M2', label: '队列协议 + 内存实现 + 指纹', done: false },
   { id: 'M3', label: 'Redis Streams（回收 / 死信 / 重试）', done: false },
@@ -111,16 +137,18 @@ onMounted(load)
         <el-col :xs="24" :sm="12" :md="6">
           <el-card shadow="never" class="stat">
             <div class="stat-label">状态</div>
-            <div class="stat-value ok">● 连通</div>
-            <div class="stat-sub">{{ elapsedMs }} ms</div>
+            <div class="stat-value" :class="health.ok ? 'ok' : 'bad'">
+              {{ health.ok ? '● 可用' : '● 依赖异常' }}
+            </div>
+            <div class="stat-sub">后端响应 {{ elapsedMs }} ms</div>
           </el-card>
         </el-col>
         <el-col :xs="24" :sm="12" :md="6">
           <el-card shadow="never" class="stat">
-            <div class="stat-label">队列后端</div>
-            <div class="stat-value mono">{{ health.config.queue_backend }}</div>
+            <div class="stat-label">部署形态</div>
+            <div class="stat-value mono">{{ health.mode }}</div>
             <div class="stat-sub">
-              {{ health.config.queue_backend === 'redis' ? '消费者组 · 可水平扩展' : '单进程 · 不可扩展' }}
+              {{ health.mode === 'full' ? '7 容器 · 可水平扩展' : '单容器 · 不可扩展' }}
             </div>
           </el-card>
         </el-col>
@@ -141,6 +169,24 @@ onMounted(load)
           </el-card>
         </el-col>
       </el-row>
+
+      <!-- 依赖 -->
+      <el-card shadow="never" class="section">
+        <template #header>
+          <span class="section-title">依赖连通性</span>
+          <span class="section-hint">后端每次请求都实时探测，不是缓存的启动结果</span>
+        </template>
+        <div class="deps">
+          <div v-for="d in deps" :key="d.name" class="dep">
+            <span class="dep-name">{{ DEP_LABEL[d.name] ?? d.name }}</span>
+            <el-tag :type="TAG_TYPE[d.status]" size="small" effect="dark">
+              {{ STATUS_TEXT[d.status] }}
+            </el-tag>
+            <span class="dep-detail mono">{{ d.detail }}</span>
+            <span v-if="d.status === 'ok'" class="dep-latency">{{ d.latency_ms }} ms</span>
+          </div>
+        </div>
+      </el-card>
 
       <!-- 流水线 -->
       <el-card shadow="never" class="section">
@@ -251,7 +297,38 @@ onMounted(load)
 .stat-value.ok {
   color: #16a34a;
 }
+.stat-value.bad {
+  color: #dc2626;
+}
 .stat-sub {
+  color: var(--sfly-text-dim);
+  font-size: 12px;
+}
+
+/* 依赖 */
+.deps {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.dep {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+.dep-name {
+  flex: 0 0 96px;
+  font-weight: 500;
+}
+.dep-detail {
+  flex: 1 1 auto;
+  color: var(--sfly-text-dim);
+  font-size: 12px;
+  word-break: break-all;
+}
+.dep-latency {
+  flex: 0 0 auto;
   color: var(--sfly-text-dim);
   font-size: 12px;
 }

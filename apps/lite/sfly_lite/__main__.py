@@ -23,11 +23,10 @@ grep 一下应该只返回一个文件 —— 这是这个卖点能被验证的�
 
 from __future__ import annotations
 
-import asyncio
-
 import uvicorn
 
 from sfly_api.main import create_app
+from sfly_shared.aio import run
 from sfly_shared.config import get_settings
 from sfly_shared.heartbeat import Heartbeat, shutdown_event
 from sfly_shared.logging import get_logger, setup_logging
@@ -39,11 +38,12 @@ async def _main_async() -> None:
     settings = get_settings()
     setup_logging(settings.log_level, settings.log_json)
 
+    # 这里同样不读 queue_backend / lock_backend —— 见的模块文档，
+    # 只有 factory.py 允许读它们。要确认当前拓扑，看 factory 的 deps.opened 日志。
     log.info(
         "lite.starting",
         port=settings.port,
-        queue_backend=settings.queue_backend,
-        lock_backend=settings.lock_backend,
+        mode=settings.mode,
         llm_provider=settings.llm_provider,
         enable_real_llm=settings.enable_real_llm,
         status="skeleton — M10 接入 GraphRunner / WorkerPool",
@@ -87,6 +87,10 @@ async def _main_async() -> None:
     # ----------------------------------------------------------------- #
     # HTTP
     # ----------------------------------------------------------------- #
+    # 刻意不用 uvicorn.run()：它在 Windows 上把循环工厂写死成
+    # ProactorEventLoop（见 uvicorn/loops/asyncio.py），而本地开发要在
+    # Windows 上跑，Proactor 上 psycopg 连不上数据库。交给
+    # sfly_shared.aio.run 决定循环，这里只负责起服务器。
     config = uvicorn.Config(
         create_app(),
         host="0.0.0.0",  # noqa: S104
@@ -108,7 +112,10 @@ async def _main_async() -> None:
 
 
 def main() -> None:
-    asyncio.run(_main_async())
+    # 注意这里是 asyncio.run 而不是 uvicorn.run：本函数自己驱动 Server.serve()
+    # （见 _main_async），所以循环的选择归我们。Windows 默认的 ProactorEventLoop
+    # 跑不了 psycopg 异步模式，sfly_shared.aio.run 会换成 Selector。
+    run(_main_async())
 
 
 if __name__ == "__main__":

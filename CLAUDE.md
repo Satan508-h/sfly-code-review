@@ -94,6 +94,19 @@ Worker 放弃之前**必须先发一条 `status="failed"` 的 `WorkerResult` 再
 
 改动顺序永远是：先改 contracts.py → 跑 `pytest tests/unit/contracts` → 再改消费方。反过来做会产生静默的字段丢失，因为 Pydantic 默认忽略多余字段。
 
+### 6. `/healthz` 永不探测依赖
+
+存活与就绪是**两个不同的接口**，判据必须不同：
+
+| | 接口 | 决定什么 | 依赖挂了时 |
+|---|---|---|---|
+| 存活 | `/healthz` | Docker 要不要重启这个容器 | **仍返回 200** |
+| 就绪 | `/api/health` | 要不要把流量打过来 | **返回 503** |
+
+合成一个接口就必然二选一：要么在数据库抖动时重启一堆无辜的容器（而 `restart: unless-stopped` 会让它们进入退避循环，日志被重启信息冲掉），要么让负载均衡把流量送进一个干不了活的服务。
+
+新增任何依赖时，探测**只加到 `/api/health`**。容器 healthcheck 用的是心跳文件（`/tmp/sfly-heartbeat`）和 HTTP 存活探针，都不该知道数据库的存在。
+
 ---
 
 ## 几个容易被直觉带错的技术决定
@@ -125,6 +138,18 @@ DeepSeek 的 `json_schema` 未文档化，`strict` 工具模式要 Beta 端点�
 **任何可能卡住的状态都必须是一行带 `deadline_at` 的记录。**
 写不成一条 `SELECT` 的恢复查询，说明状态藏在了会丢失的地方。
 
+**Windows 上必须用 `sfly_shared.aio.run()`，不能用 `asyncio.run()`。**
+Windows 默认的 `ProactorEventLoop` 不支持 `add_reader`，而 psycopg v3 的异步模式正是靠它实现的 —— 不换循环，进程能起来、日志正常、然后在第一次查询时炸掉，报
+`Psycopg cannot use the 'ProactorEventLoop' to run in async mode`。所有 `__main__.py` 和
+`tests/conftest.py` 都已经调用，写新的入口时别漏。详见 `packages/shared/sfly_shared/aio.py`。
+
+**健康探测必须走独立连接，不能复用连接池。**
+`pool.connection(timeout=N)` 只限制「等池子分配连接」的时间；一旦拿到连接，后续查询
+**没有任何超时**。`docker pause` 之下 `SHOW server_version` 会永远阻塞，把 `/api/health`
+整个挂死 —— 而 `docker pause postgres` 正是 README 里承诺要演示的场景。
+`PostgresPool.ping()` / `RedisStreamsQueue.ping()` 因此都新开一条一次性连接，
+外面套 `asyncio.wait_for`，超时取消的是一条马上要销毁的连接，不牵连池子。
+
 ---
 
 ## 常用命令
@@ -139,16 +164,22 @@ python tasks.py down       # 停止（保留数据卷）
 python tasks.py clean      # 停止并删除数据卷（改过 infra/postgres/init.sql 后必须）
 python tasks.py logs -f    # 跟踪全部日志
 python tasks.py ps         # 各容器健康状态
-python tasks.py health     # 探测 api 的 /healthz
+python tasks.py health     # 依赖真实连通性（探 /api/health，不是 /healthz）
 
-python tasks.py test       # 单测（无 Docker、无密钥，应 < 10s）
+python tasks.py test       # 单测（无 Docker、无密钥；Linux/CI 约 2s，Windows 约 16s）
 python tasks.py test-int   # 集成测试（需 Docker，Mock LLM）
 python tasks.py test-e2e   # 端到端（需真实密钥，会花钱，有 $2 上限）
 python tasks.py eval       # 评测集 → reports/eval-<sha>.md
 
 python tasks.py lint       # ruff check + format --check
 python tasks.py fmt        # 自动格式化
-python tasks.py typecheck  # mypy
+python tasks.py typecheck  # mypy strict
+```
+
+> **单测在 Windows 上比 Linux 慢一个数量级，这是平台差异不是回归。**
+> 探测类测试连的是 `127.0.0.1:1`（保证连不上）。Linux 上拒绝连接是即时的，
+> Windows 的 `SelectorEventLoop` 要花约 2 秒才报 `ECONNREFUSED`。
+> CI 跑在 `ubuntu-latest`，所以那边的耗时才是这条命令的真实成本。
 
 # 分布式能力验证（这几条就是项目要证明的东西）
 python tasks.py scale 3        # --scale worker-security=3，三个副本竞争消费
@@ -175,8 +206,8 @@ python tasks.py demo           # 端到端：投递 3 次同一 webhook → 1 ru
 
 ## 当前进度
 
-- [x] Step 0 — 文档、契约、目录骨架、compose（进行中）
-- [ ] M0 — workspace 起来、redis+postgres、`/healthz`
+- [x] Step 0 — 文档、契约、目录骨架、compose
+- [x] M0 — workspace、`sfly_bus` 连接层、`/api/health` 真实依赖探测
 - [ ] M1 — 契约 + Mock LLM + security worker CLI
 - [ ] M2 — 队列协议 + InMemoryQueue + 指纹
 - [ ] M3 — RedisStreamsQueue（含 XAUTOCLAIM / 死信 / 重试计数）

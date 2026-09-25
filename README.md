@@ -14,15 +14,28 @@
 
 ## 当前状态
 
-**Step 0 已完成并验证**：架构、领域契约、传输层协议、目录骨架、Docker 编排。
+**M0 已完成并验证**：workspace、数据存储连接层、依赖真实探测。
 
 已验证：`docker compose up` 起 8 个容器全部 healthy；`--scale worker-security=3`
-起 3 个副本；`kill-worker` 后自动重启；nginx 同源代理 `/api` 直通；74 个单测
-0.3 秒跑完；ruff 检查全绿。
+起 3 个副本；`kill-worker` 后自动重启；nginx 同源代理 `/api` 直通；
+**`/api/health` 报告 Postgres 16.15 / Redis 7.4.11 的真实版本与毫秒级延迟**；
+101 个单测通过；ruff + mypy strict 全绿。
+
+依赖故障时的行为也逐条验过（这是 M0 真正交付的东西）：
+
+| 操作 | `/healthz`（存活） | 容器状态 | `/api/health`（就绪） |
+|---|---|---|---|
+| `docker pause postgres` | 200 | 仍 healthy | **503**，3.0s 内给出「连接超时」 |
+| `docker compose stop redis` | 200 | 仍 healthy | **503**，报出 `ConnectionError` 与地址 |
+| 恢复 | 200 | healthy | 200，两项都回到 `ok` |
+
+**存活与就绪是两个接口，判据刻意不同** —— 依赖挂了不该让容器被重启，
+那只会把一次数据库抖动放大成一次全站重启，且 `restart: unless-stopped` 会让
+日志被退避重启信息冲掉。详见 [CLAUDE.md](CLAUDE.md) 约定 #6。
 
 **业务逻辑尚未实现** —— 各服务目前只输出一条说明自己身份的启动日志，然后等停机信号。
 `review_bootstrap → review_tasks → review_results → dead_letter` 四条流和
-LangGraph 图都是 M0 之后的交付物。
+LangGraph 图都是 M1 之后的交付物。
 
 进度见 [CLAUDE.md](CLAUDE.md) 末尾的清单，或前端首页。
 
@@ -99,6 +112,15 @@ python tasks.py up            # 构建 + 启动 + 等健康检查通过
 
 打开 <http://localhost:5173> 应该看到状态页，四个指标全部连通。
 
+```bash
+python tasks.py health      # 依赖的真实连通性（版本号 + 延迟），不可用则非零退出
+curl localhost:8000/healthz # 存活探针，永远 200
+```
+
+`/healthz` 与 `/api/health` 的分工见下面的「两个探针」。想直接看依赖挂掉时的
+表现，`docker pause sfly-postgres-1` 之后再调一次 `tasks.py health`，然后
+`docker unpause`。
+
 ### 端口被占用怎么办
 
 本机已经有 Postgres / Redis 时（比如另一个项目在跑），默认端口会冲突，报错是：
@@ -147,6 +169,8 @@ DeepSeek 走 OpenAI 兼容接口，所以换成 OpenAI、vLLM 或本地模型只
 | 主张 | 命令 | 应该看到 |
 |---|---|---|
 | 一键启动 | `python tasks.py up` | 全部容器 `healthy`，命令返回即代表可用 |
+| 依赖真实可达 | `python tasks.py health` | Postgres / Redis 的**版本号**与毫秒延迟，不是照抄配置 |
+| 依赖挂了不误伤 | `docker pause sfly-postgres-1` | `/healthz` 仍 200、容器仍 healthy、`/api/health` 503；`docker unpause` 后自动恢复 |
 | Worker 水平扩展 | `python tasks.py scale 3` | `worker-security` 变成 3 个副本，日志里出现 3 个消费者实例 |
 | Worker 猝死不影响结果 | `python tasks.py kill-worker` | run 照样跑完，UI 显示「1 个 Worker 降级」徽章 |
 | Webhook 幂等 | 同一 payload 连投 3 次 | 1 个 run + 2 个 `duplicate` 响应 |
@@ -192,6 +216,20 @@ LLM 裁判会引入非确定性，直接毁掉评测的可复现性。四条规�
 
 **永不发 `APPROVE`。**
 机器人审批人类 PR 是策略漏洞。只发 `REQUEST_CHANGES` 或 `COMMENT`。
+
+**存活与就绪是两个接口，判据不同。**
+`/healthz` 决定 Docker 要不要重启容器，**永不探测依赖**；`/api/health` 决定要不要
+把流量打过来，依赖挂了返回 503。合成一个接口就必然二选一：要么在数据库抖动时
+重启一堆无辜的容器（而 `restart: unless-stopped` 会把它们拖进退避循环，
+真正的错误被重启日志冲掉），要么让负载均衡把流量送进一个干不了活的服务。
+后者听起来更无害，直到你发现健康检查绿灯、页面却在报错，而日志里什么都没写。
+
+**健康探测走一次性连接，不走连接池。**
+`pool.connection(timeout=N)` 只限制「等池子分配连接」的时间；拿到连接之后，
+后面的查询**没有任何超时**。`docker pause` 之下 `SHOW server_version` 会永远阻塞
+—— 实测把 `/api/health` 整个挂死，而 `docker pause postgres` 正是上面表格里
+承诺要演示的场景。现在两种依赖的探测都新开一条一次性连接，外面套
+`asyncio.wait_for`：超时取消的是一条马上要销毁的连接，不牵连池子。
 
 ---
 
@@ -256,6 +294,21 @@ API 不直接写 `review_tasks` —— 文件风险排序和规则检索由编�
 - **DeepSeek 在真实负载下的行为未验证。** 评测集只有 30 个 PR 的规模。
 - **`review_results` 流的裁剪（MAXLEN）** 在 M5 验证通过前不会开启。近似裁剪可能
   删掉「已投递未 ACK」的消息，导致 `XAUTOCLAIM` 取回空 payload。
+- **Windows 上原生跑 Python 时必须换事件循环。** Windows 默认的
+  `ProactorEventLoop` 不支持 `add_reader`，而 psycopg v3 的异步模式正是靠它实现的；
+  不换的话进程能起来、日志正常，然后在第一次查询时抛
+  `Psycopg cannot use the 'ProactorEventLoop' to run in async mode` ——
+  看起来像代码写错了，其实是平台默认值不对。所有入口已统一走
+  `sfly_shared.aio.run()`，但它只在**非容器**运行时才是关键路径
+  （容器里是 Linux，两种循环的差异根本不存在）。uvicorn 在 Windows 上把循环工厂
+  写死成 Proactor，所以 `sfly_api/__main__.py` 没有用 `uvicorn.run()`，
+  而是自己驱动 `Server.serve()` —— 这是为了让"本地能不能跑"和"线上跑什么"
+  保持一致，不是为了性能。
+- **Windows 本地单测约 16 秒，CI 上约 2 秒。** 不是回归：探测测试连的是
+  `127.0.0.1:1`，Linux 上拒绝连接是即时的，`SelectorEventLoop` 在 Windows 上
+  要花约 2 秒才报 `ECONNREFUSED`。这一条同时影响了 `_PING_CONNECT_TIMEOUT_S`
+  的取值（设成 2 秒会被平台自身的延迟抢先触发，把有用的
+  `ConnectionRefusedError` 换成没有信息量的 `TimeoutError`）。
 
 ### 明确不做
 

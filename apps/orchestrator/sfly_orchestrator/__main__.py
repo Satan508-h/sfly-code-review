@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 
+from sfly_shared.aio import run
 from sfly_shared.config import get_settings
 from sfly_shared.heartbeat import run_service
 from sfly_shared.logging import get_logger
@@ -53,7 +54,9 @@ async def _body(stop: asyncio.Event) -> None:
 
 
 def main() -> None:
-    asyncio.run(run_service("orchestrator", _body))
+    # 用 sfly_shared.aio.run 而不是 asyncio.run：Windows 默认的 ProactorEventLoop
+    # 跑不了 psycopg 的异步模式。见 packages/shared/sfly_shared/aio.py。
+    run(run_service("orchestrator", _body))
 
 
 if __name__ == "__main__":

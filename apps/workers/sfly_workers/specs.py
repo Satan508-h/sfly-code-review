@@ -124,9 +124,11 @@ def spec_for(worker_type: WorkerType | str) -> WorkerSpec:
     —— 这个函数的主要调用点是命令行入口，用户打错字时最需要的是看到可选项列表。
     """
     try:
-        key = worker_type if isinstance(worker_type, WorkerType) else WorkerType(worker_type)
+        key: WorkerType | None = (
+            worker_type if isinstance(worker_type, WorkerType) else WorkerType(worker_type)
+        )
     except ValueError:
-        key = None  # type: ignore[assignment]
+        key = None
     if key is None or key not in SPECS:
         valid = ", ".join(sorted(s.value for s in SPECS))
         raise SystemExit(f"未知的 --spec {worker_type!r}；可选：{valid}")

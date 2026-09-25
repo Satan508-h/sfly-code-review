@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import sys
 
+from sfly_shared.aio import run
 from sfly_shared.config import get_settings
 from sfly_shared.contracts import WorkerType
 from sfly_shared.heartbeat import run_service
@@ -95,7 +96,8 @@ def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     # spec_for 会校验并给出可读的报错
     spec_for(args.spec)
-    asyncio.run(_main_async(args))
+    # 用 sfly_shared.aio.run：Windows 默认的 ProactorEventLoop 跑不了 psycopg 异步模式
+    run(_main_async(args))
 
 
 if __name__ == "__main__":

@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import MutableMapping
 from contextvars import ContextVar
-from typing import Any
+from typing import Any, cast
 
 import structlog
 
@@ -28,7 +29,15 @@ def bind_task(task_id: str | None = None, worker_type: str | None = None) -> Non
         _ctx_worker.set(worker_type)
 
 
-def _inject_context(_logger: Any, _method: str, event_dict: dict) -> dict:
+def _inject_context(
+    _logger: Any, _method: str, event_dict: MutableMapping[str, Any]
+) -> MutableMapping[str, Any]:
+    """把 contextvar 里的 task_id / worker_type 并进每条日志。
+
+    参数类型写成 ``MutableMapping`` 而不是 ``dict``：structlog 传进来的是它自己的
+    事件字典（接口上只保证 MutableMapping），声明成 ``dict`` 会让这个处理器
+    类型不兼容，mypy 会在 ``processors=[...]`` 那一行报错。
+    """
     if (tid := _ctx_task_id.get()) and "task_id" not in event_dict:
         event_dict["task_id"] = tid
     if (wt := _ctx_worker.get()) and "worker_type" not in event_dict:
@@ -73,4 +82,8 @@ def setup_logging(level: str = "INFO", json_output: bool = True) -> None:
 
 
 def get_logger(name: str = "sfly") -> structlog.stdlib.BoundLogger:
-    return structlog.get_logger(name)
+    # structlog.get_logger 的返回类型在它的类型存根里是 Any（实际返回的是
+    # 一个延迟绑定的代理，第一次用时才按 configure() 的 wrapper_class 构造）。
+    # cast 而不是 `# type: ignore`：这里确实是类型系统覆盖不到的地方，
+    # 而不是类型错了 —— 用 ignore 会把将来真正的类型错误一起吞掉。
+    return cast("structlog.stdlib.BoundLogger", structlog.get_logger(name))

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from sfly_shared.contracts import (
     BootstrapMessage,
@@ -268,7 +268,7 @@ class RunStore(Protocol):
 
     # -- 事件（SSE + UI 时间线） ------------------------------------------- #
 
-    async def append_event(self, task_id: str, kind: str, payload: dict) -> int:
+    async def append_event(self, task_id: str, kind: str, payload: dict[str, Any]) -> int:
         """追加一条事件，返回自增的 ``seq``。
 
         这张表是权威来源，SSE 只是快路径 —— 所以客户端带 ``Last-Event-ID``

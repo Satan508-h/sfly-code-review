@@ -40,9 +40,21 @@ export type RunStatus =
   | 'failed'
   | 'skipped'
 
-export interface WorkerCheck {
+export type CheckStatus = 'ok' | 'down' | 'skipped'
+
+/**
+ * 一个依赖的探测结果。
+ *
+ * `skipped` 不是 `down` 的同义词：精简模式下没有 Redis，那是正确状态而不是故障。
+ * 后端为此专门用了三态而不是布尔 —— 前端也必须照着区分，否则健康页会在
+ * 正确的部署上常亮红灯。
+ */
+export interface DependencyCheck {
+  name: string
+  status: CheckStatus
   ok: boolean
-  detail?: string
+  detail: string
+  latency_ms: number
 }
 
 export interface HealthResponse {
@@ -58,7 +70,7 @@ export interface HealthResponse {
     wait_strategy: string
     conflict_resolver: string
   }
-  checks: Record<string, WorkerCheck>
+  checks: Record<string, DependencyCheck>
 }
 
 // --------------------------------------------------------------------------- //
@@ -66,6 +78,14 @@ export interface HealthResponse {
 // --------------------------------------------------------------------------- //
 
 export async function fetchHealth(): Promise<HealthResponse> {
-  const { data } = await http.get<HealthResponse>('/health')
+  const { data } = await http.get<HealthResponse>('/health', {
+    // 依赖不可达时后端返回 **503**，而 503 的响应体里带着我们最需要的诊断信息
+    // （哪个依赖挂了、报的什么错）。
+    //
+    // axios 默认把非 2xx 当异常抛，于是「后端连得上、但 Redis 挂了」会表现为
+    // 「无法连接后端」—— 恰好是最误导人的那种错误。这里显式接受 5xx，
+    // 让调用方拿到真实结果，由它自己看 `ok` 字段决定怎么显示。
+    validateStatus: (status) => status < 600,
+  })
   return data
 }

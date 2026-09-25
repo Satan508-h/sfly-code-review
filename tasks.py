@@ -228,24 +228,65 @@ def cmd_kill_worker(_: argparse.Namespace) -> None:
     _ok("已杀死。观察日志：同伴应在 CLAIM_IDLE_MS 后回收该任务，run 照样跑完")
 
 
+#: 依赖状态三态在终端里的记号。ASCII，因为 Windows 控制台的 GBK 代码页
+#: 装不下 ● ○ 这类字符（见文件头的编码说明）。
+_CHECK_MARK = {"ok": "[OK]  ", "down": "[!!]  ", "skipped": "[--]  "}
+
+
 def cmd_health(args: argparse.Namespace) -> None:
-    # 端口从 .env 读，而不是写死 8000 —— 本机可能因为端口冲突改过映射，
-    # 探测一个错的地址会得到「服务没起来」的错误结论。
+    """探测 ``/api/health`` —— **就绪**探针，会真的去连 Postgres 和 Redis。
+
+    刻意不探 ``/healthz``：那个是存活探针，永远返回 200，用它做验收
+    等于什么都没验。这里要看的是「这套部署现在能不能干活」。
+    """
     port = args.port or _load_env().get("API_HOST_PORT", "8000")
-    url = f"http://127.0.0.1:{port}/healthz"
+    url = f"http://127.0.0.1:{port}/api/health"
+
+    import json
     import urllib.error
     import urllib.request
 
+    body: dict[str, Any] | None = None
+    last_error = ""
     for attempt in range(1, 6):
         try:
-            with urllib.request.urlopen(url, timeout=5) as r:
-                print(r.read().decode())
-                _ok(f"api 健康：{url}")
-                return
+            with urllib.request.urlopen(url, timeout=15) as r:
+                body = json.loads(r.read().decode())
+                break
+        except urllib.error.HTTPError as exc:
+            # 503 是**有内容的失败**：依赖挂了，但后端是活的，响应体里写着是哪个。
+            # 把它和「连不上」区分开，否则用户会去查一个根本没坏的后端。
+            with contextlib.suppress(Exception):
+                body = json.loads(exc.read().decode())
+            break
         except (urllib.error.URLError, TimeoutError) as exc:
+            last_error = str(exc)
             print(f"  第 {attempt}/5 次探测失败：{exc}")
             time.sleep(2)
-    _die(f"api 在 {url} 无响应。看日志：python tasks.py logs api")
+    else:
+        _die(f"api 在 {url} 无响应。看日志：python tasks.py logs api")
+
+    assert body is not None
+
+    print(
+        f"\n  {body.get('service', '?')} v{body.get('version', '?')}"
+        f"   mode={body.get('mode', '?')}   已运行 {body.get('uptime_s', 0)}s\n"
+    )
+    for name, check in (body.get("checks") or {}).items():
+        mark = _CHECK_MARK.get(check.get("status", ""), "      ")
+        latency = f"{check['latency_ms']:>7.1f} ms" if check.get("status") == "ok" else " " * 10
+        print(f"  {mark}{name:<10}{latency}  {check.get('detail', '')}")
+
+    if not body.get("ok", False):
+        failed = [n for n, c in (body.get("checks") or {}).items() if c.get("status") == "down"]
+        _die(
+            f"依赖不可用：{', '.join(failed) or '未知'}\n"
+            "  看容器状态：python tasks.py ps\n"
+            "  看日志：    python tasks.py logs postgres redis"
+        )
+    _ok(f"全部依赖就绪：{url}")
+    if last_error:
+        print(f"  （前几次探测失败过：{last_error}）")
 
 
 # -- 测试 ------------------------------------------------------------------- #
@@ -355,7 +396,8 @@ def _print_endpoints() -> None:
         f"""
   前端       http://localhost:{web}
   API 文档   http://localhost:{api}/api/docs
-  健康检查   http://localhost:{api}/healthz
+  依赖状态   http://localhost:{api}/api/health   （或：python tasks.py health）
+  存活探针   http://localhost:{api}/healthz      （不探依赖，永远 200）
   Postgres   localhost:{pg}  (sfly / sfly)
   Redis      localhost:{rd}{note}
 

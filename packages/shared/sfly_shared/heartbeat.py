@@ -105,11 +105,15 @@ async def run_service(
     settings = get_settings()
     setup_logging(settings.log_level, settings.log_json)
 
+    # 刻意**不**在这里记录 queue_backend / lock_backend：读这两个设置只允许
+    # 发生在 sfly_bus/factory.py 里（CLAUDE.md 约定 #4）。这个共用骨架一行
+    # 都不该知道自己跑在哪种拓扑下，日志也不行 —— 今天是一行日志，
+    # 明天就会有人顺手在它旁边加一个 if。
+    # 拓扑信息由 factory.open_dependencies() 的 `deps.opened` 日志给出。
     log.info(
         "service.starting",
         service=name,
         mode=settings.mode,
-        queue_backend=settings.queue_backend,
         llm_provider=settings.llm_provider,
     )
 
