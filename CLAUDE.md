@@ -1,0 +1,192 @@
+# CLAUDE.md
+
+本文件是给 Claude Code 的项目上下文。**每次改动前先读「不可违反的约定」一节。**
+
+---
+
+## 项目是什么
+
+`sfly` — 基于多 Agent 的分布式代码审查系统。GitHub Webhook 触发 PR 审查，3 个专业 Worker（安全 / 性能 / 风格）通过 Redis Streams 消费者组并行消费任务，编排器用 LangGraph 状态机协调，主 Agent 汇总去重、消解冲突、重算置信度，生成最终报告并回写 PR 评论。
+
+定位：**分布式执行 + 集中式决策**的轻量级 PR 审查平台。不引入 K8s，不引入 Kafka。
+
+## 两种拓扑（整个项目的核心卖点）
+
+同一套代码，两种部署形态，由 `QUEUE_BACKEND` 环境变量选择：
+
+| | 完整模式 | 精简模式 |
+|---|---|---|
+| 启动 | `docker compose up` | Render 单容器 |
+| 容器数 | 7+（api / orchestrator / worker×3 / redis / postgres / web） | 1 |
+| 队列 | `RedisStreamsQueue`（消费者组、XAUTOCLAIM、死信） | `InMemoryQueue`（asyncio 队列） |
+| 锁 | `RedisLock`（SET NX PX + Lua 释放） | `InMemoryLock`（asyncio.Lock 字典） |
+| 存储 | 本地 Postgres 容器 | Neon Postgres |
+| 前端 | nginx 托管，同源代理 `/api` | Vercel 独立部署，跨域 + CORS |
+| 水平扩展 | `docker compose up --scale worker-security=3` | 不支持（单进程 asyncio 并发） |
+
+**`GraphRunner`、`WorkerPool`、全部 LangGraph 节点在两种模式下是同一批对象。** 这不是巧合而是约束——任何让节点感知到具体队列实现的改动都是在破坏项目的主要论点。
+
+---
+
+## 仓库地图
+
+```
+apps/
+  api/           FastAPI 网关：HMAC 校验、投递去重、runs 接口、SSE
+  orchestrator/  LangGraph 图 + coordinator 协程 + 超时扫描器
+  workers/       一套代码三种部署：python -m sfly_workers --spec {security|performance|style}
+  lite/          单事件循环，同时跑 API + GraphRunner + WorkerPool（Render 用）
+packages/
+  shared/        sfly_shared — 领域契约（contracts.py）、配置、ID 生成
+  bus/           sfly_bus — TaskQueue / RunStore / Lock 协议 + 两种实现 + migrations
+  agent-core/    sfly_agent — LLM 抽象与结构化输出、RAG、聚合算法、GitHub 客户端
+web/             Vue 3 + Element Plus + Vite SPA
+infra/           postgres init.sql、redis.conf、nginx 配置、GitHub 限流桩
+fixtures/        diff 样例、webhook payload、大 PR fixture
+scripts/         replay_webhook.py、measure_overhead.py、seed_db.py
+tests/           unit（无 Docker 无密钥）/ integration（需 Docker）/ e2e（需真实密钥）/ eval
+reports/         评测报告，提交进仓库
+```
+
+**数据流**：`review_bootstrap → review_tasks → review_results → dead_letter`
+
+注意 API **不直接写 `review_tasks`**。它只写 `review_bootstrap`；文件风险排序和规则检索由编排层的 `plan` 节点负责。Worker 收到的 `TaskMessage` 已经带上检索好的规则，所以 Worker 保持无状态且不需要 RAG 依赖。
+
+---
+
+## 不可违反的约定
+
+这五条每一条都对应一个具体的、已经想清楚的失败模式。改代码时如果发现自己在违反其中任何一条，先停下来问。
+
+### 1. 投递顺序铁律：存 Postgres → XADD 结果 → XACK
+
+```python
+result = await self._run_llm(task)  # 可能耗时 60s
+await store.save_result(result)  # 1. 先落库
+await queue.publish_result(result)  # 2. 再唤醒编排器
+await handle.ack()  # 3. 最后才离开 PEL
+```
+
+- 先 `XADD` 后写库 → coordinator 被唤醒去读一个还不存在的结果，屏障检查失败
+- 先 `XACK` 后写库 → 结果同时从 PEL 和数据库消失，永久丢失
+
+### 2. 失败也是结果
+
+Worker 放弃之前**必须先发一条 `status="failed"` 的 `WorkerResult` 再 ack**。否则 `wait` 节点的屏障永远闭合不了，整个 run 挂到超时。
+
+推论：死信队列**不是**完成机制。它只做运维可见性（什么失败了、为什么、多频繁）。如果你发现自己在用死信去解除 run 的阻塞，那是 bug。结果进死信只能是**副本**，与补发的 failed 结果并存。
+
+### 3. 状态累加器一律用 dict，不用 list
+
+`ReviewState` 里每一个会被多个 Worker 或重放写入的字段都是 `dict[str, X]`，键是稳定 ID（`task_id`、`worker_type`、`fingerprint`）。
+
+原因：LangGraph 在恢复和重放时会重新执行节点。list 累加器（`operator.add`）遇到重放会产生重复条目；dict 按键合并天然幂等，同一个结果合并两次得到同一个 dict。
+
+### 4. 只有 factory.py 分支环境变量
+
+`QUEUE_BACKEND` / `LOCK_BACKEND` 这两个环境变量名在整个代码库里**只能出现在 `packages/bus/sfly_bus/factory.py`**。评审时 `grep -rn "QUEUE_BACKEND" --include=*.py` 应该只返回一个文件。
+
+一旦某个节点或 Worker 开始判断「我用的是不是 Redis」，两种拓扑共用代码这条就废了。
+
+### 5. 契约变更先改 contracts.py
+
+`packages/shared/sfly_shared/contracts.py` 是唯一的真相来源，`TaskMessage`/`WorkerResult`/`Finding` 在 Rust 意义上被 5 个 app 消费。
+
+改动顺序永远是：先改 contracts.py → 跑 `pytest tests/unit/contracts` → 再改消费方。反过来做会产生静默的字段丢失，因为 Pydantic 默认忽略多余字段。
+
+---
+
+## 几个容易被直觉带错的技术决定
+
+这些是刻意选择的，不是疏忽。改之前先看理由。
+
+**幂等靠数据库唯一约束，不靠 Redis SETNX。**
+`SETNX sfly:w:done:{task_id}:{worker_type}` 只是省 token 的快路径。真正的保证是 `worker_results` 的 `PRIMARY KEY (task_id, worker_type)` + `INSERT ... ON CONFLICT DO NOTHING`。Redis 键会过期、会随 Redis 重启丢失、可能在后续写库失败时已经被设上。约束不会。
+
+**去重用 `rapidfuzz` + 并查集，不用 embedding。**
+确定性、可复现（评测需要）、无模型下载、微秒级。相似度阈值：同 Worker 0.75，跨 Worker 0.55。
+
+**冲突消解用确定性规则引擎，不用 LLM。**
+LLM 裁判会引入非确定性，直接毁掉评测的可复现性。`CONFLICT_RESOLVER=llm` 保留为 M11 的 A/B 对照，不做默认。
+
+**RAG 用手写 YAML 规则库 + BM25，不用向量库。**
+60–120 条手写规则（引 OWASP Top 10 / CWE Top 25 / Google 风格指南）。规则库本身是可被审阅的作品。向量库是 M11 可选升级。
+
+**LLM 输出契约用 `response_format={"type":"json_object"}`。**
+DeepSeek 的 `json_schema` 未文档化，`strict` 工具模式要 Beta 端点。两者都不能作为核心契约。这也是 provider 可换的关键。
+
+**永不发 `APPROVE`。**
+机器人审批人类 PR 是策略漏洞。只发 `REQUEST_CHANGES` 或 `COMMENT`。
+
+**`wait` 节点用 `interrupt()` 而非轮询。**
+图暂停期间 orchestrator 崩溃，恢复靠的是一条 SQL 查询（`review_runs.status + deadline_at`）而不是内存状态。这是断点恢复故事成立的地方。
+逃生开关：`WAIT_STRATEGY=poll`，节点签名完全相同，约 20 行。卡住超过一天就切过去——**先跑通优于先优雅**。
+
+**任何可能卡住的状态都必须是一行带 `deadline_at` 的记录。**
+写不成一条 `SELECT` 的恢复查询，说明状态藏在了会丢失的地方。
+
+---
+
+## 常用命令
+
+**主入口是 `python tasks.py <命令>`**，跨平台、零依赖。`make <命令>` 是等价的
+瘦壳（内部就是委托给 tasks.py），给 Linux/macOS/CI 用。**开发机是 Windows，
+默认没有 make，所以一律以 tasks.py 为准。**
+
+```bash
+python tasks.py up         # 构建 + 启动全部服务 + 阻塞到健康检查通过
+python tasks.py down       # 停止（保留数据卷）
+python tasks.py clean      # 停止并删除数据卷（改过 infra/postgres/init.sql 后必须）
+python tasks.py logs -f    # 跟踪全部日志
+python tasks.py ps         # 各容器健康状态
+python tasks.py health     # 探测 api 的 /healthz
+
+python tasks.py test       # 单测（无 Docker、无密钥，应 < 10s）
+python tasks.py test-int   # 集成测试（需 Docker，Mock LLM）
+python tasks.py test-e2e   # 端到端（需真实密钥，会花钱，有 $2 上限）
+python tasks.py eval       # 评测集 → reports/eval-<sha>.md
+
+python tasks.py lint       # ruff check + format --check
+python tasks.py fmt        # 自动格式化
+python tasks.py typecheck  # mypy
+
+# 分布式能力验证（这几条就是项目要证明的东西）
+python tasks.py scale 3        # --scale worker-security=3，三个副本竞争消费
+python tasks.py kill-worker    # 杀掉一个 Worker：run 仍应跑完并显示降级徽章
+python tasks.py demo           # 端到端：投递 3 次同一 webhook → 1 run + 2 duplicate
+```
+
+**依赖管理**：改动任何 `pyproject.toml` 之后必须 `python tasks.py lock` 并提交
+`uv.lock` —— Docker 构建用的是 `uv sync --frozen`，lock 过期会直接构建失败。
+
+## 环境变量
+
+见 `.env.example`。核心几项：`DATABASE_URL`、`REDIS_URL`、`GITHUB_TOKEN`、`GITHUB_WEBHOOK_SECRET`、`LLM_API_KEY`、`LLM_PROVIDER`（`mock|deepseek|openai`）、`LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY`。
+
+**默认全部可空**——`LLM_PROVIDER=mock` + 本地 Docker Postgres/Redis 时不需要任何密钥就能跑通全链路。这是刻意的：开发和 CI 不应该依赖外部服务。
+
+## 代码约定
+
+- Python 3.12（容器内），`uv` 管理 workspace，一份 `uv.lock`
+- 全异步：`async def` + `psycopg` v3（**不是 asyncpg**，LangGraph 的 Postgres checkpointer 用 psycopg）
+- 结构化日志用 `structlog`，每条日志带 `task_id` / `worker_type` 便于串联
+- 类型标注必须完整，`mypy` 在 CI 中跑
+- 时间统一 UTC，`datetime.now(UTC)`
+
+## 当前进度
+
+- [x] Step 0 — 文档、契约、目录骨架、compose（进行中）
+- [ ] M0 — workspace 起来、redis+postgres、`/healthz`
+- [ ] M1 — 契约 + Mock LLM + security worker CLI
+- [ ] M2 — 队列协议 + InMemoryQueue + 指纹
+- [ ] M3 — RedisStreamsQueue（含 XAUTOCLAIM / 死信 / 重试计数）
+- [ ] M4 — Postgres schema + 幂等 migrate
+- [ ] M5 — LangGraph 图（高风险：`interrupt()`）
+- [ ] M6 — FastAPI + SSE 带 Last-Event-ID 补齐
+- [ ] M7 — GitHub 客户端 + publish 节点
+- [ ] M8 — Vue SPA
+- [ ] M9 — 聚合硬化 + 评测集
+- [ ] M10 — 精简模式 + Render / Vercel 部署
+- [ ] M11 — 可选：pgvector、LLM 冲突消解 A/B
+
+详细计划见 `~/.claude/plans/1-agent-pr-curried-unicorn.md`。

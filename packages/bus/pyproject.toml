@@ -1,0 +1,23 @@
+[project]
+name = "sfly-bus"
+version = "0.1.0"
+description = "TaskQueue / RunStore / Lock 协议与两种实现（Redis Streams、内存）"
+requires-python = ">=3.12"
+dependencies = [
+    "sfly-shared",
+    # redis-py 8.x 才有完整的 XAUTOCLAIM 支持与异步消费者组 API
+    "redis>=8.1",
+    # psycopg v3，不是 asyncpg —— LangGraph 的 Postgres checkpointer 用 psycopg，
+    # 混两个驱动会带来两份连接池和两套超时语义。
+    "psycopg[binary,pool]>=3.3",
+]
+
+[tool.uv.sources]
+sfly-shared = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sfly_bus"]

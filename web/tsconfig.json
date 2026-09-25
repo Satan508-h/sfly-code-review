@@ -1,0 +1,37 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    // "node" 是给 vite.config.ts 用的（它 import 了 node:url）。
+    // 代价是前端代码里也能看到 process/Buffer 等 Node 全局变量 ——
+    // 这是 Vite 项目里常见的取舍；想更严格就拆成 tsconfig.app.json +
+    // tsconfig.node.json 两个工程，但那是 M8 有了真实业务代码之后的事。
+    "types": ["vite/client", "node"],
+
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+
+    "jsx": "preserve",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+
+    // 不设 baseUrl：它在 TypeScript 7.0 里会被移除，而 moduleResolution
+    // 为 "bundler" 时 paths 本来就相对本文件所在目录解析，不需要它。
+    // （Vite 侧的同一份别名在 vite.config.ts 的 resolve.alias 里，
+    //   两处必须保持一致 —— 改一个记得改另一个。）
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "src/**/*.d.ts", "src/**/*.vue", "vite.config.ts"]
+}

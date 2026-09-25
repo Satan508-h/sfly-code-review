@@ -1,0 +1,35 @@
+[project]
+name = "sfly-agent"
+version = "0.1.0"
+description = "LLM 抽象与结构化输出、RAG 检索、聚合算法、GitHub 客户端、LangGraph 状态与节点"
+requires-python = ">=3.12"
+dependencies = [
+    "sfly-shared",
+    "sfly-bus",
+    "langgraph>=1.2",
+    "langgraph-checkpoint-postgres>=3.1",
+    # 走 OpenAI 兼容接口，所以同一套客户端能对接 DeepSeek / OpenAI / vLLM
+    "openai>=3.19",
+    "httpx>=0.28",
+    # 去重靠 rapidfuzz 而非 embedding：确定性、可复现、无模型下载、微秒级
+    "rapidfuzz>=3.9",
+    # RAG v1 用 BM25 而非向量库：60-120 条手写规则上词法检索完全够用
+    "rank-bm25>=0.2.2",
+    "pyyaml>=6.0",
+    "tenacity>=9.1",
+]
+
+[tool.uv.sources]
+sfly-shared = { workspace = true }
+sfly-bus = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sfly_agent"]
+
+[tool.hatch.build.targets.wheel.force-include]
+# 规则库是数据不是代码，但必须随包分发 —— 否则容器里检索不到任何规则
+"sfly_agent/rag/corpus" = "sfly_agent/rag/corpus"

@@ -1,0 +1,61 @@
+# --- 密钥 -------------------------------------------------------------------
+# .env.example 是提交的模板；.env 有真实密钥，永远不要提交
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+
+# --- 前端 -------------------------------------------------------------------
+node_modules/
+web/dist/
+web/.vite/
+web/tsconfig.tsbuildinfo
+*.local
+
+# --- 数据与运行时 -----------------------------------------------------------
+# compose 的命名卷由 Docker 管理，不进仓库
+pgdata/
+redisdata/
+*.sqlite
+*.db
+/tmp/
+.sfly-heartbeat
+
+# --- 评测 -------------------------------------------------------------------
+# cassettes **要提交** —— 没有它们评测就必须联网花钱才能重跑，
+# 然后你就会停止迭代 prompt。这是刻意的例外，见下方 ! 规则。
+tests/eval/cassettes/*.tmp
+tests/eval/results/*.json
+
+# reports/ 要提交：reports/eval-<sha>.md 是「质量可被度量」的证据，
+# 这个项目的价值有一半在这里
+!reports/
+
+# --- 编辑器与系统 -----------------------------------------------------------
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+.DS_Store
+Thumbs.db
+*.swp
+
+# --- 本地草稿 ---------------------------------------------------------------
+scratch/
+notes.local.md

@@ -1,0 +1,26 @@
+[project]
+name = "sfly-api"
+version = "0.1.0"
+description = "FastAPI 网关：HMAC 校验、投递去重、runs 接口、SSE"
+requires-python = ">=3.12"
+dependencies = [
+    "sfly-shared",
+    "sfly-bus",
+    "fastapi>=0.141",
+    "uvicorn[standard]>=0.53",
+    # SSE 用 sse-starlette 而不是自己拼 text/event-stream：
+    # 它处理了断连检测、心跳、以及代理缓冲导致的「事件不刷新」问题
+    "sse-starlette>=3.4",
+    "httpx>=0.28",
+]
+
+[tool.uv.sources]
+sfly-shared = { workspace = true }
+sfly-bus = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sfly_api"]

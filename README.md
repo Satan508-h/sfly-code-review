@@ -1,0 +1,292 @@
+# sfly — 基于多 Agent 的分布式代码审查系统
+
+> 分布式执行，集中式决策。GitHub PR 一提交，安全 / 性能 / 风格三个专业 Agent 并行开审，
+> 主 Agent 汇总去重、消解冲突、重算置信度，把结论写回 PR 评论。
+
+不依赖 Kubernetes，不依赖 Kafka。`docker compose up` 一键起。
+
+---
+
+## 当前状态
+
+**Step 0 已完成并验证**：架构、领域契约、传输层协议、目录骨架、Docker 编排。
+
+已验证：`docker compose up` 起 8 个容器全部 healthy；`--scale worker-security=3`
+起 3 个副本；`kill-worker` 后自动重启；nginx 同源代理 `/api` 直通；74 个单测
+0.3 秒跑完；ruff 检查全绿。
+
+**业务逻辑尚未实现** —— 各服务目前只输出一条说明自己身份的启动日志，然后等停机信号。
+`review_bootstrap → review_tasks → review_results → dead_letter` 四条流和
+LangGraph 图都是 M0 之后的交付物。
+
+进度见 [CLAUDE.md](CLAUDE.md) 末尾的清单，或前端首页。
+
+---
+
+## 架构
+
+### 完整模式（本地 / `docker compose up`）
+
+```mermaid
+flowchart TB
+    GH[GitHub Webhook] -->|HMAC 校验| API[api 容器<br/>FastAPI 网关]
+    API -->|XADD BootstrapMessage| BS[[review_bootstrap]]
+    BS -->|orchestrator-group| ORC
+
+    subgraph ORC[orchestrator 容器 · LangGraph 状态机]
+        direction TB
+        IN[ingest] --> PL[plan] --> DI[dispatch] --> WA[wait<br/>interrupt]
+        WA --> AG[aggregate 主 Agent] --> FI[finalize] --> PU[publish]
+    end
+
+    DI -->|XADD TaskMessage| TASKS[[review_tasks]]
+    TASKS -->|security-group| WS[worker-security ×N]
+    TASKS -->|performance-group| WP[worker-performance ×N]
+    TASKS -->|style-group| WS2[worker-style ×N]
+
+    WS & WP & WS2 -->|1 写 Postgres<br/>2 XADD 结果<br/>3 XACK| RES[[review_results]]
+    WS & WP & WS2 -.失败/超限.-> DLQ[[dead_letter]]
+
+    RES -->|aggregator-group| CO[coordinator 协程<br/>屏障检查 + 唤醒]
+    CO -->|Command resume| WA
+    PU -->|POST 评论| GHAPI[GitHub API]
+    API -->|SSE| WEB[Vue 3 SPA]
+    ORC & WS & WP & WS2 <--> PG[(PostgreSQL<br/>结果 + checkpoint)]
+    API & ORC & WS & WP & WS2 <--> RD[(Redis<br/>Streams + 锁)]
+```
+
+### 精简模式（Render 单容器）
+
+```mermaid
+flowchart LR
+    V[Vercel<br/>Vue 3 SPA] -->|HTTPS + CORS<br/>JSON 唤醒 → SSE| LT
+    subgraph LT[lite 容器 · 单事件循环 · uvicorn workers=1]
+        direction TB
+        A[FastAPI 网关] --> B[InMemoryQueue]
+        B --> C[GraphRunner<br/>同一个类]
+        B --> D[WorkerPool<br/>同一个类]
+        C & D --> E[RunStore → Postgres]
+    end
+    LT --> N[(Neon Postgres)]
+```
+
+**两种模式跑的是同一套代码。** `GraphRunner`、`WorkerPool`、全部 LangGraph 节点
+是同一批对象，只有 `TaskQueue` 和 `Lock` 两个接口有两套实现。全代码库只有
+`packages/bus/sfly_bus/factory.py` 一个文件读 `QUEUE_BACKEND`：
+
+```bash
+grep -rn "QUEUE_BACKEND" --include=*.py .   # 应该只返回一个文件
+```
+
+---
+
+## 快速开始
+
+**零密钥即可跑通全链路**（默认 Mock LLM + 本地 Docker 的 Postgres/Redis）。
+
+```bash
+git clone <this-repo> && cd sfly-code-review-system
+cp .env.example .env          # 默认值就能跑
+python tasks.py up            # 构建 + 启动 + 等健康检查通过
+```
+
+> Windows 上用 `python tasks.py <命令>`；Linux/macOS 上 `make <命令>` 等价。
+
+打开 <http://localhost:5173> 应该看到状态页，四个指标全部连通。
+
+### 端口被占用怎么办
+
+本机已经有 Postgres / Redis 时（比如另一个项目在跑），默认端口会冲突，报错是：
+
+```
+Bind for 127.0.0.1:6379 failed: port is already allocated
+```
+
+这个报错**不会告诉你是谁占用的**。在 `.env` 里改掉即可：
+
+```ini
+POSTGRES_HOST_PORT=55432
+REDIS_HOST_PORT=56379
+# 改完记得同步这两行，否则宿主机上跑脚本连的是旧端口
+DATABASE_URL=postgresql://sfly:sfly@localhost:55432/sfly
+REDIS_URL=redis://localhost:56379/0
+```
+
+容器之间是用服务名互访的（`postgres:5432`、`redis:6379`），走 Docker 内网，
+所以这两个映射**只影响你从宿主机连进去调试**，对应用本身零影响。
+
+```bash
+python tasks.py logs          # 跟踪日志
+python tasks.py down          # 停止（保留数据）
+python tasks.py clean         # 停止并清空数据卷
+```
+
+### 接入真实 LLM
+
+`.env` 里改两行：
+
+```ini
+LLM_PROVIDER=deepseek
+LLM_API_KEY=sk-xxxxxxxx
+```
+
+DeepSeek 走 OpenAI 兼容接口，所以换成 OpenAI、vLLM 或本地模型只要改 `LLM_BASE_URL`，
+代码不用动。
+
+---
+
+## 想验证什么，用哪条命令
+
+这个项目的核心主张都需要能被验证，而不是靠嘴说。每条主张对应一个可复现的操作：
+
+| 主张 | 命令 | 应该看到 |
+|---|---|---|
+| 一键启动 | `python tasks.py up` | 全部容器 `healthy`，命令返回即代表可用 |
+| Worker 水平扩展 | `python tasks.py scale 3` | `worker-security` 变成 3 个副本，日志里出现 3 个消费者实例 |
+| Worker 猝死不影响结果 | `python tasks.py kill-worker` | run 照样跑完，UI 显示「1 个 Worker 降级」徽章 |
+| Webhook 幂等 | 同一 payload 连投 3 次 | 1 个 run + 2 个 `duplicate` 响应 |
+| 断点恢复 | `docker restart sfly-orchestrator-1` | 从 Postgres 的 checkpoint 续跑，不重复发评论 |
+| Redis 重启不丢任务 | `docker restart sfly-redis` | 扫描器按 `attempt+1` 重派，消息排空 |
+| Postgres 不可达不丢结果 | `docker pause sfly-postgres` | 消息堆在 PEL 里；`unpause` 后排空（证明「先落库再 ack」的顺序） |
+| 质量可被度量 | `python tasks.py eval` | `reports/eval-<sha>.md`：精确率 / 召回率 / 误报率 / 单次成本 |
+
+---
+
+## 几个刻意的技术选择
+
+这些不是随手选的，每一条都对应一个具体的失败模式。面试时被追问的就是这些。
+
+**幂等靠数据库唯一约束，不靠 Redis SETNX。**
+`worker_results` 的 `PRIMARY KEY (task_id, worker_type)` 才是保证。Redis 的
+`SETNX` 只是省 token 的快路径 —— 它会过期、会随 Redis 重启丢失、也可能在后续
+写库失败时已经被设上。约束不会。
+
+**失败也是结果。**
+Worker 放弃之前必须先发一条 `status=failed` 的结果再 ack。否则 `wait` 节点的
+屏障永远闭合不了，整个 run 挂到超时。这条让 `docker kill` 那个演示变成真的，
+而不只是理论上可恢复。
+
+**图暂停期间 orchestrator 崩了，恢复靠一条 SQL 查询。**
+`wait` 节点用 LangGraph 的 `interrupt()` 暂停并退出执行，进程不再持有该 run 的
+任何内存状态。超时扫描器每 15 秒查一次 `due_runs()`，把过了 `deadline_at` 还停在
+`dispatched`/`waiting` 的 run 捞出来唤醒。**任何可能卡住的状态都必须是一行带
+`deadline_at` 的记录** —— 写不成一条 `SELECT` 的恢复查询，说明状态藏在了会丢的地方。
+
+**去重不用向量库，用 `rapidfuzz` + 并查集。**
+确定性、可复现（评测需要）、无模型下载、微秒级。同 Worker 阈值 0.75，
+跨 Worker 0.55。
+
+**冲突消解不用 LLM，用确定性规则引擎。**
+LLM 裁判会引入非确定性，直接毁掉评测的可复现性。四条规则顺序匹配：
+职责域优先 → 越界降级 → 证据裁决 → 标记待人工。`CONFLICT_RESOLVER=llm`
+保留为可测量的 A/B 对照，不做默认。
+
+**RAG 用手写规则库 + BM25，不用向量库。**
+60–120 条手写规则（引 OWASP Top 10 / CWE Top 25 / Google 风格指南）。
+规则库本身是可被审阅的作品。向量检索列为可选升级。
+
+**永不发 `APPROVE`。**
+机器人审批人类 PR 是策略漏洞。只发 `REQUEST_CHANGES` 或 `COMMENT`。
+
+---
+
+## 技术栈
+
+| 层 | 选择 | 为什么 |
+|---|---|---|
+| Agent 编排 | LangGraph 1.2 + `AsyncPostgresSaver` | 自带 checkpointer，`interrupt()` 的断点恢复是内建能力 |
+| API | FastAPI + `sse-starlette` | SSE 是项目要求；`sse-starlette` 处理了断连检测和代理缓冲 |
+| 队列 | Redis Streams 消费者组 | 比 Kafka 轻得多，且天然支持「同组竞争消费」的水平扩展语义 |
+| 状态 | PostgreSQL（本地 Docker / Neon 云） | 同时是 LangGraph 的 checkpointer |
+| 驱动 | `psycopg` v3（**不是 asyncpg**） | LangGraph 的 Postgres checkpointer 用 psycopg，混用会带来两份连接池 |
+| 前端 | Vue 3 + Element Plus + Vite + TS | 中文资料最多，Element Plus 的表格/时间线组件省事 |
+| LLM | DeepSeek（OpenAI 兼容接口） | 成本极低；接口兼容意味着 provider 可换 |
+| 去重 | `rapidfuzz` | 见上 |
+| 检索 | `rank_bm25` | 见上 |
+| 打包 | `uv` workspace（单仓多包） | 一份 lock，每个服务只装自己的依赖闭包 |
+
+---
+
+## 目录结构
+
+```
+apps/
+  api/           FastAPI 网关：HMAC 校验、投递去重、runs 接口、SSE
+  orchestrator/  LangGraph 图 + coordinator 协程 + 超时扫描器
+  workers/       一套代码三种部署：--spec {security|performance|style}
+  lite/          单事件循环，一个进程跑完整个系统（Render 用）
+packages/
+  shared/        领域契约、配置、ID、日志、异常
+  bus/           TaskQueue / RunStore / Lock 协议 + 两种实现
+  agent-core/    LLM 抽象与结构化输出、RAG、聚合算法、GitHub 客户端
+web/             Vue 3 SPA
+infra/           postgres init、redis conf、nginx conf、GitHub 限流桩
+fixtures/        diff 样例、webhook payload、大 PR
+scripts/         运维与演示脚本
+tests/           unit / integration / e2e / eval
+reports/         评测报告（提交进仓库）
+```
+
+数据流：`review_bootstrap → review_tasks → review_results → dead_letter`
+
+API 不直接写 `review_tasks` —— 文件风险排序和规则检索由编排层的 `plan` 节点负责，
+所以 Worker 收到的任务已经带着检索好的规则，Worker 因而保持无状态且不依赖 RAG。
+
+---
+
+## 已知限制
+
+写在前面而不是藏在最后：一个未被说明的限制会被当成经验不足，一个被说明的限制
+则是严谨。
+
+- **GitHub 真实二级限流只能用桩模拟。** `infra/github/stub_server.py` 模拟
+  429 → 退避 → 201 的序列。桩是模型，不是真相。
+- **Render 冷启动无法自动化测试。** 免费版休眠后首次请求约需 60 秒（Render 唤醒
+  约 60s + Neon 唤醒约 1s）。需要人工冒烟测试并记录实测耗时。
+- **Neon 免费版空闲 5 分钟挂起且无法关闭。** 连接池必须传
+  `check=AsyncConnectionPool.check_connection`，否则挂起后的第一次查询会拿到死连接
+  直接抛错。代码里已处理，但这个约 0.5–1.5 秒的首次查询惩罚无法消除。
+- **Neon 免费版 0.5 GB 上限**，而 LangGraph 的 checkpoint 按 thread 无界增长。
+  需要保留策略任务定期清理 14 天前的 checkpoint 与 `run_events`。
+- **DeepSeek 在真实负载下的行为未验证。** 评测集只有 30 个 PR 的规模。
+- **`review_results` 流的裁剪（MAXLEN）** 在 M5 验证通过前不会开启。近似裁剪可能
+  删掉「已投递未 ACK」的消息，导致 `XAUTOCLAIM` 取回空 payload。
+
+### 明确不做
+
+Kubernetes、Kafka、为去重引入 embedding、索引 PR 自己的代码仓库、多查询检索、
+cross-encoder 重排、独立的向量数据库容器、按 token 流式输出（批处理审查没有收益）。
+
+---
+
+## 评测
+
+`python tasks.py eval` 会在 `reports/` 下生成带 git sha 的报告，**并提交进仓库**。
+改了 prompt 或规则之后，PR 里就能看到精确率和召回率的 diff。
+
+评测集 30 个 PR，三组人群刻意不同：
+
+- **~10 个真实漏洞**：取有 CVE 修复 commit 的公开仓库代码，**回退修复来重建漏洞**。
+  这样得到的是无人能质疑的 ground truth。
+- **~15 个手写 diff**：注入覆盖三个 Worker 的 bug。
+- **~5 个干净 diff**：**没有预期发现**，用来测误报率。多数人完全跳过这一组，
+  这正是他们的精确率数字毫无意义的原因。
+
+指标：严格/宽松两档精确率、召回率、F1、误报率、单 PR 成本、p50/p95 延迟、
+缓存命中率、对照单 Agent 基线的有效开销比、1 Worker vs 3 Worker 消融。
+
+> **关于「Agent 间通信 token 冗余 < 15%」**
+>
+> 这个指标作为常见宣传口径，实测会失败 —— 三个 Worker 会把 diff 各发一遍，
+> 输入 token 显著高于单 Agent 基线。本项目改为报告可测量的两个口径：
+> **缓存命中后的有效开销比**，以及**每多发现一个真实问题的边际成本**。
+> 数字不好看，但站得住。
+
+评测用 `temperature=0` 并把原始请求响应用 `vcrpy` 录到 `tests/eval/cassettes/`，
+因此可以离线、无密钥、零成本重跑 —— 否则每次调 prompt 都要花钱，然后你就会停止迭代。
+
+---
+
+## 许可
+
+MIT

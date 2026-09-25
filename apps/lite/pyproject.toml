@@ -1,0 +1,32 @@
+[project]
+name = "sfly-lite"
+version = "0.1.0"
+description = "单事件循环精简模式：一个进程同时跑 API + GraphRunner + WorkerPool（Render 用）"
+requires-python = ">=3.12"
+dependencies = [
+    "sfly-shared",
+    "sfly-bus",
+    "sfly-agent",
+    # lite 就是「把所有服务塞进一个进程」，所以它依赖全部 app 包。
+    # 这不是架构缺陷 —— 这恰好证明了 GraphRunner / WorkerPool / 各节点
+    # 是同一批对象，只是换了个宿主。
+    "sfly-api",
+    "sfly-orchestrator",
+    "sfly-workers",
+    "uvicorn[standard]>=0.53",
+]
+
+[tool.uv.sources]
+sfly-shared = { workspace = true }
+sfly-bus = { workspace = true }
+sfly-agent = { workspace = true }
+sfly-api = { workspace = true }
+sfly-orchestrator = { workspace = true }
+sfly-workers = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sfly_lite"]

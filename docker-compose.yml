@@ -1,0 +1,207 @@
+# 完整模式：7 个容器，真正的分布式拓扑。
+#
+# 精简模式（Render 单容器）不用这个文件，见 apps/lite/。
+#
+# 三条让 `--scale` 能工作的硬性要求，改这个文件时不要破坏：
+#   1. Worker 服务不能有 container_name —— 有名字就没法起多个副本
+#   2. Worker 服务不能发布 host ports —— 三个副本抢同一个端口必然失败
+#   3. Worker 服务不能有独占的命名卷
+#
+# 验证：docker compose up -d --scale worker-security=3
+
+name: sfly
+
+# --------------------------------------------------------------------------- #
+# 公共片段
+# --------------------------------------------------------------------------- #
+
+x-common: &common
+  env_file:
+    # required: false 让 compose 在没有 .env 时也能起来（走 config.py 的默认值：
+    # Mock LLM + 本地 Postgres/Redis，零密钥可跑通全链路）
+    - path: .env
+      required: false
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+# 容器内用服务名互相寻址，和宿主机跑脚本时用的 localhost 不一样。
+# 所以这两个地址写死在 compose 里，不进 .env —— 这样同一份 .env
+# 既能给容器用，也能给 `uv run python -m sfly_workers --diff ...` 用。
+x-datastores: &datastores
+  DATABASE_URL: postgresql://sfly:sfly@postgres:5432/sfly
+  REDIS_URL: redis://redis:6379/0
+  MODE: full
+
+services:
+
+  # ------------------------------------------------------------------------- #
+  # 基础设施
+  # ------------------------------------------------------------------------- #
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sfly
+      POSTGRES_PASSWORD: sfly
+      POSTGRES_DB: sfly
+      # 表结构由应用启动时的幂等 migrate() 建，和 Neon 走同一条路径。
+      # init.sql 只负责建库和（M11 的）扩展。
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    ports:
+      # 暴露给宿主机，方便 psql 排查和跑评测脚本。
+      #
+      # 宿主端口做成可配置的（POSTGRES_HOST_PORT）而不是写死 5432：
+      # 任何本机已经有 Postgres 的开发者都会撞上 "port is already allocated"，
+      # 而那个报错完全不提是哪个容器占的，排查体验很差。
+      #
+      # 注意**容器内的 5432 永远不变** —— 服务之间是通过 Docker 网络用
+      # 服务名互访的（postgres:5432），所以改这个映射对应用零影响，
+      # 只影响你从宿主机连进去。改了记得同步 .env 里的 DATABASE_URL。
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sfly -d sfly"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    # 配置全在 infra/redis/redis.conf 里，带注释说明为什么这么调。
+    # 关键是 appendonly yes（默认的 RDB 快照会丢掉最近的 stream 条目）
+    # 和 maxmemory-policy noeviction（LRU 会静默丢弃待处理任务）。
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    volumes:
+      - redisdata:/data
+      - ./infra/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    ports:
+      # 同上，宿主端口可配置。容器内仍是 6379。
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # ------------------------------------------------------------------------- #
+  # 应用
+  # ------------------------------------------------------------------------- #
+
+  api:
+    <<: *common
+    build:
+      context: .
+      args:
+        APP: sfly-api
+        APP_MODULE: sfly_api
+    environment:
+      <<: *datastores
+      PORT: "8000"
+    ports:
+      - "${API_HOST_PORT:-8000}:8000"
+    healthcheck:
+      # api 有 HTTP，直接探接口比心跳文件更准确
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4).status==200 else 1)"]
+      interval: 15s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
+
+  orchestrator:
+    <<: *common
+    build:
+      context: .
+      args:
+        APP: sfly-orchestrator
+        APP_MODULE: sfly_orchestrator
+    environment:
+      <<: *datastores
+
+  # ------------------------------------------------------------------------- #
+  # Worker —— 一套代码，三种部署
+  #
+  # 三个服务用同一个 image 标签 + 同一组 build args，compose 只会构建一次
+  # 并复用镜像；否则同样的镜像会被构建三遍，白等几分钟。
+  # ------------------------------------------------------------------------- #
+
+  worker-security:
+    <<: *common
+    image: sfly/workers:dev
+    build:
+      context: .
+      args:
+        APP: sfly-workers
+        APP_MODULE: sfly_workers
+    command: ["python", "-m", "sfly_workers", "--spec", "security"]
+    environment:
+      <<: *datastores
+      WORKER_TYPE: security
+
+  worker-performance:
+    <<: *common
+    image: sfly/workers:dev
+    build:
+      context: .
+      args:
+        APP: sfly-workers
+        APP_MODULE: sfly_workers
+    command: ["python", "-m", "sfly_workers", "--spec", "performance"]
+    environment:
+      <<: *datastores
+      WORKER_TYPE: performance
+
+  worker-style:
+    <<: *common
+    image: sfly/workers:dev
+    build:
+      context: .
+      args:
+        APP: sfly-workers
+        APP_MODULE: sfly_workers
+    command: ["python", "-m", "sfly_workers", "--spec", "style"]
+    environment:
+      <<: *datastores
+      WORKER_TYPE: style
+
+  # ------------------------------------------------------------------------- #
+  # 前端
+  #
+  # 完整模式下由 nginx 托管静态文件并把 /api 反代到 api:8000，
+  # 前后端同源 —— SSE 和 CORS 都省事。
+  # 精简模式下前端在 Vercel，那时才需要 CORS。
+  # ------------------------------------------------------------------------- #
+
+  web:
+    build:
+      # 上下文是仓库根：前端 Dockerfile 同时要 web/ 源码和
+      # infra/nginx/default.conf，两处共用一份 nginx 配置避免漂移。
+      context: .
+      dockerfile: web/Dockerfile
+      args:
+        # 完整模式下走相对路径，由 nginx 直通代理到 api:8000。
+        # 部署到 Render + Vercel 时改成后端的绝对地址。
+        VITE_API_BASE: /api
+    ports:
+      - "${WEB_HOST_PORT:-5173}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  pgdata:
+  redisdata:

@@ -1,0 +1,33 @@
+# 统一换行为 LF。
+#
+# 这不只是风格问题：infra/redis/redis.conf 和 infra/nginx/default.conf 是
+# 从宿主机 **bind-mount 进 Linux 容器**的。在 Windows 上 clone 仓库时如果
+# git 自动转成 CRLF，Redis 的配置解析器会把行尾的 \r 当成值的一部分，
+# 报出看不出原因的错误（比如 maxmemory-policy 的值变成 "noeviction\r"）。
+# 强制 eol=lf 让工作区文件始终保持容器能正确读取的形态。
+#
+# 另一层保障：.editorconfig 之外，Windows 上开发时编辑器写入的 CRLF
+# 也会在提交时被规范化为 LF，不会污染仓库。
+
+* text=auto eol=lf
+
+# 二进制文件不要做任何转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+*.woff  binary
+*.woff2 binary
+*.ttf  binary
+
+# uv.lock 由工具生成，不要手动合并（冲突时重新 `uv lock`）
+uv.lock linguist-generated=true merge=union
+# package-lock.json 同理
+web/package-lock.json linguist-generated=true
+
+# GitHub 的语言统计：把前端和 Python 都算进来，别让 CSS 之类的占榜首
+*.py      linguist-language=Python
+*.vue     linguist-language=Vue
+*.ts      linguist-language=TypeScript
