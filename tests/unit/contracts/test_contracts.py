@@ -262,7 +262,7 @@ def test_failed_factory_closes_the_barrier() -> None:
 def test_failed_error_is_truncated() -> None:
     # 一个巨大的 traceback 塞进 Postgres 的 TEXT 会拖慢查询，
     # 而诊断只需要开头那一段
-    r = WorkerResult.failed("t1", "security", "x" * 10_000)
+    r = WorkerResult.failed("t1", WorkerType.SECURITY, "x" * 10_000)
     assert r.error is not None
     assert len(r.error) == 2000
 

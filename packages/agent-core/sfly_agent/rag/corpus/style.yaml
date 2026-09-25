@@ -1,0 +1,116 @@
+# 风格规则库。
+#
+# 风格 Worker 是最容易写出「噪音机器」的一个，所以这里的每一条都遵守
+# 同一个标准：**能说出具体代价**。说不出代价的偏好（缩进几个空格、
+# 单引号还是双引号）一律不收录 —— 那些交给 formatter，
+# 让 robot 去和 robot 争论。
+#
+# 因此本文件里的规则普遍是 low/info 级：它们不该让任何人停下来，
+# 但它们累积起来决定一个代码库三个月后还能不能被愉快地读。
+
+- id: style-naming-001
+  title: 命名无法传达意图
+  worker_type: style
+  category: naming
+  severity_hint: low
+  body: |
+    名字是唯一不需要跳转就能读到的文档。data、tmp、x、flag 这些名字
+    在三个月后会变成阅读障碍。
+    长度与作用域成正比：活三行的循环变量可以叫 i，
+    活三十行的业务变量必须叫得出口。
+    例外是数学约定（矩阵用 M、坐标用 x/y）和惯用短名（i/j/k、self、cls），
+    改它们反而增加阅读成本。
+  references:
+    - https://peps.python.org/pep-0008/#naming-conventions
+
+- id: style-deadcode-001
+  title: 死代码与调试残留
+  worker_type: style
+  category: dead_code
+  severity_hint: low
+  body: |
+    注释掉的代码块、不再被调用的函数、print 调试语句。
+    它们不会被执行，所以没有测试能发现它们；
+    而读者必须逐个判断「这是不是还有用」，这个成本由每个后来者承担一次。
+    版本控制已经保存了历史，删掉它不会丢任何信息。
+  references:
+    - https://martinfowler.com/bliki/DeadCode.html
+
+- id: style-errhandling-001
+  title: 异常处理过宽或过窄
+  worker_type: style
+  category: error_handling
+  severity_hint: medium
+  body: |
+    裸 except 会连 KeyboardInterrupt 和 SystemExit 一起吞掉，
+    于是 Ctrl-C 也杀不掉进程。except Exception: pass 更糟 ——
+    它把失败伪装成成功，是排查成本最高的一种写法。
+    拿不准时至少要 log.exception 再抛，让错误往上走。
+  references:
+    - https://peps.python.org/pep-0008/#programming-recommendations
+
+- id: style-docs-001
+  title: 缺少注释解释「为什么」
+  worker_type: style
+  category: docs
+  severity_hint: info
+  body: |
+    「做了什么」代码自己会说，「为什么这么做」只能由人写下来。
+    最需要注释的是三类地方：绕开某个 bug 的权宜之计、
+    看起来多余但其实有必要的判断、以及被拒绝过的方案。
+    反过来，注释复述代码（i += 1  # i 加一）是有害的，
+    因为它会在代码修改后变成一句谎话。
+  references:
+    - https://martinfowler.com/bliki/CodeAsDocumentation.html
+
+- id: style-readability-001
+  title: 可读性的具体形态
+  worker_type: style
+  category: complexity_readability
+  severity_hint: low
+  body: |
+    嵌套超过三层、单个函数超过一屏、一行里塞多个副作用、
+    用 == None 而不是 is None（前者在有自定义 __eq__ 时语义不同）。
+    这些单独看都不是错误，合在一起会让代码变成只能改、
+    不能读的状态 —— 而维护成本主要由「读」构成。
+  references:
+    - https://peps.python.org/pep-0008/
+
+- id: style-duplication-001
+  title: 重复代码
+  worker_type: style
+  category: duplication
+  severity_hint: low
+  body: |
+    同一段逻辑出现两次，就必须在改的时候改两处 —— 而人会漏。
+    注意：重复**三次以上**才值得抽象，两处相似但会各自演化的代码
+    强行合并，往往得到的是一个带一堆参数的怪物。
+    判断标准是「它们会一起变吗」，不是「它们看起来像吗」。
+  references:
+    - https://martinfowler.com/bliki/RuleOfThree.html
+
+- id: style-magicnumber-001
+  title: 魔法数字
+  worker_type: style
+  category: magic_number
+  severity_hint: low
+  body: |
+    代码里的 3600、86400、1024 这些数字不携带意图，
+    读者只能靠上下文猜单位是秒还是毫秒。
+    具名常量把意图写进代码本身，而常量名只写一遍，
+    被读到的次数却是每一次。
+  references:
+    - https://refactoring.guru/replace-magic-number-with-symbolic-constant
+
+- id: style-formatting-001
+  title: 格式不一致
+  worker_type: style
+  category: formatting
+  severity_hint: info
+  body: |
+    这一条**通常不该由人来报** —— 交给 ruff format / prettier 就结束了。
+    只有在项目没配 formatter，或者某段代码明显绕过了它时才值得提。
+    把格式讨论留在 review 里是团队效率最常见的漏损点：
+    它消耗注意力，却不改变任何行为。
+  references:
+    - https://black.readthedocs.io/en/stable/the_black_code_style/current_style.html

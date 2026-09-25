@@ -14,14 +14,79 @@
 
 ## 当前状态
 
-**M0 已完成并验证**：workspace、数据存储连接层、依赖真实探测。
+**M1 已完成并验证**：diff 解析、Mock LLM、JSON 修复阶梯、手写规则库、
+单个 Worker 的独立命令行。**不接队列、不连数据库、不需要任何密钥**就能跑：
 
-已验证：`docker compose up` 起 8 个容器全部 healthy；`--scale worker-security=3`
-起 3 个副本；`kill-worker` 后自动重启；nginx 同源代理 `/api` 直通；
-**`/api/health` 报告 Postgres 16.15 / Redis 7.4.11 的真实版本与毫秒级延迟**；
-101 个单测通过；ruff + mypy strict 全绿。
+```bash
+python -m sfly_workers --spec security --diff fixtures/security_demo.diff
+```
 
-依赖故障时的行为也逐条验过（这是 M0 真正交付的东西）：
+```
+── 安全审查结果 ─────────────────────────────
+  文件       4 个（71 个变更行）
+  规则       8 条
+  状态       正常
+  成本       输入 1609 tokens / 输出 893 tokens，耗时 2 毫秒，模型 mock-1
+  发现       10 条：严重 4 · 高危 5 · 中危 1
+
+  [严重]    app/db.py:8  secrets（规则 sec-secrets-001）
+          疑似把凭据硬编码在源码里，会随仓库永久留存
+  [严重]    app/db.py:17  sqli（规则 sec-sqli-001）
+          SQL 语句用字符串拼接/格式化构造，用户输入可直接改写查询语义
+  ...
+```
+
+JSON 走 stdout（可直接 `| jq`），人读的摘要走 stderr。
+退出码刻意分成三个：`0` 有结果 / `2` 审查失败（模型返回的东西解析不出来）/
+`3` 输入不是 diff —— 把「输入给错了」和「模型抽风了」混成一个码，
+CI 就只能一律当成失败。
+
+### 这一层解决的问题
+
+**模型返回坏 JSON 是必然事件，不是事故。** 每一次解析失败都等于整个 Worker
+的结果归零，所以 M1 的重心在这里，而不在提示词的花哨程度上。修复阶梯分五级：
+
+| 级别 | 处理 | 真实形态 |
+|---|---|---|
+| L0 | 直接解析 | 干净输出（常态） |
+| L1 | 花括号配平扫描 | ` ```json ` 围栏、前后有解释文字、**响应被 max_tokens 截断** |
+| L2 | 清理后重试 | 尾逗号、全角引号 |
+| L3 | 一次修复调用 | 单引号、Python 风格的无引号键 |
+| L4 | 放弃，保留原文（8KB） | —— |
+
+两个细节值得单独说：
+
+* **L1 是手写字符状态机，不是正则。** `re.search(r"\{.*\}", text)` 用贪婪匹配
+  在响应被截断时会跨过对象边界，把好几个 finding 连成一坨 —— 而且**不报错**。
+  表现是「模型这次只报了 1 个问题」，于是你会去调提示词，而 bug 在解析器里。
+* **逐元素校验，不是整包校验。** 12 条里有 1 条格式错，代价必须是 1 条而不是
+  整个 Worker，产出 `status="partial"`。这也让「模型报对了 11 个」和
+  「模型啥也没报」在系统里长得完全不同。
+
+### Mock 的定位
+
+**它不是「随机吐几条假 finding」。** 下游所有东西都建在它上面 —— 队列往返
+测试、图端到端、评测基线。所以它是一个**确定性的、真的读 diff 的规则扫描器**：
+逐行扫新增行、从 `@@` 头部跟踪新文件行号、命中规则时回填 `rule_id`。
+同一个输入永远产出同一个输出，连故障注入也是（种子由提示词内容决定）。
+
+故障注入（`MOCK_LLM_FAILURE_RATE`）是**验证修复阶梯真的在工作**的唯一手段 ——
+七种坏法各自只能被某一级救回来，跑一遍就等于把整条阶梯走了一遍。
+
+### 已验证
+
+`fixtures/security_demo.diff`（真实 `git diff` 输出）在三个 Worker 上分别得到
+**10 / 2 / 4 条**发现，全部落在变更行上；`fixtures/clean.diff`（参数化查询、
+批量取数、有界分页的正确写法）三个 Worker **都保持沉默**。
+
+容器内跑同一份 fixture 得到**逐字节相同**的输出（证明规则库随镜像正确分发）。
+
+280 个单测通过；ruff + mypy strict（含 tests）全绿。
+
+### 在此之前（M0）
+
+`docker compose up` 起 8 个容器全部 healthy；`/api/health` 报告 Postgres 16.15 /
+Redis 7.4.11 的真实版本与毫秒级延迟。依赖故障行为逐条验过：
 
 | 操作 | `/healthz`（存活） | 容器状态 | `/api/health`（就绪） |
 |---|---|---|---|
@@ -33,9 +98,9 @@
 那只会把一次数据库抖动放大成一次全站重启，且 `restart: unless-stopped` 会让
 日志被退避重启信息冲掉。详见 [CLAUDE.md](CLAUDE.md) 约定 #6。
 
-**业务逻辑尚未实现** —— 各服务目前只输出一条说明自己身份的启动日志，然后等停机信号。
-`review_bootstrap → review_tasks → review_results → dead_letter` 四条流和
-LangGraph 图都是 M1 之后的交付物。
+**分布式部分尚未接入** —— Worker 的常驻消费循环、`review_bootstrap →
+review_tasks → review_results → dead_letter` 四条流、LangGraph 图都是 M2 之后的交付物。
+现在每个 Worker 只能对着一份 diff 跑一次。
 
 进度见 [CLAUDE.md](CLAUDE.md) 末尾的清单，或前端首页。
 
@@ -169,6 +234,9 @@ DeepSeek 走 OpenAI 兼容接口，所以换成 OpenAI、vLLM 或本地模型只
 | 主张 | 命令 | 应该看到 |
 |---|---|---|
 | 一键启动 | `python tasks.py up` | 全部容器 `healthy`，命令返回即代表可用 |
+| **零密钥就能审代码** | `python -m sfly_workers --spec security --diff fixtures/security_demo.diff` | 10 条 finding，行号全部落在变更行上；`\| jq` 直接可用 |
+| **干净代码上不乱报** | 同上，换成 `fixtures/clean.diff` | 三个 Worker 都返回 `{"findings": []}` |
+| **坏 JSON 不会毁掉结果** | `MOCK_LLM_FAILURE_RATE=1.0` 再跑上一条 | 每一次调用都返回坏 JSON，仍然出结果（修复阶梯接住了） |
 | 依赖真实可达 | `python tasks.py health` | Postgres / Redis 的**版本号**与毫秒延迟，不是照抄配置 |
 | 依赖挂了不误伤 | `docker pause sfly-postgres-1` | `/healthz` 仍 200、容器仍 healthy、`/api/health` 503；`docker unpause` 后自动恢复 |
 | Worker 水平扩展 | `python tasks.py scale 3` | `worker-security` 变成 3 个副本，日志里出现 3 个消费者实例 |
@@ -292,6 +360,17 @@ API 不直接写 `review_tasks` —— 文件风险排序和规则检索由编�
 - **Neon 免费版 0.5 GB 上限**，而 LangGraph 的 checkpoint 按 thread 无界增长。
   需要保留策略任务定期清理 14 天前的 checkpoint 与 `run_events`。
 - **DeepSeek 在真实负载下的行为未验证。** 评测集只有 30 个 PR 的规模。
+  OpenAI 兼容 provider 的**请求契约和错误翻译有单测覆盖**（发什么、怎么解析响应、
+  超时/401/429 分别怎么报），但「真实模型返回的东西修复阶梯能不能救回来」
+  只有 M9 的评测集能回答。Mock 的故障注入是对这一点的**模拟，不是证据**。
+- **Mock LLM 是一个启发式扫描器，它的误报和漏报不代表模型的表现。**
+  它的规则表是正则 + 一处循环上下文分析。下游的队列往返测试、图端到端、
+  评测基线都建在它上面，但它的准确率**不能**用来推断真实模型的准确率 ——
+  这是两件事，混淆它们会让评测数字失去意义。
+- **`--max-files` 目前是「按 diff 里的顺序取前 N」，不是按风险排序。**
+  文件风险排序属于编排层 `plan` 节点的职责（M5），因为它需要整个 PR 的上下文
+  （哪些是核心模块、哪些是测试）。在那之前，截断是**看得见**的
+  （摘要里会写「已按上限截取」），但不是**聪明**的。
 - **`review_results` 流的裁剪（MAXLEN）** 在 M5 验证通过前不会开启。近似裁剪可能
   删掉「已投递未 ACK」的消息，导致 `XAUTOCLAIM` 取回空 payload。
 - **Windows 上原生跑 Python 时必须换事件循环。** Windows 默认的

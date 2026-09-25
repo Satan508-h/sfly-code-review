@@ -65,7 +65,7 @@ const WORKERS = [
 const MILESTONES = [
   { id: 'Step 0', label: '文档 · 契约 · 骨架 · compose', done: true },
   { id: 'M0', label: 'workspace + 依赖连通 + /api/health', done: true },
-  { id: 'M1', label: '契约 + Mock LLM + security worker CLI', done: false },
+  { id: 'M1', label: 'diff 解析 + Mock LLM + 修复阶梯 + 独立 CLI', done: true },
   { id: 'M2', label: '队列协议 + 内存实现 + 指纹', done: false },
   { id: 'M3', label: 'Redis Streams（回收 / 死信 / 重试）', done: false },
   { id: 'M4', label: 'Postgres schema + 幂等 migrate', done: false },

@@ -181,6 +181,12 @@ python tasks.py typecheck  # mypy strict
 > Windows 的 `SelectorEventLoop` 要花约 2 秒才报 `ECONNREFUSED`。
 > CI 跑在 `ubuntu-latest`，所以那边的耗时才是这条命令的真实成本。
 
+```bash
+# 单次审查：不接队列、不连数据库、不起容器，调提示词时用它
+# （比走完整链路快一个数量级）。JSON 走 stdout，人读的摘要走 stderr，
+# 所以可以直接 `| jq`。退出码 0=有结果 / 2=审查失败 / 3=输入不是 diff。
+python -m sfly_workers --spec security --diff fixtures/security_demo.diff
+
 # 分布式能力验证（这几条就是项目要证明的东西）
 python tasks.py scale 3        # --scale worker-security=3，三个副本竞争消费
 python tasks.py kill-worker    # 杀掉一个 Worker：run 仍应跑完并显示降级徽章
@@ -201,14 +207,19 @@ python tasks.py demo           # 端到端：投递 3 次同一 webhook → 1 ru
 - Python 3.12（容器内），`uv` 管理 workspace，一份 `uv.lock`
 - 全异步：`async def` + `psycopg` v3（**不是 asyncpg**，LangGraph 的 Postgres checkpointer 用 psycopg）
 - 结构化日志用 `structlog`，每条日志带 `task_id` / `worker_type` 便于串联
-- 类型标注必须完整，`mypy` 在 CI 中跑
+- **日志一律写 stderr，stdout 只留给程序输出。** 只要有一行日志混进 stdout，
+  `python -m sfly_workers --diff x.diff | jq` 就会在第一个字符上解析失败，
+  而报错指向 jq 的语法错误 —— 完全看不出真正的原因。
+  注意日志级别不能用 `logging.getLogger().setLevel()` 调：structlog 的
+  `PrintLogger` 不经过标准库的 root logger，那一行看着像在静音，实际无效。
+- 类型标注必须完整，`mypy` 在 CI 中跑（覆盖 `packages` `apps` `tests` 三处）
 - 时间统一 UTC，`datetime.now(UTC)`
 
 ## 当前进度
 
 - [x] Step 0 — 文档、契约、目录骨架、compose
 - [x] M0 — workspace、`sfly_bus` 连接层、`/api/health` 真实依赖探测
-- [ ] M1 — 契约 + Mock LLM + security worker CLI
+- [x] M1 — diff 解析、Mock LLM、修复阶梯、规则库、`--diff` 独立 CLI
 - [ ] M2 — 队列协议 + InMemoryQueue + 指纹
 - [ ] M3 — RedisStreamsQueue（含 XAUTOCLAIM / 死信 / 重试计数）
 - [ ] M4 — Postgres schema + 幂等 migrate

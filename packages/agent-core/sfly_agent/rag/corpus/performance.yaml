@@ -1,0 +1,116 @@
+# 性能规则库。
+#
+# 一条准则贯穿全篇：**只报有量级差的**。常数因子优化（少建一个对象、
+# 换一种循环写法）在真实系统里几乎从不值得开一条 PR 评论，报出来只会
+# 稀释真正重要的那几条。所以这里的每一条都对应至少一个数量级。
+
+- id: perf-nplus1-001
+  title: N+1 查询
+  worker_type: performance
+  category: n_plus_one
+  severity_hint: high
+  body: |
+    循环体里每条记录各查一次数据库，往返次数随数据量线性增长，
+    而每次往返的网络延迟远大于查询本身。1000 条记录就是 1000 次往返。
+    解法是拿到 id 集合后一次批量查出来，循环里只做内存查表 ——
+    这通常能把一个接口从秒级降到毫秒级，是所有性能建议里收益最高的一条。
+  references:
+    - https://stackoverflow.com/questions/97197/what-is-the-n1-selects-problem
+
+- id: perf-unbounded-001
+  title: 无上限的查询
+  worker_type: performance
+  category: unbounded_query
+  severity_hint: medium
+  body: |
+    SELECT * 或没有 LIMIT 的查询，返回行数由数据量决定而不由代码决定。
+    今天在测试库上跑得好好的，上线三个月后就是一次 OOM 或一次超时。
+    分页不只是给前端用的，它也是服务端的自我保护。
+  references:
+    - https://use-the-index-luke.com/sql/partial-results/free-without-order-by
+
+- id: perf-blocking-001
+  title: 异步上下文里的阻塞调用
+  worker_type: performance
+  category: blocking_io
+  severity_hint: high
+  body: |
+    单线程事件循环里，一个阻塞调用会让**所有**并发请求一起排队等待，
+    而不是只影响自己。time.sleep、同步 HTTP 客户端、同步文件 IO 都是这类。
+    改用 asyncio.to_thread 或对应的异步客户端，让等待变成可调度的。
+  references:
+    - https://docs.python.org/3/library/asyncio-dev.html#running-blocking-code
+
+- id: perf-syncasync-001
+  title: 在异步函数里使用同步数据库驱动
+  worker_type: performance
+  category: sync_in_async
+  severity_hint: high
+  body: |
+    同步驱动（psycopg2、pymysql、sqlite3）的每一次查询都会阻塞事件循环。
+    它比 time.sleep 更隐蔽，因为它看起来就是一次普通的业务调用，
+    而代价随并发数放大。
+    注意：本项目用的 psycopg v3 是**异步**驱动，写 asyncio.to_thread 反而是错的。
+  references:
+    - https://www.psycopg.org/psycopg3/docs/advanced/async.html
+
+- id: perf-quadratic-001
+  title: 循环内的二次复杂度操作
+  worker_type: performance
+  category: quadratic
+  severity_hint: medium
+  body: |
+    字符串累加、list 的 in 判断、循环里再套一层遍历 —— 数据量翻倍时耗时翻四倍。
+    字符串用 ''.join(parts)，成员判断用 set，能一次算出来的就提到循环外。
+    这类问题在小数据下完全看不出来，是典型的「上线后突然变慢」。
+  references:
+    - https://wiki.python.org/moin/TimeComplexity
+
+- id: perf-missingindex-001
+  title: 缺少支撑查询的索引
+  worker_type: performance
+  category: missing_index
+  severity_hint: medium
+  body: |
+    在 WHERE / JOIN / ORDER BY 用到的列上没有索引时，数据库会退化成全表扫描。
+    几万行以内察觉不到，百万行就是几秒到几十秒的差别。
+    加索引前先看执行计划，不要凭猜测加 —— 多余的索引会拖慢写入。
+  references:
+    - https://use-the-index-luke.com/sql/table-of-contents
+
+- id: perf-allocation-001
+  title: 不必要的内存分配
+  worker_type: performance
+  category: unnecessary_allocation
+  severity_hint: low
+  body: |
+    在大循环里反复构造临时容器、复制大对象、把整个结果集读进内存再切片。
+    流式处理（生成器、游标迭代）把内存占用从 O(数据量) 降到 O(1)，
+    在批处理任务里往往决定它能不能跑完。
+  references:
+    - https://docs.python.org/3/library/itertools.html
+
+- id: perf-repeated-001
+  title: 循环内重复计算不变量
+  worker_type: performance
+  category: repeated_work
+  severity_hint: low
+  body: |
+    循环条件里每次重新求长度、循环体里反复访问同一条链式属性、
+    每轮都重新编译同一个正则。这类开销单次微不足道，
+    但把它们放在一个百万次的循环里就是可以测量的差别。
+  references:
+    - https://docs.python.org/3/library/re.html#re.compile
+
+- id: perf-memory-001
+  title: 无界读取到内存
+  worker_type: performance
+  category: memory
+  severity_hint: medium
+  body: |
+    read() 不带长度、把所有行 append 进列表再处理、把整个文件读成一个大字符串。
+    输入大小不可控时，内存占用就等于输入大小 ——
+    在容器里有内存上限的情况下，这直接表现为 OOMKilled。
+    按块处理或按行迭代。
+  references:
+    - https://docs.python.org/3/library/io.html#io.RawIOBase.read

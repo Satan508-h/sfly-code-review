@@ -1,0 +1,56 @@
+diff --git a/app/orders.py b/app/orders.py
+index 06de2ed..563ae18 100644
+--- a/app/orders.py
++++ b/app/orders.py
+@@ -3,6 +3,7 @@ import os
+ import sqlite3
+ 
+ DB_PATH = os.environ.get("DB_PATH", "app.db")
++MAX_PAGE_SIZE = 100
+ 
+ 
+ def connect():
+@@ -15,6 +16,43 @@ def get_order(order_id):
+     return cur.fetchone()
+ 
+ 
++def list_orders(order_ids):
++    """按 id 批量取订单。
++
++    一次查询取回全部，调用方在内存里查表 —— 逐个查会变成 N+1。
++    """
++    if not order_ids:
++        return {}
++    placeholders = ",".join("?" * len(order_ids))
++    cur = connect().cursor()
++    cur.execute(
++        f"SELECT id, total, status FROM orders WHERE id IN ({placeholders})",
++        tuple(order_ids),
++    )
++    return {row[0]: row for row in cur.fetchall()}
++
++
++def summarize_orders(order_ids):
++    orders = list_orders(order_ids)
++    parts = []
++    for order_id in order_ids:
++        row = orders.get(order_id)
++        if row is None:
++            continue
++        parts.append(f"{order_id}: {row[1]}")
++    return "; ".join(parts)
++
++
++def page_orders(status, page):
++    size = min(MAX_PAGE_SIZE, page * 50)
++    cur = connect().cursor()
++    cur.execute(
++        "SELECT id FROM orders WHERE status = ? LIMIT ?",
++        (status, size),
++    )
++    return cur.fetchall()
++
++
+ def save_note(order_id, note):
+     conn = connect()
+     conn.execute("UPDATE orders SET note = ? WHERE id = ?", (note, order_id))

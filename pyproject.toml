@@ -84,7 +84,10 @@ plugins = ["pydantic.mypy"]
 mypy_path = "packages/shared:packages/bus:packages/agent-core:apps/api:apps/orchestrator:apps/workers:apps/lite"
 
 [[tool.mypy.overrides]]
-module = ["rank_bm25.*", "ulid.*", "testcontainers.*"]
+# PyYAML 其实有第三方 stubs（types-PyYAML），但 safe_load 的返回类型
+# 本来就是 Any —— 装上它只换来 import 不再报错，多一个依赖不值得。
+# 与之相对，rank_bm25 / ulid 确实没有可用的 stubs。
+module = ["rank_bm25.*", "ulid.*", "testcontainers.*", "yaml.*"]
 ignore_missing_imports = true
 
 [tool.coverage.run]

@@ -1,0 +1,141 @@
+diff --git a/app/api.py b/app/api.py
+index 0ab7923..59a9657 100644
+--- a/app/api.py
++++ b/app/api.py
+@@ -1,6 +1,8 @@
+ """HTTP 接口层。"""
+ import os
++import subprocess
+ 
++import requests
+ from flask import Flask, request, jsonify
+ 
+ from app.db import get_user
+@@ -20,4 +22,19 @@ def read_user(user_id):
+ @app.get("/files")
+ def read_file():
+     name = request.args["name"]
+-    return open(os.path.join(UPLOAD_DIR, name)).read()
++    path = os.path.join(UPLOAD_DIR, name)
++    return open(path).read()
++
++
++@app.post("/admin/backup")
++def backup():
++    target = request.json["target"]
++    subprocess.run(f"tar -czf {target}.tgz {UPLOAD_DIR}", shell=True)
++    return jsonify({"ok": True})
++
++
++@app.get("/preview")
++def preview():
++    url = request.args["url"]
++    resp = requests.get(url, timeout=5)
++    return jsonify({"status": resp.status_code, "body": resp.text[:500]})
+diff --git a/app/db.py b/app/db.py
+index 3233aad..d93dff5 100644
+--- a/app/db.py
++++ b/app/db.py
+@@ -1,7 +1,11 @@
+ """数据访问层。"""
++import hashlib
++import pickle
++import random
+ import sqlite3
+ 
+ DB_PATH = "app.db"
++API_KEY = "sk-live-9f8a7b6c5d4e3f2a1b0c7d8e"
+ 
+ 
+ def connect():
+@@ -10,10 +14,28 @@ def connect():
+ 
+ def get_user(user_id):
+     cur = connect().cursor()
+-    cur.execute("SELECT id, name, email FROM users WHERE id = ?", (user_id,))
++    cur.execute(f"SELECT id, name, email FROM users WHERE id = {user_id}")
+     return cur.fetchone()
+ 
+ 
++def find_users(name):
++    cur = connect().cursor()
++    cur.execute("SELECT id, name FROM users WHERE name = '%s'" % name)
++    return cur.fetchall()
++
++
++def hash_password(password):
++    return hashlib.md5(password.encode()).hexdigest()
++
++
++def load_session(blob):
++    return pickle.loads(blob)
++
++
++def make_reset_code():
++    return random.randint(100000, 999999)
++
++
+ def list_orders(user_id):
+     cur = connect().cursor()
+     cur.execute("SELECT id, total FROM orders WHERE user_id = ?", (user_id,))
+@@ -24,3 +46,4 @@ def save_setting(key, value):
+     conn = connect()
+     conn.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (key, value))
+     conn.commit()
++    print("saved", key)
+diff --git a/app/report.py b/app/report.py
+index ffbbe64..294c1b7 100644
+--- a/app/report.py
++++ b/app/report.py
+@@ -1,16 +1,40 @@
+ """报表生成。"""
+ from app.db import list_orders
+ 
++FREE_SHIPPING_THRESHOLD = 9900
++
+ 
+ def build_report(users):
+     lines = []
+     for user in users:
+-        lines.append(f"用户 {user['name']}")
++        orders = list_orders(user["id"])
++        lines.append(f"用户 {user['name']}：{len(orders)} 单")
+     return "\n".join(lines)
+ 
+ 
++def summarize(users):
++    text = ""
++    for user in users:
++        text += f"{user['name']},{user['email']};"
++    return text
++
++
+ def total(orders):
+     result = 0
+     for order in orders:
+         result = result + order["total"]
+     return result
++
++
++def discount(order):
++    try:
++        return order["total"] - order["coupon"]
++    except:
++        return order["total"]
++
++
++def label(user):
++    x = user.get("nickname")
++    if x == None:
++        return user["name"]
++    return x
+diff --git a/static/app.js b/static/app.js
+new file mode 100644
+index 0000000..29e6e70
+--- /dev/null
++++ b/static/app.js
+@@ -0,0 +1,4 @@
++// 前端预览组件
++export function renderPreview(el, content) {
++  el.innerHTML = content
++}

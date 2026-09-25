@@ -1,0 +1,179 @@
+# 安全规则库。手写，不是索引出来的。
+#
+# 每条规则都要能被三样东西消费：
+#   1. plan 节点按 BM25 检索后塞进 Worker 的提示词
+#   2. Worker 命中时回填 rule_id，从而拿到置信度 +0.10 的 grounded 加成
+#   3. PR 评论里附上 references 里的链接，让作者知道为什么
+#
+# 所以 body 写的是「为什么这是问题 + 怎么改」，不是「禁止使用 X」。
+# 一条只会说禁止的规则，作者的第一反应是找绕过去的方法。
+
+- id: sec-sqli-001
+  title: SQL 注入
+  worker_type: security
+  category: sqli
+  severity_hint: critical
+  cwe: CWE-89
+  owasp: "A03:2021 Injection"
+  body: |
+    把外部输入拼进 SQL 文本，数据库就无法区分「代码」和「数据」——
+    输入里的引号会改写查询结构。参数化查询是唯一被证明有效的解法，
+    转义和黑名单都只是提高门槛。
+    注意 ORM 的 raw/filter 拼接同样会中招，它只是把拼接藏得更深。
+  references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html
+    - https://cwe.mitre.org/data/definitions/89.html
+
+- id: sec-secrets-001
+  title: 源码中的硬编码凭据
+  worker_type: security
+  category: secrets
+  severity_hint: critical
+  cwe: CWE-798
+  owasp: "A07:2021 Identification and Authentication Failures"
+  body: |
+    凭据一旦提交，就同时进入了 git 历史、CI 日志、镜像层和每一个克隆。
+    仅仅删掉那一行是不够的 —— 历史里还在，必须轮换。
+  references:
+    - https://cwe.mitre.org/data/definitions/798.html
+
+- id: sec-authz-001
+  title: 缺失或写错的访问控制
+  worker_type: security
+  category: auth
+  severity_hint: critical
+  cwe: CWE-862
+  owasp: "A01:2021 Broken Access Control"
+  body: |
+    鉴权是「你是谁」，授权是「你能做什么」，两者都要在每个入口显式检查。
+    最常见的形态是接口只校验了登录态，却没校验这条记录属不属于当前用户 ——
+    把 URL 里的 id 换掉就能读到别人的数据。
+    这类缺陷在测试里几乎不会被发现，因为测试用的永远是自己的账号。
+  references:
+    - https://owasp.org/Top10/A01_2021-Broken_Access_Control/
+
+- id: sec-cmdi-001
+  title: 命令注入
+  worker_type: security
+  category: command_injection
+  severity_hint: critical
+  cwe: CWE-78
+  owasp: "A03:2021 Injection"
+  body: |
+    shell=True（或 os.system）会把参数交给 shell 解释，于是参数里的
+    分号、反引号、$() 都变成了新的命令。改成列表传参可以彻底消除这一层，
+    因为不再有 shell 参与。确需 shell 特性时必须用 shlex.quote。
+  references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/OS_Command_Injection_Defense_Cheat_Sheet.html
+
+- id: sec-deser-001
+  title: 不安全的反序列化
+  worker_type: security
+  category: deserialization
+  severity_hint: critical
+  cwe: CWE-502
+  owasp: "A08:2021 Software and Data Integrity Failures"
+  body: |
+    pickle 的 __reduce__ 允许在反序列化过程中导入模块并调用任意函数，
+    所以「反序列化不可信数据」等价于「执行不可信代码」。
+    yaml.load 不指定 Loader 时同样能构造任意 Python 对象，必须用 safe_load。
+  references:
+    - https://cwe.mitre.org/data/definitions/502.html
+
+- id: sec-crypto-001
+  title: 使用已被攻破的密码学原语
+  worker_type: security
+  category: crypto
+  severity_hint: high
+  cwe: CWE-327
+  owasp: "A02:2021 Cryptographic Failures"
+  body: |
+    MD5 和 SHA1 的碰撞已被实际构造出来，不能用于签名、证书或完整性校验；
+    口令则连 SHA-256 都不该直接用，因为它是为速度设计的，而口令哈希必须慢 ——
+    用 bcrypt / scrypt / argon2。
+    关闭证书校验（verify=False）是同一类问题的另一种形态：它把 TLS 的
+    全部价值换成了「暂时不报错」。
+  references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html
+
+- id: sec-random-001
+  title: 非密码学安全的随机数
+  worker_type: security
+  category: insecure_random
+  severity_hint: high
+  cwe: CWE-338
+  body: |
+    random 模块是可预测的梅森旋转算法，看到连续输出就能反推内部状态。
+    会话 id、重置令牌、验证码、盐值都必须来自 secrets 或 os.urandom。
+  references:
+    - https://cwe.mitre.org/data/definitions/338.html
+
+- id: sec-pathtraversal-001
+  title: 路径穿越
+  worker_type: security
+  category: path_traversal
+  severity_hint: high
+  cwe: CWE-22
+  owasp: "A01:2021 Broken Access Control"
+  body: |
+    用外部输入直接拼文件路径时，../ 可以逃出预期目录并读写任意文件。
+    仅过滤 ../ 是不够的（编码变体、绝对路径、符号链接都能绕过），
+    正确做法是 realpath 之后校验前缀，或干脆只允许白名单里的固定文件名。
+  references:
+    - https://cwe.mitre.org/data/definitions/22.html
+
+- id: sec-ssrf-001
+  title: 服务端请求伪造
+  worker_type: security
+  category: ssrf
+  severity_hint: high
+  cwe: CWE-918
+  owasp: "A10:2021 Server-Side Request Forgery"
+  body: |
+    服务端代发起请求时，攻击者可以让它去访问内网服务和云厂商的元数据端点
+    （169.254.169.254），从而拿到实例凭据。
+    校验必须发生在解析之后 —— 只检查字符串里有没有 "localhost" 会被
+    十进制 IP、DNS 重绑定等手段绕过。
+  references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+
+- id: sec-xss-001
+  title: 跨站脚本
+  worker_type: security
+  category: xss
+  severity_hint: high
+  cwe: CWE-79
+  owasp: "A03:2021 Injection"
+  body: |
+    把不可信内容交给 innerHTML / v-html / dangerouslySetInnerHTML 时，
+    浏览器会把它当代码执行。优先用 textContent 这类纯文本接口；
+    确实需要富文本就必须经过白名单清洗，而白名单要过滤属性和协议，
+    不只是标签名。
+  references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html
+
+- id: sec-xxe-001
+  title: XML 外部实体注入
+  worker_type: security
+  category: xxe
+  severity_hint: high
+  cwe: CWE-611
+  body: |
+    默认配置的 XML 解析器会读取外部实体，于是「解析一段 XML」变成了
+    「读取服务器上的任意文件」或「发起一次内网请求」。
+    解析前必须显式禁用 DTD 和外部实体；能换成 JSON 就换掉。
+  references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html
+
+- id: sec-openredirect-001
+  title: 未校验的跳转目标
+  worker_type: security
+  category: open_redirect
+  severity_hint: medium
+  cwe: CWE-601
+  body: |
+    跳转目标来自参数时，攻击者可以用真实域名做跳板把用户送到钓鱼站，
+    也可以在 OAuth 流程里用它将授权码送到自己的服务器。
+    跳转前必须校验目标属于允许的域名，且只允许相对路径更安全。
+  references:
+    - https://cheatsheetseries.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html

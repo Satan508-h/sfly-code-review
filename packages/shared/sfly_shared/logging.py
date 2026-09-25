@@ -45,10 +45,41 @@ def _inject_context(
     return event_dict
 
 
+class _DynamicStderr:
+    """一个「永远写入当前的 ``sys.stderr``」的代理对象。
+
+    **为什么不能直接传 ``sys.stderr``**：``PrintLoggerFactory`` 在构造时就把
+    那个对象记下来了，而本项目开了 ``cache_logger_on_first_use`` ——
+    于是进程启动那一刻的 stream 对象被永久持有。
+    正常情况下这没有任何问题（进程里 sys.stderr 不会变），但只要有人替换过它
+    （pytest 的捕获、Jupyter、某些 uvicorn reload 实现），日志就会写进一个
+    已经关闭的文件，报 ``ValueError: I/O operation on closed file``。
+    而那个报错最讽刺的地方在于：**日志正是你用来排查这件事的工具**。
+
+    代理的代价是每次写多一次属性查找。日志不是热路径，这个代价可以忽略。
+    """
+
+    def write(self, message: str) -> int:
+        return sys.stderr.write(message)
+
+    def flush(self) -> None:
+        sys.stderr.flush()
+
+    def isatty(self) -> bool:
+        return sys.stderr.isatty()
+
+
 def setup_logging(level: str = "INFO", json_output: bool = True) -> None:
+    # **日志一律走 stderr。**
+    #
+    # 这不是风格偏好，是「stdout 属于程序输出」这条 Unix 约定的具体后果：
+    # 只要有一行日志混进 stdout，`python -m sfly_workers --diff x.diff | jq`
+    # 就会在第一个字符上解析失败，而错误信息指向的是 jq 的语法错误，
+    # 完全看不出真正的原因是那行日志。
+    # 运维侧没有损失：docker compose logs 和 journald 都同时收两个流。
     logging.basicConfig(
         format="%(message)s",
-        stream=sys.stdout,
+        stream=_DynamicStderr(),  # 鸭子类型，见类文档
         level=getattr(logging, level.upper(), logging.INFO),
     )
 
@@ -72,7 +103,8 @@ def setup_logging(level: str = "INFO", json_output: bool = True) -> None:
             renderer,
         ],
         wrapper_class=structlog.make_filtering_bound_logger(getattr(logging, level.upper(), logging.INFO)),
-        logger_factory=structlog.PrintLoggerFactory(),
+        # 同一个理由：stderr。用代理而不是 sys.stderr 本身，见 _DynamicStderr。
+        logger_factory=structlog.PrintLoggerFactory(file=_DynamicStderr()),  # type: ignore[arg-type]
         cache_logger_on_first_use=True,
     )
 
