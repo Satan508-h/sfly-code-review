@@ -60,7 +60,7 @@ class _Usage:
 class _Response:
     choices: list[_Choice] = field(default_factory=lambda: [_Choice(_Msg('{"findings": []}'))])
     usage: _Usage | None = field(default_factory=_Usage)
-    model: str = "deepseek-chat"
+    model: str = "deepseek-flash"
 
 
 class _FakeClient:
@@ -87,7 +87,7 @@ def _llm(response: _Response | Exception = _Response(), **over: Any) -> tuple[Op
     client = _FakeClient(response)
     base: dict[str, Any] = {
         "provider": "deepseek",
-        "model": "deepseek-chat",
+        "model": "deepseek-flash",
         "api_key": "sk-test",
         "temperature": 0.1,
         "max_tokens": 4096,
@@ -133,7 +133,7 @@ async def test_request_sends_system_and_user_as_separate_messages() -> None:
 async def test_defaults_are_used_and_overridable() -> None:
     llm, client = _llm()
     await llm.complete(system="s", user="u")
-    assert client.calls[0]["model"] == "deepseek-chat"
+    assert client.calls[0]["model"] == "deepseek-flash"
     assert client.calls[0]["temperature"] == 0.1
     assert client.calls[0]["max_tokens"] == 4096
 
@@ -241,6 +241,7 @@ async def test_connection_error_names_the_base_url() -> None:
         (402, "余额不足"),
         (429, "限流"),
         (400, "模型名"),
+        (404, "模型不存在"),
     ],
 )
 async def test_http_status_carries_an_actionable_hint(status: int, hint_word: str) -> None:
@@ -261,6 +262,9 @@ async def test_http_status_carries_an_actionable_hint(status: int, hint_word: st
         await llm.complete(system="s", user="u")
     message = str(exc.value)
     assert str(status) in message
+    # 报错里必须写出「我发的是哪个模型」：模型 id 会被厂商改名和下线，
+    # 而那总是表现为一条没头没尾的 400/404 —— 不写出来就只能靠猜。
+    assert "model=deepseek-flash" in message
     assert hint_word in message
 
 
@@ -313,7 +317,7 @@ def test_real_provider_is_built_when_a_key_is_present() -> None:
     llm = build_llm(Settings(llm_provider="deepseek", llm_api_key="sk-x"))
     assert isinstance(llm, OpenAICompatLLM)
     assert llm.name == "deepseek"
-    assert llm.model == "deepseek-chat"
+    assert llm.model == "deepseek-flash"
 
 
 @pytest.mark.unit

@@ -217,10 +217,21 @@ class Settings(BaseSettings):
 
     @property
     def resolved_llm_model(self) -> str:
+        """实际发给 API 的模型 id。
+
+        **这里的默认值是有保质期的。** 模型 id 会被厂商改名和下线 ——
+        DeepSeek 的 ``deepseek-chat`` / ``deepseek-reasoner`` 这两个用了一年多的
+        别名已于 2026-07-24 停用，用它们发请求会直接 400/404。所以：
+        真正部署前用 ``GET {base_url}/models`` 确认一次当前有效的 id，
+        然后用 ``LLM_MODEL`` 覆盖它，不要指望这个默认值是准的。
+
+        之所以还留默认值：留空时至少能发出一个**语法正确**的请求，
+        拿回一条「模型不存在」的报错；而留空直接报「没有模型」会让人以为是配置漏了。
+        """
         if self.llm_model:
             return self.llm_model
         return {
-            "deepseek": "deepseek-chat",
+            "deepseek": "deepseek-flash",
             "openai": "gpt-4o-mini",
             "mock": "mock-1",
         }[self.llm_provider]

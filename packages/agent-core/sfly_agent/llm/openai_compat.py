@@ -94,7 +94,7 @@ class OpenAICompatLLM:
         except APIConnectionError as exc:
             raise LlmHttpError(f"连不上 {self.name}（{self._client.base_url}）：{exc}") from exc
         except APIStatusError as exc:
-            raise LlmHttpError(_describe_status(self.name, exc)) from exc
+            raise LlmHttpError(_describe_status(self.name, self.model, exc)) from exc
 
         return self._to_response(response, started)
 
@@ -137,12 +137,16 @@ def _cached_tokens(usage: Any) -> int:
     return nested if isinstance(nested, int) else 0
 
 
-def _describe_status(provider: str, exc: APIStatusError) -> str:
+def _describe_status(provider: str, model: str, exc: APIStatusError) -> str:
     """把 HTTP 错误压成一行有用的信息。
 
     状态码必须带上，因为**同一个 provider 的不同状态码处置方式完全不同**：
     401 是密钥问题（改配置），402/429 是余额或限流（等或换），
-    400 通常是模型名写错或 prompt 超长。只说「请求失败」等于什么都没说。
+    400/404 通常是模型名已停用或写错。只说「请求失败」等于什么都没说。
+
+    **模型名也要带上。** 厂商会改名和下线模型 id（DeepSeek 的 ``deepseek-chat``
+    别名就在 2026-07 停用了），而那总是表现为一条没头没尾的 400/404 ——
+    报错里不写出「我发的是哪个模型」，排查就只能靠猜。
     """
     body = ""
     try:
@@ -150,11 +154,12 @@ def _describe_status(provider: str, exc: APIStatusError) -> str:
     except Exception:  # 响应体读不出来不该盖掉原始错误
         body = ""
     hint = {
-        400: "请求被拒（常见原因：模型名写错、prompt 超过上下文长度）",
+        400: "请求被拒（常见原因：模型名已停用或写错、prompt 超过上下文长度）",
         401: "鉴权失败（LLM_API_KEY 无效或已撤销）",
         402: "余额不足",
         403: "无权限访问该模型",
+        404: "模型不存在（该 id 可能已被厂下线，用 GET /models 确认当前有效的 id）",
         429: "触发限流",
     }.get(exc.status_code, "")
     suffix = f" —— {hint}" if hint else ""
-    return f"{provider} 返回 HTTP {exc.status_code}{suffix}；响应体：{body}"
+    return f"{provider}（model={model}）返回 HTTP {exc.status_code}{suffix}；响应体：{body}"
