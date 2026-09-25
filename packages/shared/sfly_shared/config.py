@@ -82,7 +82,13 @@ class Settings(BaseSettings):
 
     reclaim_interval_s: int = 30
     max_attempts: int = 3
-    """超过这个次数进死信。计数用 ``HINCRBY`` 显式记，不解析 XPENDING。"""
+    """投递次数**达到**这个值还没有成功 → 进死信。
+
+    是「达到」不是「超过」：``attempt`` 从 1 开始计数，所以 3 表示三次机会。
+
+    计数由队列层负责（Redis 用 ``INCR sfly:attempts:{stream}:{id}`` 显式记，
+    不解析 ``XPENDING`` —— 那个数字的含义随回收次数变化，不能拿来当重试计数），
+    Worker 只是读 ``handle.attempt`` 做判定。"""
 
     stream_maxlen_tasks: int = 10_000
     stream_maxlen_results: int = 10_000

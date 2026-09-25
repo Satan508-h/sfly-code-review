@@ -21,7 +21,8 @@ from pathlib import Path
 import pytest
 
 from sfly_shared.config import Settings
-from sfly_workers.__main__ import EXIT_BAD_INPUT, EXIT_FAILED, EXIT_OK, main
+from sfly_shared.contracts import ErrorClass, WorkerResult, WorkerType
+from sfly_workers.__main__ import EXIT_BAD_INPUT, EXIT_FAILED, EXIT_OK, _should_dead_letter, main
 
 FIXTURES = Path(__file__).resolve().parents[3] / "fixtures"
 NOT_A_DIFF = "这是一段普通文字，不是 diff。"
@@ -305,15 +306,67 @@ def test_unknown_spec_fails_fast_with_the_valid_options(
     assert "security" in err and "performance" in err and "style" in err
 
 
+# --------------------------------------------------------------------------- #
+# 死信判定（纯函数，不需要队列也不需要库）
+#
+# 这段逻辑的代价是不对称的：判早了，一条还会成功的任务被丢进死信；判晚了，
+# 每条坏消息都会烧三次 prompt 的 token，而**没有任何地方会报错** ——
+# 账单上只是多了一点。
+# --------------------------------------------------------------------------- #
+
+
+class _Handle:
+    """一个 ``MessageHandle`` 桩，只有 ``attempt`` 有实际取值。
+
+    另外两个方法**写出来就抛**：死信判定是纯函数，它不该去 ack 任何东西 ——
+    真这么做了，这条测试要立刻说出来，而不是等某天在线上发现
+    「判定了死信但消息没被 ack」。
+    """
+
+    def __init__(self, attempt: int) -> None:
+        self.id = "1-1"
+        self.attempt = attempt
+
+    async def ack(self) -> None:
+        raise AssertionError("死信判定不该 ack —— 那是调用方的事")
+
+    async def to_dead_letter(self, error: str, error_class: ErrorClass) -> None:
+        raise AssertionError("死信判定只回答「该不该」，发送是调用方的事")
+
+
+def _failed(error_class: ErrorClass) -> WorkerResult:
+    return WorkerResult.failed("01JTESTRUN0000000000000000", WorkerType.SECURITY, "boom", error_class)
+
+
 @pytest.mark.unit
-def test_worker_mode_without_diff_points_at_the_working_command(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """M3 之前，不带 ``--diff`` 会走到常驻模式。它必须给出一条**能直接用**的命令，
-    而不是一句「未实现」—— 前者让人继续往下走，后者让人停下来问。"""
+def test_a_non_retryable_failure_goes_to_the_dead_letter_on_the_first_try() -> None:
+    """schema_unrecoverable / diff_too_large / repo_not_found / auth_revoked
+    再试一百次的结果完全一样，而每一次都要烧一份 prompt。"""
     settings = Settings(llm_provider="mock")
-    monkeypatch.setattr("sfly_workers.__main__.get_settings", lambda: settings)
-    with pytest.raises(SystemExit) as exc:
-        main(["--spec", "security"])
-    # run_service 会抛出 SystemExit，消息里带着可执行的下一步
-    assert "M3" in str(exc.value) or exc.value.code not in (0, None)
+    handle = _Handle(attempt=1)
+
+    assert _should_dead_letter(_failed(ErrorClass.SCHEMA_UNRECOVERABLE), handle, settings) is True
+    assert _should_dead_letter(_failed(ErrorClass.AUTH_REVOKED), handle, settings) is True
+
+
+@pytest.mark.unit
+def test_a_transient_failure_is_retried_up_to_max_attempts() -> None:
+    """``attempt`` 从 1 开始，所以 ``MAX_ATTEMPTS=3`` 是**三次机会**，不是四次。
+
+    边界写成 ``>`` 是最容易犯的错，而且它的症状是「明明写了 3 次却跑了 4 次」——
+    多出来那一次要付一份完整的 prompt 钱。
+    """
+    settings = Settings(llm_provider="mock", max_attempts=3)
+
+    assert _should_dead_letter(_failed(ErrorClass.TRANSIENT), _Handle(1), settings) is False
+    assert _should_dead_letter(_failed(ErrorClass.TRANSIENT), _Handle(2), settings) is False
+    assert _should_dead_letter(_failed(ErrorClass.TRANSIENT), _Handle(3), settings) is True
+
+
+@pytest.mark.unit
+def test_a_successful_result_never_goes_to_the_dead_letter() -> None:
+    """成功的结果当然不进死信 —— 但这条也顺手挡住「忘了判断 status」这种写法。"""
+    settings = Settings(llm_provider="mock")
+    ok = WorkerResult(task_id="01JTESTRUN0000000000000000", worker_type=WorkerType.SECURITY)
+
+    assert _should_dead_letter(ok, _Handle(attempt=9), settings) is False

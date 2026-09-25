@@ -48,19 +48,12 @@ from typing import Any
 
 import pytest
 
+# 领域对象的工厂住在 tests/factories.py：队列契约、仓储往返、M5 的图都要用
+# 同一批对象，**形状必须一致**（否则「图能处理它、仓储存不下」只能靠人记得比）。
+# 两个后端继承本契约时也从那里取，不从这里转手 —— 少一层间接。
+from factories import bootstrap, result, task
 from sfly_bus.base import STREAMS, MessageHandle, TaskQueue
-from sfly_shared.contracts import (
-    BootstrapMessage,
-    ErrorClass,
-    FilePatch,
-    Finding,
-    ResultStatus,
-    Severity,
-    TaskMessage,
-    WorkerResult,
-    WorkerType,
-    idempotency_key_for,
-)
+from sfly_shared.contracts import ErrorClass, ResultStatus, WorkerResult, WorkerType
 
 #: 任何一次「这里应该立刻有消息」的等待上限。
 #:
@@ -134,77 +127,6 @@ async def collect[MsgT](
         with contextlib.suppress(asyncio.CancelledError):
             await task
     return out
-
-
-# --------------------------------------------------------------------------- #
-# 构造器
-# --------------------------------------------------------------------------- #
-
-
-def bootstrap(**over: Any) -> BootstrapMessage:
-    """一个合法的 BootstrapMessage。``idempotency_key`` 由三元组算出来，
-    不留给人填 —— 填错的话契约层会直接拒绝，那不是这里想测的东西。"""
-    base: dict[str, Any] = {
-        "task_id": "01JTESTRUN0000000000000000",
-        "repo_id": "123456",
-        "repo_node_id": "R_kgDOAbcdef",
-        "pr_number": 7,
-        "head_sha": "a" * 40,
-        "base_sha": "b" * 40,
-        "pr_title": "给查询接口加上分页",
-        "pr_author": "contributor",
-        "file_patches": [
-            FilePatch(path="app/db.py", language="python", patch="@@ -1 +1 @@\n-x\n+y\n", changed_lines=[1]),
-        ],
-    }
-    base.update(over)
-    base["idempotency_key"] = idempotency_key_for(base["repo_id"], base["pr_number"], base["head_sha"])
-    return BootstrapMessage(**base)
-
-
-def task(task_id: str, *, worker_type: WorkerType = WorkerType.SECURITY) -> TaskMessage:
-    """``task_id`` 是**同一个 run 的所有 Worker 共用的**那个 id。
-    多条消息各带不同 task_id，就等于这条流上同时跑着多个 run —— 这是常态。"""
-    boot = bootstrap()
-    return TaskMessage(
-        task_id=task_id,
-        worker_type=worker_type,
-        idempotency_key=boot.idempotency_key,
-        repo_id=boot.repo_id,
-        repo_node_id=boot.repo_node_id,
-        pr_number=boot.pr_number,
-        head_sha=boot.head_sha,
-        base_sha=boot.base_sha,
-        file_patches=list(boot.file_patches),
-        language="python",
-    )
-
-
-def finding(**over: Any) -> Finding:
-    base: dict[str, Any] = {
-        "file": "app/db.py",
-        "line": 12,
-        "severity": Severity.HIGH,
-        "category": "sqli",
-        "message": "用 f-string 拼接 SQL，用户输入没有参数化",
-        "confidence": 0.8,
-    }
-    base.update(over)
-    return Finding.model_validate(base)
-
-
-def result(task_id: str, *, findings: list[Finding] | None = None) -> WorkerResult:
-    return WorkerResult(
-        task_id=task_id,
-        worker_type=WorkerType.SECURITY,
-        status=ResultStatus.OK,
-        findings=findings if findings is not None else [finding()],
-        tokens_in=1234,
-        tokens_out=567,
-        cached_tokens=800,
-        latency_ms=4321,
-        model="mock-1",
-    )
 
 
 # --------------------------------------------------------------------------- #

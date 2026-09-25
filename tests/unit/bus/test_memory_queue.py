@@ -18,13 +18,10 @@ from typing import Any
 
 from contracts.queue_contract import (
     QueueContract,
-    bootstrap,
     collect,
-    finding,
     next_message,
-    result,
-    task,
 )
+from factories import bootstrap, finding, result, task
 from sfly_bus.base import STREAMS
 from sfly_bus.memory import InMemoryQueue
 from sfly_shared.contracts import ErrorClass, WorkerType

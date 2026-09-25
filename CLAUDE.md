@@ -38,9 +38,12 @@ apps/
   lite/          单事件循环，同时跑 API + GraphRunner + WorkerPool（Render 用）
 packages/
   shared/        sfly_shared — 领域契约（contracts.py）、配置、ID 生成
-  bus/           sfly_bus — TaskQueue / RunStore / Lock 协议 + 两种实现 + migrations
+  bus/           sfly_bus — TaskQueue / RunStore / Lock 协议 + 两种实现
                  （锁和队列放在一起：memory.py 有 InMemoryQueue + InMemoryLock，
-                   redis_streams.py 有 RedisStreamsQueue + RedisLock）
+                   redis_streams.py 有 RedisStreamsQueue + RedisLock；
+                   postgres.py 有 PostgresPool + PostgresRunStore —— 仓储只有这一个实现）
+                 migrations/ 纯 SQL 迁移 + 迁移器（001_init.sql 是六张表）
+                 注意：迁移 SQL 是**数据文件**，Dockerfile 靠 `COPY packages` 带进镜像
   agent-core/    sfly_agent — LLM 抽象与结构化输出、RAG、聚合算法、GitHub 客户端
 web/             Vue 3 + Element Plus + Vite SPA
 infra/           postgres init.sql、redis.conf、nginx 配置、GitHub 限流桩
@@ -177,6 +180,51 @@ Windows 默认的 `ProactorEventLoop` 不支持 `add_reader`，而 psycopg v3 �
 `Psycopg cannot use the 'ProactorEventLoop' to run in async mode`。所有 `__main__.py` 和
 `tests/conftest.py` 都已经调用，写新的入口时别漏。详见 `packages/shared/sfly_shared/aio.py`。
 
+**迁移器（`sfly_bus/migrations/`）有三条不能破的规则。**
+纯 SQL 文件 + `schema_version` 记账表，一个事务整批应用，`pg_advisory_xact_lock`
+串行化 —— 完整模式下五个容器**同时**调 `migrate()` 是常态，不是边角情况。
+
+1. **已应用的迁移不能再改。** 内容变了（sha256）直接报 `MigrationDriftError`，
+   而且 `migrate_on_startup` 会**让它抛出去**（和「连不上数据库」相反：那种情况
+   记一条 error 继续跑，进程要能起来在 `/api/health` 里说话）。改结构加
+   `002_*.sql`。本地试验要重来就是 `python tasks.py clean`。
+2. **版本号必须从 1 连续。** 跳号 = 有文件在合并里丢了，而这件事**只在空库上暴露**：
+   已经迁到 3 的库照常跑，新克隆的库少建一张表，然后在某条查询上炸掉。
+3. **迁移 SQL 永远不传参数。** 实测：psycopg 3 在不传参数时走**简单查询协议**，
+   Postgres 自己按分号切分，于是一整份文件可以一次 `execute()`；一旦带上参数就
+   改用扩展协议，而它**一次只允许一条语句** ——
+   `SyntaxError: cannot insert multiple commands into a prepared statement`。
+   所以 `run_migrations` 里的 `execute` 一律不带参数，带参数的语句单独发。
+
+**连接的行工厂会传染给每一个在它上面执行的 helper。**
+`PostgresPool` 的连接设了 `dict_row`（仓储里所有查询都按列名取值），于是任何
+拿这个连接执行 SQL 的辅助函数都会拿到 dict 而不是元组。M4 实测踩到：
+`_applied_versions` 写的是 `row[0]`，报出来的是 `KeyError: 0` —— 一个指不到
+真正原因的错误。**在自己开 cursor 的地方显式声明 `row_factory`**，别假设调用方。
+（同一类：`AsyncConnection` **没有** `executemany`，那在 cursor 上，同步连接才有。）
+
+**`ON CONFLICT DO NOTHING` 的 `RETURNING` 在冲突时返回空**，这是幂等写入能work
+的全部机制：`save_result` 靠它判断「这条结果是不是已经有人写过了」。
+而 `create_run` 用的是 `ON CONFLICT (idempotency_key) DO UPDATE SET updated_at = updated_at`
+—— 一次**空更新**。它不是笔误：`DO UPDATE` 会**锁住那一行并等**对方提交，
+于是两个 API 副本同时收到同一个 webhook 时，输的那个也能拿到行；
+`DO NOTHING` + 随后的 SELECT 做不到这一点（那个 SELECT 可能看不见还没提交的行）。
+
+**测试文件里的 `test_*` 名字会被 pytest 收集，包括 import 进来的。**
+`postgres_support.py` 里那个 helper 曾经叫 `test_dsn`，于是每个 import 它的
+测试文件都多出一条「测试」：不检查任何东西、返回一个字符串，而**用例总数看起来
+完全正常**，所以不会有人注意到。取名叫 `postgres_test_dsn` 是从这里来的。
+
+**`Path.write_text` 会把 `\n` 翻译成 `os.linesep`。** Windows 上「写一个 CRLF
+文件」实际会得到 `\r\r\n`（`\r` 留着，`\n` 又被翻译一次）。测试里要构造
+特定的换行符就得 `newline=""` —— M4 那条「指纹不该被换行符影响」的测试
+第一次跑就是被这个坑掉的（两个文件都变成了 CRLF，测不出区别）。
+
+**Mock LLM 靠 `iter_added_lines` 从提示词里读新增行，而它需要文件头。**
+`diff --git` / `---` / `+++` 三行缺一不可；只给一个 `@@` 的话它**静默返回空**，
+于是 Mock 报出「0 条发现」——测试不会失败，它只是什么也没验证。
+写 fixture 或测试里的假补丁时照抄 `fixtures/security_demo.diff` 的形状。
+
 **健康探测必须走独立连接，不能复用连接池。**
 `pool.connection(timeout=N)` 只限制「等池子分配连接」的时间；一旦拿到连接，后续查询
 **没有任何超时**。`docker pause` 之下 `SHOW server_version` 会永远阻塞，把 `/api/health`
@@ -199,9 +247,11 @@ python tasks.py clean      # 停止并删除数据卷（改过 infra/postgres/in
 python tasks.py logs -f    # 跟踪全部日志
 python tasks.py ps         # 各容器健康状态
 python tasks.py health     # 依赖真实连通性（探 /api/health，不是 /healthz）
+python tasks.py tables     # 看建了哪些表、迁移到第几版（M4 验收）
 
 python tasks.py test       # 单测（无 Docker、无密钥；Linux/CI 约 2s，Windows 约 16s）
-python tasks.py test-int   # 集成测试（需 Docker 里的 Redis；用 db 15，跑前 flushdb）
+python tasks.py test-int   # 集成测试（需 Docker 里的 Redis + Postgres；Redis 用 db 15，
+                           # Postgres 用 <库名>_test 且每次会话删掉重建）
 python tasks.py test-e2e   # 端到端（需真实密钥，会花钱，有 $2 上限）
 python tasks.py eval       # 评测集 → reports/eval-<sha>.md
 python tasks.py demo-reclaim  # 队列容错演示：副本猝死 → 回收 → attempt=2（只要 Redis）
@@ -257,7 +307,7 @@ python tasks.py demo           # 端到端：投递 3 次同一 webhook → 1 ru
 - [x] M1 — diff 解析、Mock LLM、修复阶梯、规则库、`--diff` 独立 CLI
 - [x] M2 — 队列协议 + InMemoryQueue / InMemoryLock + 指纹 + 两后端的契约测试骨架
 - [x] M3 — RedisStreamsQueue（含 XAUTOCLAIM / 死信 / 重试计数）+ RedisLock + 契约跑真 Redis
-- [ ] M4 — Postgres schema + 幂等 migrate
+- [x] M4 — Postgres 六张表 + `PostgresRunStore` + 幂等 migrate + Worker 常驻消费循环
 - [ ] M5 — LangGraph 图（高风险：`interrupt()`）
 - [ ] M6 — FastAPI + SSE 带 Last-Event-ID 补齐
 - [ ] M7 — GitHub 客户端 + publish 节点

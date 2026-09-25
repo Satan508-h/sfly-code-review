@@ -14,6 +14,19 @@
 
 ## 当前状态
 
+**M4 已完成**：Postgres 六张表由启动时的**幂等 `migrate()`** 建出来（本地容器和 Neon
+走的是同一条代码路径），`PostgresRunStore` 实现了整个 `RunStore` 协议，
+**Worker 的常驻消费循环真的在跑**——存库 → 发结果 → ack，顺序就是那条投递顺序铁律。
+验收是一条命令：
+
+```bash
+python tasks.py tables
+```
+
+下面按里程碑倒序排列，最近完成的在最前。
+
+---
+
 **M1 已完成并验证**：diff 解析、Mock LLM、JSON 修复阶梯、手写规则库、
 单个 Worker 的独立命令行。**不接队列、不连数据库、不需要任何密钥**就能跑：
 
@@ -81,7 +94,79 @@ CI 就只能一律当成失败。
 
 容器内跑同一份 fixture 得到**逐字节相同**的输出（证明规则库随镜像正确分发）。
 
-354 个单测 + 30 个集成测试通过；ruff + mypy strict（含 tests）全绿。
+373 个单测 + 59 个集成测试通过；ruff + mypy strict（含 tests）全绿。
+
+### M4 已完成：Postgres schema / 仓储 / 迁移 / Worker 消费循环
+
+```bash
+python tasks.py tables     # 六张表 + schema_version，见下
+```
+
+```
+                List of relations
+ Schema |      Name       | Type  | Owner
+--------+-----------------+-------+-------
+ public | findings        | table | sfly
+ public | llm_calls       | table | sfly
+ public | review_reports  | table | sfly
+ public | review_runs     | table | sfly
+ public | run_events      | table | sfly
+ public | schema_version  | table | sfly
+ public | worker_results  | table | sfly
+
+ version | name |          applied_at
+---------+------+-------------------------------
+       1 | init | 2026-09-25 12:15:03.412+00
+```
+
+六张业务表各自对应一件事：`review_runs`（一次审查一行，`deadline_at` 是所有恢复
+逻辑的主干）、`worker_results`（幂等靠它的复合主键）、`findings`（逐条展开，
+供评测统计）、`review_reports`（最终报告 jsonb + 冗余的汇总列）、`run_events`
+（SSE 的权威来源）、`llm_calls`（成本账）。
+
+**建表的是应用，不是 `init.sql`。** `infra/postgres/init.sql` 里只有扩展，
+表结构由每个进程启动时的幂等 `migrate()` 创建 —— 因为 Neon 上根本执行不到
+那个 init 脚本，「本地能跑、线上缺表」是这类项目最常见的部署事故。
+
+#### 三件不显然的事
+
+| 事 | 为什么 |
+|---|---|
+| **五个容器同时建表**是常态 | api / orchestrator / 三个 Worker 启动时都调 `migrate()`，靠 `pg_advisory_xact_lock` 串行化。没有它，表现是 `schema_version` 主键冲突或 `CREATE TABLE` 竞态 —— 然后容器进重启循环，看起来像数据库有问题 |
+| **漂移要炸，连不上不能炸** | 已应用的迁移被改过（sha256 对不上）→ 启动失败，因为代码期待的结构和库里的不是一回事，继续跑就是往错的结构上写数据。而数据库连不上时**记一条 error 继续** —— M0 定下的规矩：进程要能起来在 `/api/health` 里说清楚哪里坏了 |
+| **失败也要写库**（约定 #2 的落地） | Worker 放弃前先补一条 `status="failed"` 的结果，否则 `wait` 节点的屏障永远闭合不了。`completed_workers` 因此**不带 status 过滤** —— 写成「哪些 Worker 成功了」，一个 Worker 失败就会让整个 run 挂到超时 |
+
+#### Worker 的常驻循环：三行的顺序
+
+```python
+await store.save_result(result)  # 1. 先落库
+await queue.publish_result(result)  # 2. 再唤醒编排器
+await handle.ack()  # 3. 最后离开 PEL
+```
+
+反过来两种写法各有各的灾难：先 `XADD` 后写库 → 编排器被唤醒去读一个还不存在的
+结果，屏障检查失败；先 `XACK` 后写库 → 结果同时从 PEL 和数据库消失，**永久丢失**。
+
+而 `save_result` 失败时**不 ack** 也是这条约定的一部分：消息留在 PEL 里，
+等 Postgres 恢复后被 `reclaim()` 捞回来重跑，两处都不丢。这几条都有测试钉着
+（`tests/integration/workers/test_consume_loop.py`，对着真 Redis + 真 Postgres 跑）。
+
+每个 Worker 还跑一条回收协程（`RECLAIM_INTERVAL_S`，默认 30 秒一次
+`XAUTOCLAIM`）—— 这是「副本猝死」能被兜住的那一半，另一半是幂等写入。
+
+#### 过程中改掉的东西
+
+| 现象 | 真因 |
+|---|---|
+| `python tasks.py up` 一直抛 `TypeError` | `cmd_up` 一直在给 `_compose` 传 `timeout=`，而那个参数从没被接上。**最常用的那条命令坏了，没有任何东西发现它** —— 它不在任何自动化路径上，而手工跑它的人只会以为是自己环境的问题。现在两层的超时都补齐了（compose 自己的 `--wait-timeout` + subprocess 兜底） |
+| 迁移器第一次跑就 `KeyError: 0` | 池子的连接设了 `dict_row`（按列名取值），而 `_applied_versions` 写的是 `row[0]`。**行工厂会传染给每一个在它上面执行的 helper** —— 所以现在在自己开 cursor 的地方显式声明它 |
+| Worker 一启动就 `AttributeError: executemany` | `AsyncConnection` **没有**这个方法（同步连接才有），它得在 cursor 上调用 |
+| 「指纹不该被换行符影响」的测试不成立 | `Path.write_text` 会把 `\n` 翻译成 `os.linesep`，Windows 上于是把「写 CRLF」变成了 `\r\r\n`。测试里构造特定换行符必须 `newline=""` |
+
+另外两处**只有对着真库才会暴露**的设计细节，写进了代码注释：`ON CONFLICT DO NOTHING`
+的 `RETURNING` 在冲突时返回空（幂等写入靠的就是它）；而 `create_run` 用一次
+**空更新**而不是 `DO NOTHING` + SELECT —— 后者在两个副本同时收到同一个 webhook 时
+可能看不见对方还没提交的那一行。
 
 ### M3 已完成：Redis Streams（队列 / 锁 / 回收）
 
@@ -166,17 +251,17 @@ Redis 7.4.11 的真实版本与毫秒级延迟。依赖故障行为逐条验过�
 那只会把一次数据库抖动放大成一次全站重启，且 `restart: unless-stopped` 会让
 日志被退避重启信息冲掉。详见 [CLAUDE.md](CLAUDE.md) 约定 #6。
 
-**还差什么**：传输层两种实现都齐了（M2/M3），队列层的容错已经是可运行的
-（`python tasks.py demo-reclaim`）。还差的是**把它们串起来的那一层**：
+**还差什么**：传输层两种实现都齐了（M2/M3），Worker 的常驻消费循环与 Postgres
+仓储也齐了（M4）—— 投递顺序铁律「先落库、再 XADD、最后 XACK」现在是代码，
+而且有对着真 Redis + 真 Postgres 的测试。还差的是**把它们串起来的那一层**：
 
-* Worker 的常驻消费循环要等 **M4** —— 投递顺序铁律要求「先落库、再 XADD、
-  最后 XACK」，而落库要 Postgres 仓储
 * `review_bootstrap → review_tasks → review_results → dead_letter` 四条的端到端
   流转、屏障闭合、`docker kill` 之后 run 照样跑完，要等 **M5** 的 LangGraph 图
-  与 coordinator
+  与 coordinator —— 现在还没有东西往 `review_tasks` 里写（`dispatch` 是图的一环）
 
-所以现在每个 Worker 只能对着一份 diff 跑一次；`--scale` 与 `docker kill` 那两个
-场景的**机制**已经验证过了，但还没有一条真正的 run 从它们上面走过去。
+所以现在 Worker 收到任务会真的处理并写库（手工投一条就能看到），但一条完整的
+run 还走不通；`--scale` 与 `docker kill` 那两个场景的**机制**已经验证过了，
+只是还没有一条真正的 run 从它们上面走过去。
 
 进度见 [CLAUDE.md](CLAUDE.md) 末尾的清单，或前端首页。
 
@@ -313,16 +398,18 @@ DeepSeek 走 OpenAI 兼容接口，所以换成 OpenAI、vLLM 或本地模型只
 | **零密钥就能审代码** | `python -m sfly_workers --spec security --diff fixtures/security_demo.diff` | 10 条 finding，行号全部落在变更行上；`\| jq` 直接可用 |
 | **干净代码上不乱报** | 同上，换成 `fixtures/clean.diff` | 三个 Worker 都返回 `{"findings": []}` |
 | **坏 JSON 不会毁掉结果** | `MOCK_LLM_FAILURE_RATE=1.0` 再跑上一条 | 每一次调用都返回坏 JSON，仍然出结果（修复阶梯接住了） |
-| **两种拓扑共用一套代码** | `python tasks.py test` + `python tasks.py test-int` | **同一份**契约（`tests/contracts/queue_contract.py`）在内存后端与真 Redis 上各跑一遍 —— 14 条 + 6 条，一条都没有为哪一端放宽 |
+| **两种拓扑共用一套代码** | `python tasks.py test` + `python tasks.py test-int` | **同一份**契约（`tests/contracts/queue_contract.py`）在内存后端与真 Redis 上各跑一遍 —— 14 条 + 6 条，一条都没有为哪一端放宽。集成层还会在真 Postgres 上跑仓储/迁移/消费循环 |
 | 依赖真实可达 | `python tasks.py health` | Postgres / Redis 的**版本号**与毫秒延迟，不是照抄配置 |
 | 依赖挂了不误伤 | `docker pause sfly-postgres-1` | `/healthz` 仍 200、容器仍 healthy、`/api/health` 503；`docker unpause` 后自动恢复 |
+| **表是应用建出来的** | `python tasks.py tables` | 六张业务表 + `schema_version`（第 1 版已应用）。空库上也能建 —— 每个容器启动时都跑一遍幂等 `migrate()` |
 | **副本猝死，同伴接手** | `python tasks.py demo-reclaim` | 4 条任务被两个副本瓜分 → 一个副本中途消失 → PEL 里留下 1 条没人认领的记录 → `reclaim()` 抢回 → 重投的 `attempt` 是 2（不需要全栈，只要一个 Redis） |
-| Worker 水平扩展 | `python tasks.py scale 3` | `worker-security` 变成 3 个副本 —— **但 3 个消费者实例要等 M4**：常驻消费循环需要 Postgres 仓储 |
+| Worker 水平扩展 | `python tasks.py scale 3` | `worker-security` 变成 3 个副本，**同一个消费者组里三个消费者在竞争**（常驻循环 M4 已就绪，`XINFO CONSUMERS` 数得出来） |
+| **Worker 真的在写库** | `docker compose logs worker-security \| grep worker.consuming` | 每个副本报出消费者组、并发数、回收间隔；收到任务时按「存库 → 发结果 → ack」处理（集成测试逐条验证这个顺序） |
 | Worker 猝死不影响结果 | `python tasks.py kill-worker` | run 照样跑完，UI 显示「1 个 Worker 降级」徽章 —— **等 M5**：屏障闭合需要编排器 |
 | Webhook 幂等 | 同一 payload 连投 3 次 | 1 个 run + 2 个 `duplicate` 响应 |
 | 断点恢复 | `docker restart sfly-orchestrator-1` | 从 Postgres 的 checkpoint 续跑，不重复发评论 |
 | Redis 重启不丢任务 | `docker restart sfly-redis` | 扫描器按 `attempt+1` 重派，消息排空 |
-| Postgres 不可达不丢结果 | `docker pause sfly-postgres` | 消息堆在 PEL 里；`unpause` 后排空（证明「先落库再 ack」的顺序） |
+| Postgres 不可达不丢结果 | `docker pause sfly-postgres` | 消息堆在 PEL 里；`unpause` 后排空（证明「先落库再 ack」的顺序，集成测试里有一条专门钉它） |
 | 质量可被度量 | `python tasks.py eval` | `reports/eval-<sha>.md`：精确率 / 召回率 / 误报率 / 单次成本 |
 
 ---
@@ -407,12 +494,16 @@ apps/
 packages/
   shared/        领域契约、配置、ID、日志、异常
   bus/           TaskQueue / RunStore / Lock 协议 + 两种实现
+                 postgres.py 里是池子 + 仓储；migrations/001_init.sql 是六张表
+                 （**迁移 SQL 是数据文件**，靠 Dockerfile 的 COPY packages 进镜像）
   agent-core/    LLM 抽象与结构化输出、RAG、聚合算法、GitHub 客户端
 web/             Vue 3 SPA
-infra/           postgres init、redis conf、nginx conf、GitHub 限流桩
+infra/           postgres init（只有扩展，表由应用建）、redis conf、nginx conf、限流桩
 fixtures/        diff 样例、webhook payload、大 PR
 scripts/         运维与演示脚本
-tests/           unit / integration / e2e / eval
+tests/           contracts/（两个后端共用的行为契约，被 unit 与 integration 同时继承）
+                 factories.py（领域对象工厂，三层测试共用同一批形状）
+                 unit / integration / e2e / eval
 reports/         评测报告（提交进仓库）
 ```
 
@@ -428,11 +519,18 @@ API 不直接写 `review_tasks` —— 文件风险排序和规则检索由编�
 写在前面而不是藏在最后：一个未被说明的限制会被当成经验不足，一个被说明的限制
 则是严谨。
 
-- **worker 容器现在会退出并重启。** 队列层（M3）已经就绪，但常驻消费循环要等
-  M4 的 Postgres 仓储（投递顺序铁律要求先落库）。它退出时会打一条说明，不是
-  静默失败 —— 而 `docker compose ps` 里它们仍然显示 `healthy`，因为健康检查看的是
-  心跳文件、不探测依赖（约定 #6）。这个「看起来健康其实在重启」的状态会在 M4 消失，
-  在那之前它是本项目最容易被误读的一处输出。
+- **没有东西往 `review_tasks` 里写。** Worker 的消费循环（M4）已经就绪 ——
+  手工投一条任务进 Redis，对应的容器会真的处理它、写库、再 ack（这也是集成测试
+  在做的事）。但投递方 `dispatch` 是 LangGraph 图的一环，要等 M5，所以
+  **一条完整的 run 现在还走不通**：Webhook 进来只会建一行 `review_runs`。
+  `python tasks.py kill-worker` 那个演示也因此还差一步（屏障闭合需要编排器）。
+- **`purge_older_than` 里清 checkpoint 的那一段还没有被真正执行过。**
+  LangGraph 的表要等 M5 的 `AsyncPostgresSaver` 才会出现，所以那条分支现在是
+  「表不存在 → 返回 0」。SQL 是按 LangGraph 的表结构写的，但**它在 M4 只是代码，
+  不是证据** —— M5 接上 checkpointer 之后要补一条测试。
+- **数据量没有验证过。** 六张表的索引是按查询形状设计的（部分索引给超时扫描、
+  复合主键给屏障查询），但整个 M4 阶段的数据都是个位数行。
+  真实规模下的表现只有 M9 的评测集能回答。
 - **GitHub 真实二级限流只能用桩模拟。** `infra/github/stub_server.py` 模拟
   429 → 退避 → 201 的序列。桩是模型，不是真相。
 - **Render 冷启动无法自动化测试。** 免费版休眠后首次请求约需 60 秒（Render 唤醒

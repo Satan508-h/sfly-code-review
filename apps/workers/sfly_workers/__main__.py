@@ -9,7 +9,8 @@
   对着一份 diff 跑单个 Worker 然后打印结果。调试提示词时它比走完整链路
   快一个数量级，而且**格式化输出到 stdout、人读的摘要到 stderr**，
   所以 ``... | jq '.findings[]'`` 直接用。
-* **常驻消费**（默认）：接队列跑消费循环（M3 实现）。
+* **常驻消费**（默认）：接队列跑消费协程（M4 实现），顺序严格是
+  「存库 → 发结果 → ack」—— 见 ``_process_one``。
 
 退出码：``0`` 有结果（含 partial）／``2`` 审查失败（解析不出 JSON）／
 ``3`` 输入有问题（文件不存在、里面没有 diff）。让脚本能区分
@@ -19,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 from pathlib import Path
 
@@ -28,9 +30,22 @@ from sfly_agent.llm.registry import build_llm
 from sfly_agent.prompt import dominant_language
 from sfly_agent.rag.loader import RuleSet, load_rules
 from sfly_agent.rag.retriever import select_rules
+from sfly_bus.base import MessageHandle, RunStore, TaskQueue
+from sfly_bus.factory import Dependencies, open_dependencies
+from sfly_bus.postgres import migrate_on_startup
 from sfly_shared.aio import run
 from sfly_shared.config import Settings, get_settings
-from sfly_shared.contracts import FilePatch, ResultStatus, Rule, Severity, WorkerResult
+from sfly_shared.contracts import (
+    NON_RETRYABLE_ERRORS,
+    ErrorClass,
+    FilePatch,
+    ResultStatus,
+    Rule,
+    Severity,
+    TaskMessage,
+    WorkerResult,
+)
+from sfly_shared.errors import classify
 from sfly_shared.heartbeat import run_service
 from sfly_shared.ids import new_task_id
 from sfly_shared.logging import get_logger, setup_logging
@@ -42,6 +57,10 @@ log = get_logger(__name__)
 EXIT_OK = 0
 EXIT_FAILED = 2
 EXIT_BAD_INPUT = 3
+
+#: 存储层故障之后取下一条之前的退避。依赖挂了的时候每条消息都会立刻失败，
+#: 不退避就是一串说同一件事的异常日志。
+_FAILURE_BACKOFF_S = 1.0
 
 #: 摘要里的严重度顺序：最严重的排最前，人扫一眼就知道要不要停下来。
 _SEVERITY_ORDER = (Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM, Severity.LOW, Severity.INFO)
@@ -266,55 +285,219 @@ async def _review_once(args: argparse.Namespace, settings: Settings) -> int:
 # --------------------------------------------------------------------------- #
 
 
-async def _consume_forever(spec: WorkerSpec, stop: object) -> None:
-    """常驻消费循环。**M4 交付，不是 M3。**
+async def _process_one(
+    handle: MessageHandle,
+    task: TaskMessage,
+    *,
+    runner: WorkerRunner,
+    queue: TaskQueue,
+    store: RunStore,
+    settings: Settings,
+) -> None:
+    """处理一条任务。**这个函数的语句顺序就是 CLAUDE.md 约定 #1（投递顺序铁律）。**
 
-    队列那一层（M3）已经就绪 —— ``bus.consume_tasks`` 在真 Redis 上跑得通，
-    回收、重试计数、死信都有测试。这个循环之所以还差一步，缺的是
-    ``store.save_result()``：投递顺序铁律要求「先落库、再 XADD、最后 XACK」，
-    而落库要等 M4 的 Postgres schema 和仓储。
+    三行写入的顺序不是风格问题：
 
-    先落库这一条不能省：反过来（先 XADD）会让编排器被唤醒去读一个还不存在的
-    结果，屏障检查失败；先 XACK 则会让结果同时从 PEL 和数据库消失。
+    * 先 ``XADD`` 后写库 → 编排器被唤醒去读一个还不存在的结果，屏障检查失败
+    * 先 ``XACK`` 后写库 → 结果同时从 PEL 和数据库消失，**永久丢失**
 
-    形态是（顺序即约定 #1）：
-        async for handle, task in bus.consume_tasks(spec.worker_type):
-            if await already_done(task):          # 幂等快路径
-                await handle.ack(); continue
-            try:
-                result = await runner.review(...)
-            except Exception as exc:
-                # 失败也是结果：先补一条 failed 结果闭合屏障，再决定是否进死信
-                result = WorkerResult.failed(task.task_id, spec.worker_type, str(exc),
-                                             classify(exc), attempt=handle.attempt)
-            await store.save_result(result)        # 1. 先落库
-            await bus.publish_result(result)       # 2. 再唤醒编排器
-            await handle.ack()                     # 3. 最后离开 PEL
+    而 ``save_result`` 抛异常时**不 ack** 也是这条约定的一部分：消息留在 PEL 里，
+    等 Postgres 恢复后被回收重跑，两处都不丢。
     """
+    worker_type = task.worker_type
+
+    # 幂等快路径：回收之后重投的消息很可能早就写过了。省下的是一次真实的 LLM 调用，
+    # 但**正确性不靠它** —— 真正的保证是 worker_results 的主键
+    # （``save_result`` 里的 ON CONFLICT DO NOTHING），而这条路径可能因为
+    # 「上次写库成功、这次查询失败」而给出错误答案，所以它只是快路径。
+    if await store.exists_result(task.task_id, worker_type):
+        log.info(
+            "worker.skip_already_done",
+            task_id=task.task_id,
+            worker_type=worker_type.value,
+            attempt=handle.attempt,
+        )
+        await handle.ack()
+        return
+
+    try:
+        result = await runner.review(
+            task_id=task.task_id,
+            patches=task.file_patches,
+            rules=task.rules,
+            attempt=handle.attempt,
+        )
+    except Exception as exc:
+        # 失败也是结果（约定 #2）：不补一条 failed 结果的话，wait 节点的屏障
+        # 永远闭合不了，整个 run 挂到超时 —— 而日志里只会有一条「Worker 报错」。
+        #
+        # 注意这里只接 ``Exception``：CancelledError 必须继续往上走（停机信号），
+        # 把它翻译成一条 failed 结果会让停机变成一次「失败的审查」。
+        log.exception("worker.review_crashed", task_id=task.task_id, worker_type=worker_type.value)
+        result = WorkerResult.failed(
+            task.task_id, worker_type, str(exc), classify(exc), attempt=handle.attempt
+        )
+
+    await store.save_result(result)  # 1. 先落库
+    await queue.publish_result(result)  # 2. 再唤醒编排器
+    if _should_dead_letter(result, handle, settings):
+        # 死信**不是**完成机制（约定 #2）：failed 结果上面已经发过了，
+        # 这一条只是为了运维可见性。to_dead_letter 自己会 ack。
+        await handle.to_dead_letter(result.error or "", result.error_class or ErrorClass.TRANSIENT)
+    else:
+        await handle.ack()  # 3. 最后离开 PEL
+
+
+def _should_dead_letter(result: WorkerResult, handle: MessageHandle, settings: Settings) -> bool:
+    """这条消息该不该进死信。
+
+    ``attempt >= max_attempts`` 而不是 ``>``：attempt 从 1 开始计数，
+    所以 ``MAX_ATTEMPTS=3`` 的意思是「第 3 次投递失败时进死信」——
+    总共三次机会，不是四次。
+
+    不可重试的错误（schema_unrecoverable / diff_too_large / repo_not_found /
+    auth_revoked）一次就进死信：再试一百次的结果完全一样，而每一次都要烧一份
+    prompt 的 token。
+    """
+    if result.status is not ResultStatus.FAILED:
+        return False
+    if result.error_class in NON_RETRYABLE_ERRORS:
+        return True
+    return handle.attempt >= settings.max_attempts
+
+
+async def _consumer(
+    spec: WorkerSpec,
+    runner: WorkerRunner,
+    *,
+    queue: TaskQueue,
+    store: RunStore,
+    settings: Settings,
+) -> None:
+    """一条消费路径。一个进程起 ``WORKER_CONCURRENCY`` 条，``--scale`` 再叠一层。
+
+    每条协程在 Redis 那边有**自己的 consumer 名**（``_next_consumer`` 的序号），
+    所以 ``XINFO CONSUMERS`` 数出来的条数和这里起的一样多。
+    """
+    async for handle, task in queue.consume_tasks(spec.worker_type):
+        try:
+            await _process_one(handle, task, runner=runner, queue=queue, store=store, settings=settings)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 能漏到这里的只有**存储层故障**（写库失败 / 唤醒失败）——
+            # 每一条业务错误在 ``_process_one`` 里都已经有了归宿。
+            #
+            # **绝不能 ack**：不 ack 的消息留在 PEL 里，等 Postgres 恢复后
+            # 被回收重跑，两处都不丢。这就是 README 里「Postgres 不可达不丢结果」
+            # 那一行的实现。
+            log.exception(
+                "worker.message_failed",
+                task_id=task.task_id,
+                worker_type=task.worker_type.value,
+                attempt=handle.attempt,
+                hint="没有 ack —— 消息留在 PEL，等依赖恢复后由 reclaim 重投",
+            )
+            # 退避一下再取下一条：依赖挂了的时候每条消息都会立刻失败，
+            # 不退避就是一串刷屏的异常日志，而它们说的是同一件事。
+            await asyncio.sleep(_FAILURE_BACKOFF_S)
+
+
+async def _reclaim_forever(queue: TaskQueue, spec: WorkerSpec, interval_s: float) -> None:
+    """定期把同伴手里超时未确认的消息抢回来。
+
+    这是「副本猝死」能被兜住的那一半（另一半是幂等写入）。**每个副本都跑它** ——
+    多跑几次是无害的（``XAUTOCLAIM`` 只会拿走空闲超过阈值的那些），
+    而少跑一个副本的后果是「那个副本手里的活没人接」。
+
+    回收只是把消息变回「可投递」，它要经由同进程的消费协程才真的被处理 ——
+    这是 ``reclaim()`` 返回计数而不是返回消息的直接后果（见 base.py 的说明）。
+    """
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            count = await queue.reclaim(spec.worker_type)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("worker.reclaim_failed", worker_type=spec.worker_type.value)
+            continue
+        if count:
+            log.info(
+                "worker.reclaimed",
+                worker_type=spec.worker_type.value,
+                count=count,
+                hint="这些是空闲超过 CLAIM_IDLE_MS 未被确认的消息，多半来自一个猝死的副本",
+            )
+
+
+async def _serve(spec: WorkerSpec, stop: asyncio.Event, deps: Dependencies) -> None:
+    """常驻消费：``WORKER_CONCURRENCY`` 条消费协程 + 一条回收协程。"""
     settings = get_settings()
+    queue = deps.queue
+    if queue is None:  # factory 保证不会；类型上是可空的，所以在这里收窄一次
+        raise RuntimeError("队列没有被装配 —— factory.open_dependencies 应当总是给出它")
+
+    llm: LLMProvider = build_llm(settings, worker_types=(spec.worker_type,))
+    runner = WorkerRunner(spec, llm, settings)
     log.info(
-        "worker.skeleton",
+        "worker.consuming",
         consumer_group=spec.consumer_group,
         stream=spec.stream,
+        worker_type=spec.worker_type.value,
         categories=len(spec.categories),
         concurrency=settings.worker_concurrency,
         claim_idle_ms=settings.claim_idle_ms,
-        status="消费循环等 M4 的 RunStore；队列层（M3）已就绪",
+        reclaim_interval_s=settings.reclaim_interval_s,
     )
-    raise SystemExit(
-        "常驻消费模式还没实现（等 M4 的 Postgres 仓储）。\n"
-        f"  现在可以用：python -m sfly_workers --spec {spec.name} --diff fixtures/security_demo.diff\n"
-        "  想看队列层已经能做到什么（Worker 猝死 → 副本回收）：python scripts/demo_reclaim.py"
+
+    consumers = [
+        asyncio.create_task(
+            _consumer(spec, runner, queue=queue, store=deps.store, settings=settings),
+            name=f"{spec.name}-consumer-{i}",
+        )
+        for i in range(max(1, settings.worker_concurrency))
+    ]
+    reclaim = asyncio.create_task(
+        _reclaim_forever(queue, spec, settings.reclaim_interval_s), name=f"{spec.name}-reclaim"
     )
+    tasks = [*consumers, reclaim]
+
+    try:
+        # 停机信号在这里等 —— 消费协程自己不会返回（它们阻塞在流上）。
+        await stop.wait()
+    finally:
+        # **取消在飞的那条消息是可以的**，不是妥协：它留在 PEL 里，由 reclaim
+        # 交给同伴重跑。这和「副本猝死」走的是同一条路径，而那条路径有测试。
+        #
+        # 不这么做的代价是停机要等一个 60 秒的 LLM 调用跑完，而 Docker 只给 10 秒
+        # 就 SIGKILL —— 结果一样，只是过程更难解释。
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        closer = getattr(llm, "aclose", None)
+        if closer is not None:
+            await closer()
 
 
 async def _main_async(args: argparse.Namespace) -> int:
     settings = get_settings()
     if args.diff:
+        # 独立 CLI 模式**不连数据库**：它是对着一份 diff 调提示词的，
+        # 快一个数量级的原因正是这条路径上没有任何外部依赖。
         return await _review_once(args, settings)
 
     spec = spec_for(args.spec)
-    await run_service(f"worker-{spec.name}", lambda stop: _consume_forever(spec, stop))
+
+    # 常驻模式的依赖与建表：Worker 是写库的一方（save_result），
+    # 所以它也需要 Postgres，且启动时要保证表在。五个容器同时建表由
+    # pg_advisory_xact_lock 串行化。
+    deps = await open_dependencies(settings)
+    try:
+        await migrate_on_startup(deps.store)
+        await run_service(f"worker-{spec.name}", lambda stop: _serve(spec, stop, deps))
+    finally:
+        await deps.close()
     return EXIT_OK
 
 

@@ -23,8 +23,8 @@ from contracts.queue_contract import (
     QueueContract,
     collect,
     next_message,
-    task,
 )
+from factories import task
 from redis_support import raw_client, redis_test_url
 from sfly_bus.base import STREAMS
 from sfly_bus.redis_streams import RedisStreamsQueue

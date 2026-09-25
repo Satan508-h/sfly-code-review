@@ -354,7 +354,9 @@ async def test_probe_survives_a_probe_that_raises() -> None:
     async def fine() -> CheckResult:
         return ok("postgres", "PostgreSQL 16.4")
 
-    deps = Dependencies(postgres=None, queue=None, _probes=[("postgres", fine), ("redis", boom)])  # type: ignore[arg-type]
+    # postgres / store 传 None：这里只测探测编排，不需要真的依赖。
+    # 生产里这两个字段永远是有的（open_dependencies 装配），能传 None 是数据类的代价。
+    deps = Dependencies(postgres=None, store=None, queue=None, _probes=[("postgres", fine), ("redis", boom)])  # type: ignore[arg-type]
     report = await deps.probe()
 
     checks = report.as_dict()["checks"]
@@ -377,6 +379,7 @@ async def test_probe_runs_dependencies_concurrently() -> None:
 
     deps = Dependencies(
         postgres=None,  # type: ignore[arg-type]
+        store=None,  # type: ignore[arg-type]
         queue=None,
         _probes=[("a", lambda: slow("a")), ("b", lambda: slow("b")), ("c", lambda: slow("c"))],
     )
@@ -391,6 +394,6 @@ async def test_probe_runs_dependencies_concurrently() -> None:
 @pytest.mark.unit
 async def test_close_is_safe_when_queue_was_never_opened() -> None:
     """关机路径上不能抛：这时候 Docker 已经在拆容器了，没人会看到那条错误。"""
-    deps = Dependencies(postgres=None, queue=None, _probes=[])  # type: ignore[arg-type]
+    deps = Dependencies(postgres=None, store=None, queue=None, _probes=[])  # type: ignore[arg-type]
     await deps.close()
     await deps.close()  # 重复调用也要安全

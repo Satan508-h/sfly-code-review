@@ -20,17 +20,19 @@ from pathlib import Path
 
 import pytest
 
-from contracts.queue_contract import bootstrap
+from factories import bootstrap
 from sfly_bus.base import (
     CONSUMER_GROUPS,
     STREAMS,
     WORKER_TYPES,
     Lock,
     MessageHandle,
+    RunStore,
     TaskQueue,
     group_for,
 )
 from sfly_bus.memory import InMemoryLock, InMemoryQueue
+from sfly_bus.postgres import PostgresPool, PostgresRunStore
 from sfly_bus.redis_streams import RedisLock, RedisStreamsQueue
 from sfly_shared.contracts import WorkerType
 
@@ -39,6 +41,9 @@ from sfly_shared.contracts import WorkerType
 #: 都不产生网络 IO（连是 ``start()`` 才做的事），所以不需要真的 Redis。
 #: 这也让这几条测试留在单测层（无 Docker、毫秒级）。
 DEAD_URL = "redis://127.0.0.1:1/15"
+
+#: 同理的 Postgres 地址。端口 1 是 IANA 保留端口（TCPMUX），不可能有服务监听。
+DEAD_PG = "postgresql://nobody:nopw@127.0.0.1:1/nope"
 
 # --------------------------------------------------------------------------- #
 # 结构一致性
@@ -64,6 +69,20 @@ def test_redis_queue_satisfies_the_task_queue_protocol() -> None:
 @pytest.mark.unit
 def test_memory_lock_satisfies_the_lock_protocol() -> None:
     assert isinstance(InMemoryLock(), Lock)
+
+
+@pytest.mark.unit
+def test_the_postgres_store_satisfies_the_run_store_protocol() -> None:
+    """``RunStore`` 只有 Postgres 一个实现 —— 但仍然值得在这里查一遍。
+
+    一个实现也会漏方法：漏了 ``completed_workers``，``wait`` 节点会拿到
+    ``AttributeError``（还好，会报错）；漏了 ``mark_published``，publish 节点
+    会重复发评论（不好，不报错）。而且这个检查不需要数据库 ——
+    池子和仓储的构造都不产生 IO（连是 ``open()`` 才做的事），
+    所以它留在「无 Docker、毫秒级」这一层。
+    """
+    store = PostgresRunStore(PostgresPool(DEAD_PG))
+    assert isinstance(store, RunStore)
 
 
 @pytest.mark.unit

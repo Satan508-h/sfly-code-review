@@ -26,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from sfly_bus.factory import Dependencies, open_dependencies
+from sfly_bus.postgres import migrate_on_startup
 from sfly_shared.config import get_settings
 from sfly_shared.heartbeat import Heartbeat
 from sfly_shared.logging import get_logger, setup_logging
@@ -65,6 +66,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 依赖在这里开一次，整个进程共用 —— 每条请求新建一个连接池是
     # 「看着能跑、压一下就崩」的经典写法。
     app.state.deps = await open_dependencies(settings)
+
+    # 建表。**每个进程都在启动时做一遍**（api / orchestrator / 三个 Worker），
+    # 并发的部分由 pg_advisory_xact_lock 串行化 —— 完整模式下五个容器同时
+    # 启动是常态，不是边角情况。
+    #
+    # 放在这里而不是 open_dependencies 里面：那一步的语义是「把依赖装起来」，
+    # 在它里面做 DDL 会让它带上副作用，而它明确允许数据库不可达
+    # （连不上时进程照样起来，见 PostgresPool.open）。
+    # migrate_on_startup 的处置策略：连不上 → 记一条 error 继续；漂移 → 抛出。
+    await migrate_on_startup(app.state.deps.store)
 
     log.info("api.ready", mode=settings.mode, port=settings.port)
     try:

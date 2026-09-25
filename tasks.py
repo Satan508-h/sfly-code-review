@@ -7,7 +7,8 @@
 
     python tasks.py up          一键起全部服务并等健康检查通过
     python tasks.py test        全量单测（不需要 Docker、不需要密钥）
-    python tasks.py test-int    集成测试：同一份队列契约对着真 Redis 再跑一遍
+    python tasks.py test-int    集成测试：同一份队列契约对着真 Redis + Postgres 再跑一遍
+    python tasks.py tables      看数据库建了哪些表、迁移到第几版（M4 验收）
     python tasks.py demo-reclaim 队列容错演示：副本猝死 → 回收 → 重投（不需要全栈）
     python tasks.py demo        端到端演示：投递 3 次 webhook
     python tasks.py scale 3     把 worker-security 扩到 3 个副本
@@ -67,8 +68,14 @@ def run(
     check: bool = True,
     capture: bool = False,
     cwd: Path | None = None,
+    timeout: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """跑一条命令。失败时把命令原文打出来 —— 否则用户只看到 'exit 1' 无从下手。"""
+    """跑一条命令。失败时把命令原文打出来 —— 否则用户只看到 'exit 1' 无从下手。
+
+    ``timeout`` 是**兜底**用的：卡住不返回的命令（dockerd 没响应、
+    网络盘挂死）不会有自己的超时，而那种情况下 Ctrl-C 之外没有任何出路。
+    外面要留出余量，让命令有机会先把自己的话说清楚。
+    """
     printable = " ".join(cmd)
     if not capture:
         print(f"\n\033[36m$\033[0m {printable}", flush=True)
@@ -82,11 +89,18 @@ def run(
             check=check,
             text=True,
             capture_output=capture,
+            timeout=timeout,
             # npm 在 Windows 上是 npm.cmd，没有 shell 会报 FileNotFoundError
             shell=IS_WINDOWS and cmd[0] in {"npm", "npx"},
         )
     except FileNotFoundError:
         _die(f"找不到可执行文件：{cmd[0]}\n  请确认它已安装并在 PATH 里。")
+    except subprocess.TimeoutExpired:
+        _die(
+            f"命令超时（{timeout} 秒）：{printable}\n"
+            "  它还在后台跑着 —— 排查：docker compose ps / docker compose logs\n"
+            "  加长等待：python tasks.py up --timeout 1200"
+        )
     except subprocess.CalledProcessError as exc:
         if capture and exc.stdout:
             print(exc.stdout)
@@ -131,16 +145,24 @@ def _ensure_env_file() -> None:
         _ok("已从 .env.example 创建 .env（默认零密钥可跑通）")
 
 
-def _compose(*args: str, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess[str]:
+def _compose(
+    *args: str,
+    check: bool = True,
+    capture: bool = False,
+    timeout: int | None = None,
+) -> subprocess.CompletedProcess[str]:
     """包一层 docker compose。``capture`` 用于需要读取输出的场景（如取容器 id）。
 
     注意要把关键字参数**显式转发**给 run()。漏掉一个的话，
     调用点会在很晚的地方抛 TypeError（比如取容器 id 时），
     而报错位置和真正的原因（这行少了个参数）隔得很远。
+    —— 这不是假设：``cmd_up`` 一直在传 ``timeout``，而这里没有那个参数，
+    于是 ``python tasks.py up`` 从写下的那天起就是 TypeError。
+    最常用的那条命令坏掉了，而没有任何东西发现它。
     """
     if not _which("docker"):
         _die("找不到 docker。")
-    return run(["docker", "compose", *args], check=check, capture=capture)
+    return run(["docker", "compose", *args], check=check, capture=capture, timeout=timeout)
 
 
 # --------------------------------------------------------------------------- #
@@ -175,7 +197,20 @@ def cmd_up(args: argparse.Namespace) -> None:
     _step("构建并启动全部服务")
     # --wait 会阻塞到所有 healthcheck 变绿（或超时失败），
     # 这正是「一键启动」该有的语义：命令返回即代表真的可用。
-    _compose("up", "--build", "-d", "--wait", timeout=args.timeout)
+    #
+    # --wait-timeout 和 subprocess 的 timeout 是**两件不同的事**，两个都要：
+    # 前者让 compose 自己判定「等太久了」并说出是哪个服务没健康；
+    # 后者是兜底 —— 卡在更底层的地方（dockerd 不响应、网络盘挂死）时
+    # compose 自己不会超时。外面留 60 秒余量让它先把话说完。
+    _compose(
+        "up",
+        "--build",
+        "-d",
+        "--wait",
+        "--wait-timeout",
+        str(args.timeout),
+        timeout=args.timeout + 60,
+    )
     _ok("全部服务健康")
     _print_endpoints()
 
@@ -311,7 +346,7 @@ def cmd_test(_: argparse.Namespace) -> None:
 
 def cmd_test_int(_: argparse.Namespace) -> None:
     """集成测试。**依赖不可达时是失败，不是 skip** —— 见 tests/integration/conftest.py。"""
-    _step("集成测试（需要 Docker 里的 Redis，用 Mock LLM）")
+    _step("集成测试（需要 Docker 里的 Redis + Postgres，用 Mock LLM）")
     # -ra：把 skip/失败的原因打出来。默认的 -q 会把「30 个测试因为依赖不在
     # 而全部跳过」显示成一行绿字，那是最容易骗过自己的输出形态。
     _pytest("integration", extra=["-ra"])
@@ -320,12 +355,49 @@ def cmd_test_int(_: argparse.Namespace) -> None:
 def cmd_demo_reclaim(_: argparse.Namespace) -> None:
     """队列层容错演示：一个消费者猝死，同伴把它手里的活接过去跑完。
 
-    M3 的可运行证据。完整的 `kill-worker` 演示要等 M4/M5（Worker 常驻循环需要
-    Postgres 仓储、屏障闭合需要编排器），但它依赖的机制就是这里跑的这几步。
+    M3 的可运行证据。完整的 `kill-worker` 演示还要等 M5（屏障闭合需要编排器），
+    但它依赖的机制就是这里跑的这几步 —— 而且从 M4 起，Worker 的常驻循环
+    真的在用它（``_reclaim_forever``）。
     """
     script = ROOT / "scripts" / "demo_reclaim.py"
     _step("队列容错演示：副本猝死 -> XAUTOCLAIM 回收 -> 重投 attempt=2")
     run([_py(), str(script)])
+
+
+def cmd_tables(_: argparse.Namespace) -> None:
+    """看数据库里建了哪些表、迁移到第几个版本 —— **M4 的验收就是这条命令**。
+
+    直接走容器里的 psql，而不是从宿主机连：容器里的地址是 ``postgres:5432``，
+    宿主机的映射端口（本机是 55432）改了的话，从外面连需要你记得改参数。
+    """
+    _step("数据库表结构（由 Migrate 在启动时幂等创建）")
+    result = _compose(
+        "exec",
+        "-T",
+        "postgres",
+        "psql",
+        "-U",
+        "sfly",
+        "-d",
+        "sfly",
+        "-c",
+        "\\dt",
+        "-c",
+        "SELECT version, name, applied_at FROM schema_version ORDER BY version",
+        check=False,
+        capture=True,
+    )
+    if result.returncode != 0:
+        _die(
+            "连不上 postgres 容器。先起依赖：python tasks.py up postgres\n"
+            f"  （原样报错：{(result.stderr or '').strip()[:300]}）"
+        )
+    print(result.stdout)
+    _ok("六张业务表 + schema_version（记账表）")
+    print(
+        "\n  建表的是应用启动时的幂等 migrate()，不是 init.sql ——\n"
+        "  这样本地容器和 Neon 走的是同一条代码路径（infra/postgres/init.sql 里有完整理由）。\n"
+    )
 
 
 def cmd_test_e2e(_: argparse.Namespace) -> None:
@@ -528,6 +600,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add("kill-worker", cmd_kill_worker, "容错演示：杀死一个 worker-security")
     add("demo-reclaim", cmd_demo_reclaim, "队列容错演示：副本猝死 → 回收重投（不需全栈）")
+    add("tables", cmd_tables, "看数据库建了哪些表、迁到第几版（M4 验收）")
 
     add("test", cmd_test, "单测（默认，无需 Docker/密钥）")
     add("test-int", cmd_test_int, "集成测试（需要 Docker）")

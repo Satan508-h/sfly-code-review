@@ -1,4 +1,4 @@
-# CI：lint + 单测 + 队列契约（对着真 Redis 跑）。
+# CI：lint + 单测 + 集成层（对着真 Redis 和真 Postgres 跑）。
 #
 # 两个 job 的分工是刻意的：
 #
@@ -6,12 +6,19 @@
 #   依赖才能跑的 CI，在被 fork 或在新环境里第一次跑就会红，然后人们就开始
 #   忽略它。端到端测试（真实 DeepSeek 密钥，会花钱）仍然留给本地和 M9 的
 #   夜间任务。
-# * **contract** 起一个真的 Redis，把**同一份**队列契约再跑一遍。
-#   这一条不是「多一份测试」——它是项目中心论点（一套代码、两种拓扑）的证据。
-#   没有这个 job，那份契约会慢慢退化成「只有内存后端在跑」，而
-#   **不会有任何东西报错**：测试全绿、覆盖率不降，只是证据没了。
-#   testcontainers 用不上（CI 里没有 Docker daemon 可用），所以这里用
-#   service container —— 契约测试只需要一个能连上的 REDIS_URL。
+# * **integration** 起真的 Redis + Postgres，把集成层整个跑一遍。里面有两类东西：
+#
+#   1. **队列/锁契约**（``-m integration`` 里的 ``test_redis_*``）—— 同一份契约
+#      在第二个后端上再跑一遍。这一条不是「多一份测试」：它是项目中心论点
+#      （一套代码、两种拓扑）的证据。没有这个 job，那份契约会慢慢退化成
+#      「只有内存后端在跑」，而**不会有任何东西报错**：测试全绿、覆盖率不降，
+#      只是证据没了。
+#   2. **仓储与迁移**（``test_postgres_*``）—— 这些没有第二个实现可比，
+#      所以不是契约（理由写在那个文件的文档字符串里）。它们需要的是一个
+#      **真的** Postgres：空库上建表、五个进程并发迁移、失败回滚、
+#      jsonb 往返。拿假对象测这些等于测了个寂寞。
+#
+#   testcontainers 用不上（CI 里没有 Docker daemon 可用），所以用 service container。
 #
 # 命令与本地完全一致（见 Makefile / tasks.py），所以「本地过了 CI 挂了」
 # 这种事不会发生。
@@ -70,9 +77,8 @@ jobs:
         # 这类错误只会在别人 clone 下来跑 `docker compose up` 时才暴露。
         run: docker compose config --quiet
 
-  contract:
-    # 队列/锁协议的契约测试，对着**真 Redis** 再跑一遍。
-    # 这是「一套代码、两种拓扑」这个论点的证据本身，所以它值得一个 job。
+  integration:
+    # 集成层：队列/锁契约（真 Redis）+ 仓储与迁移（真 Postgres）。
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -89,6 +95,22 @@ jobs:
         ports:
           - 6379:6379
 
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: sfly
+          POSTGRES_PASSWORD: sfly
+          POSTGRES_DB: sfly
+        # pg_isready 要带 -U：不带的话它探的是「这台机器上有没有 postgres」，
+        # 而不是「我这个用户能不能连上」—— 后者才是测试要等的那个条件。
+        options: >-
+          --health-cmd "pg_isready -U sfly -d sfly"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+        ports:
+          - 5432:5432
+
     steps:
       - uses: actions/checkout@v4
 
@@ -100,9 +122,15 @@ jobs:
       - name: 按 lock 文件同步依赖
         run: uv sync --frozen --all-packages
 
-      - name: 队列/锁契约（真 Redis）
-        # REDIS_URL 指向 service container。测试自己会用 db 15，
-        # 并且**只在确认库号是 15 时**才 flushdb（见 tests/redis_support.py）。
+      - name: 集成测试（真 Redis + 真 Postgres）
+        # 两个 URL 都指向 service container。
+        #
+        # Redis：测试自己会用 db 15，并且**只在确认库号是 15 时**才 flushdb
+        # （见 tests/redis_support.py）。
+        # Postgres：测试会**另建一个 sfly_test 库**并在会话开始时删掉重建
+        # （见 tests/postgres_support.py）—— 所以这里给的 sfly 库不会被弄脏，
+        # 而每一次 run 都是在空库上验证「migrate() 能不能建起来」。
         env:
           REDIS_URL: redis://localhost:6379/0
+          DATABASE_URL: postgresql://sfly:sfly@localhost:5432/sfly
         run: uv run pytest -m integration -o addopts="-q --strict-markers -ra"

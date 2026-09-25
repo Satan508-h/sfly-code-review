@@ -28,10 +28,10 @@ import contextlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
-from sfly_bus.base import Lock, TaskQueue
+from sfly_bus.base import Lock, RunStore, TaskQueue
 from sfly_bus.health import CheckResult, HealthReport, down, skipped
 from sfly_bus.memory import InMemoryLock, InMemoryQueue
-from sfly_bus.postgres import PostgresPool
+from sfly_bus.postgres import PostgresPool, PostgresRunStore
 from sfly_bus.redis_streams import RedisLock, RedisStreamsQueue
 from sfly_shared.config import Settings, get_settings
 from sfly_shared.logging import get_logger
@@ -53,7 +53,15 @@ class Dependencies:
     """
 
     postgres: PostgresPool
-    """两种拓扑都有。``RunStore`` 的实现挂在这上面（M4）。"""
+    """两种拓扑都有。连接生命周期与健康探测归它。"""
+
+    store: RunStore
+    """``RunStore`` 实现，**两种拓扑都是同一个** :class:`PostgresRunStore`。
+
+    它不是「可选依赖」：屏障查询、幂等约束、事件日志、超时扫描全在上面。
+    和 ``queue`` / ``lock`` 不同，这里没有第二个实现可换 —— 精简模式去掉的是
+    Redis，不是数据库。
+    """
 
     queue: TaskQueue | None = None
     """``TaskQueue`` 实现。完整模式是 :class:`RedisStreamsQueue`，
@@ -124,6 +132,11 @@ async def open_dependencies(settings: Settings | None = None) -> Dependencies:
     )
     await postgres.open()
     probes: list[Probe] = [("postgres", postgres.ping)]
+    # 仓储只包一层池子，构造它不产生 IO —— 所以数据库不可达时这里不会失败，
+    # 进程照常起来（能不能干活由 /api/health 回答）。建表是**另一个显式步骤**：
+    # 各入口调 migrate_on_startup()，而不是塞进 open_dependencies ——
+    # 后者是「把依赖装起来」，在它里面做 DDL 会让「装依赖」带上副作用。
+    store = PostgresRunStore(postgres, run_deadline_s=s.run_deadline_s)
 
     queue, lock = await _open_transport(s, probes)
 
@@ -134,9 +147,10 @@ async def open_dependencies(settings: Settings | None = None) -> Dependencies:
         lock_backend=s.lock_backend,
         queue=type(queue).__name__ if queue is not None else None,
         lock=type(lock).__name__ if lock is not None else None,
+        store=type(store).__name__,
         database=_safe_dsn(s.database_url),
     )
-    return Dependencies(postgres=postgres, queue=queue, lock=lock, _probes=probes)
+    return Dependencies(postgres=postgres, store=store, queue=queue, lock=lock, _probes=probes)
 
 
 async def _open_transport(s: Settings, probes: list[Probe]) -> tuple[TaskQueue | None, Lock | None]:
