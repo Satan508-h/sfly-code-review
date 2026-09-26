@@ -36,6 +36,7 @@ from harness import (
     CASES_DIR,
     EvalCase,
     all_merged,
+    budget_from_env,
     load_cases,
     render_report,
     run_all,
@@ -45,6 +46,7 @@ from harness import (
 )
 
 from sfly_agent.aggregate.confidence import SUPPRESS_THRESHOLD
+from sfly_shared.config import Settings
 from sfly_shared.contracts import CATEGORY_OWNER, Severity, normalize_path
 from sfly_shared.diff import iter_added_lines
 
@@ -174,12 +176,16 @@ def test_the_manifest_matches_the_directory() -> None:
 
 
 @pytest.fixture(scope="module")
-def offline_runs():  # type: ignore[no-untyped-def]
-    """离线层跑一遍。**整个模块共用一次** —— 它虽然快，但没必要跑两遍。"""
-    return run_all(load_cases())
+def eval_runs():  # type: ignore[no-untyped-def]
+    """整批用例跑一遍。**整个模块共用一次** —— 真实层上这里要花钱。
+
+    预算从 ``EVAL_BUDGET_USD`` 读（默认 $5）。Mock 的单价是 0，
+    所以离线层永远不会触发它 —— 但真实层会，而那时**必须有东西拦着**。
+    """
+    return run_all(load_cases(), budget_usd=budget_from_env())
 
 
-def test_every_injected_case_is_actually_detectable(offline_runs) -> None:  # type: ignore[no-untyped-def]
+def test_every_injected_case_is_actually_detectable(eval_runs) -> None:  # type: ignore[no-untyped-def]
     """**每条注入用例都必须真的被测到 —— 越过置信度闸之前。**
 
     这条断言存在的理由：一条 Mock 根本认不出来的用例，会让召回率恒为 0、
@@ -189,14 +195,14 @@ def test_every_injected_case_is_actually_detectable(offline_runs) -> None:  # ty
     用「全部合并后的发现」而不是「发布的发现」来判断，是为了把
     「扫描器认不出」和「置信度闸砍掉了」区分开 —— 后者是另一条断言的事。
     """
-    blind = [run.case.id for run in offline_runs if run.case.group == "injected" and not all_merged(run)]
+    blind = [run.case.id for run in eval_runs if run.case.group == "injected" and not all_merged(run)]
     assert not blind, f"这些用例 Mock 一条都没报出来（用例写错了，或者规则认不出）：{blind}"
 
 
-def test_clean_cases_do_not_get_high_severity_findings(offline_runs) -> None:  # type: ignore[no-untyped-def]
+def test_clean_cases_do_not_get_high_severity_findings(eval_runs) -> None:  # type: ignore[no-untyped-def]
     """干净代码上不许出现 HIGH 及以上的发现。"""
     alarms: list[str] = []
-    for run in offline_runs:
+    for run in eval_runs:
         if run.case.group != "clean":
             continue
         for finding in run.report.findings:
@@ -225,14 +231,14 @@ def test_the_offline_numbers_are_reproducible() -> None:
     assert first.conflicts == second.conflicts
 
 
-def test_the_sweep_is_monotone_in_the_obvious_direction(offline_runs) -> None:  # type: ignore[no-untyped-def]
+def test_the_sweep_is_monotone_in_the_obvious_direction(eval_runs) -> None:  # type: ignore[no-untyped-def]
     """阈值调低，发布的条数不会变少。
 
     看着像句废话，但它是**扫描本身正确**的唯一检查：如果 ``threshold_sweep``
     读错了数据（比如只扫了 ``findings`` 而漏了 ``suppressed``），
     非单调就会立刻暴露出来。
     """
-    rows = threshold_sweep(offline_runs, SWEEP)
+    rows = threshold_sweep(eval_runs, SWEEP)
     counts = [row.published for row in rows]
     # ``SWEEP`` 是升序的阈值，所以条数必须是**降序** —— 门槛越高放过去越少。
     assert counts == sorted(counts, reverse=True), f"发布条数随阈值不单调：{counts}"
@@ -244,23 +250,50 @@ def test_the_sweep_is_monotone_in_the_obvious_direction(offline_runs) -> None:  
 # --------------------------------------------------------------------------- #
 
 
-def test_write_the_report(offline_runs) -> None:  # type: ignore[no-untyped-def]
+def test_write_the_report(eval_runs) -> None:  # type: ignore[no-untyped-def]
     """把指标、阈值扫描、逐用例明细写成 ``reports/eval-<sha>.md``。
 
     报告**提交进仓库**：面试官 clone 下来直接读，不需要跑任何东西；
     而文件名里的 sha 让「这份数字对应哪个 commit」一眼可见 ——
     改了代码之后数字过期，也是一眼可见。
     """
-    metrics = score(offline_runs)
+    metrics = score(eval_runs)
     metrics.depth = 3
-    sweep = threshold_sweep(offline_runs, SWEEP)
+    sweep = threshold_sweep(eval_runs, SWEEP)
     sha = _sha()
     dirty = _working_tree_is_dirty()
+    provider = Settings().llm_provider
+    budget = budget_from_env()
+    is_mock = provider == "mock"
+    truncated = metrics.runs < len(load_cases())
+
+    if is_mock:
+        layer = "离线层 · Mock LLM"
+        llm_line = "LLM：**Mock**（确定性正则扫描器，不产生任何模型调用，成本恒为 $0）"
+        blurb = (
+            "**这份报告量的是聚合层**（聚类、去重、置信度闸、冲突消解），"
+            "不是模型的审查能力 —— 这一层里根本没有模型。"
+            "干净组的误报率主要由扫描器一次只看一行的粗糙程度决定，"
+            "**不能当作系统的精确率引用**。"
+            "`rebuilt` 组基本认不出来也属于同一件事：那些是真代码，不是为正则准备的。"
+        )
+        command = "python tasks.py eval"
+    else:
+        layer = f"真实层 · {provider}"
+        llm_line = f"LLM：**{provider}**（真实调用）· 花费 ${metrics.cost_usd:.4f} / 上限 ${budget:.2f}" + (
+            "　⚠️ **因超预算提前停止**" if truncated else ""
+        )
+        blurb = (
+            "**这份报告量的是模型在真实调用下的审查能力**，同时也覆盖了聚合层。"
+            "数字会随模型版本、温度、以及 provider 侧的改动漂移 —— "
+            "所以它比离线层更接近真实，但**不可复现**，这是它的固有代价。"
+        )
+        command = "python tasks.py eval --real"
 
     body = render_report(
         metrics,
-        offline_runs,
-        title=f"sfly 评测报告（离线层 · Mock LLM）· {sha}",
+        eval_runs,
+        title=f"sfly 评测报告（{layer}）· {sha}",
         meta=[
             f"代码版本：`{sha}`"
             + (
@@ -268,18 +301,16 @@ def test_write_the_report(offline_runs) -> None:  # type: ignore[no-untyped-def]
                 if dirty
                 else "（生成时工作区干净，数字精确对应这个 commit）"
             ),
-            f"用例：{metrics.runs} 个（{_group_line(offline_runs)}）",
-            "LLM：**Mock**（确定性正则扫描器，不产生任何模型调用，成本恒为 $0）",
-            "命令：`python tasks.py eval`",
+            f"用例：{metrics.runs} 个（{_group_line(eval_runs)}）"
+            + (f"　⚠️ 计划 {len(load_cases())} 个，**超预算提前停止**" if truncated else ""),
+            llm_line,
+            f"命令：`{command}`",
             "",
-            "**这份报告量的是聚合层**（聚类、去重、置信度闸、冲突消解），"
-            "不是模型的审查能力 —— 这一层里根本没有模型。"
-            "干净组的误报率主要由扫描器一次只看一行的粗糙程度决定，"
-            "**不能当作系统的精确率引用**。",
+            blurb,
         ],
         sweep=sweep,
         current_threshold=SUPPRESS_THRESHOLD,
-        by_group=score_by_group(offline_runs),
+        by_group=score_by_group(eval_runs),
     )
 
     REPORTS_DIR.mkdir(exist_ok=True)

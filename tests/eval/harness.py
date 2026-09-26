@@ -34,6 +34,7 @@ Postgres，只会让它变慢、变脆，然后在需要频繁跑它的时候被
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -45,6 +46,7 @@ import yaml
 
 from sfly_agent.aggregate.pipeline import aggregate_run, finalize_run
 from sfly_agent.llm.base import LLMProvider
+from sfly_agent.llm.pricing import estimate_cost_usd
 from sfly_agent.llm.registry import build_llm
 from sfly_agent.prompt import dominant_language
 from sfly_agent.rag.loader import load_rules
@@ -54,16 +56,19 @@ from sfly_shared.config import Settings
 from sfly_shared.contracts import (
     SEVERITY_RANK,
     ReviewReport,
+    Rule,
     RunRow,
     RunStatus,
     Severity,
+    WorkerResult,
     WorkerType,
     normalize_path,
 )
 from sfly_shared.diff import parse_unified_diff
 from sfly_shared.ids import new_task_id
+from sfly_shared.logging import get_logger
 from sfly_workers.runner import WorkerRunner
-from sfly_workers.specs import spec_for
+from sfly_workers.specs import SPECS, WorkerSpec, spec_for
 
 CASES_DIR = Path(__file__).parent / "cases"
 
@@ -75,6 +80,20 @@ LINE_TOLERANCE = 3
 #: 评测集的三组。**干净组是多数学生完全跳过的那一组** ——
 #: 缺了它，精确率的分母里只有「有问题的地方」，数字会好看得没有意义。
 GROUPS = ("rebuilt", "injected", "clean")
+
+
+def baseline_persona() -> str:
+    """单 Agent 基线的人设：三个专家人设**逐字拼起来**，只加一段衔接说明。
+
+    逐字拼而不是重写成一段「综合人设」：重写就引入了第二个变量，
+    于是「差多少」里就分不清哪些来自拓扑、哪些来自措辞。
+    基线要回答的是「同样的知识、同样的规则，一个 Agent 干三个人的活会怎样」。
+    """
+    return (
+        "你同时负责三个方面：安全、性能、代码风格。下面是你在这三个方面的完整职责说明，"
+        "你必须一次审完，并在一次输出里报出全部发现。\n\n"
+        + "\n\n---\n\n".join(spec.persona for spec in SPECS.values())
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,10 +221,97 @@ async def review_case(
         results.append(result)
 
     wall_ms = int((time.perf_counter() - started) * 1000)
+    return _finish_run(case, results, planned, wall_ms, parsed.total_files, len(patches), truncated)
 
+
+async def review_case_single_agent(
+    case: EvalCase,
+    *,
+    settings: Settings | None = None,
+    llm: LLMProvider | None = None,
+) -> CaseRun:
+    """**单 Agent 基线**：一次调用包办安全 / 性能 / 风格三件事。
+
+    这是「多 Agent 到底值不值」这个问题的另一半答案。没有它，评测只能回答
+    「我的系统得了多少分」；有了它才能回答「比一个人干贵多少、多找回几条」。
+
+    与生产路径的**唯一**差别是规格和提示词，其余（选文件、检索规则、
+    ``WorkerRunner``、聚合）逐字相同 —— 基线必须走同一条链路，
+    否则比的就不是「一个 Agent 还是三个」，而是「两套实现」。
+
+    基线规格**只存在于评测里**（``WorkerType`` 只有三个值，加第四个会污染
+    ``CATEGORY_OWNER`` 和整条冲突消解）。它是一次对照实验，不是一种运行模式。
+    """
+    task_id = new_task_id()
+    s = settings or Settings()
+    parsed = parse_unified_diff(case.diff, max_patch_chars=s.per_file_patch_chars)
+    patches, truncated = select_files(parsed.patches, s.pr_max_files)
+    language = dominant_language(patches)
+    ruleset = load_rules()
+    spec = baseline_spec()
+
+    # **三个 lane 的规则全给它**：单 Agent 要包办三件事，就该看到三份规则。
+    # 各取各的 top_k 再拼起来，而不是把 top_k 调大 —— 后者会让它在
+    # 「谁该多看几条」上和三个 Worker 的分配方式不一样，比的就不只是拓扑了。
+    rules: list[Rule] = []
+    for worker_type in WorkerType:
+        lane = spec_for(worker_type)
+        rules += select_rules(
+            ruleset,
+            worker_type=worker_type,
+            language=language,
+            core_ids=lane.core_rule_ids,
+            top_k=lane.top_k_rules,
+        )
+
+    started = time.perf_counter()
+    provider = llm or build_llm(s, worker_types=None)  # None = 三条 lane 都报
+    result = await WorkerRunner(spec, provider, s).review(
+        task_id=task_id,
+        patches=patches,
+        rules=rules,
+    )
+    wall_ms = int((time.perf_counter() - started) * 1000)
+    return _finish_run(
+        case, [result], tuple(WorkerType), wall_ms, parsed.total_files, len(patches), truncated
+    )
+
+
+def baseline_spec() -> WorkerSpec:
+    """把三个专家压成一个人的那份规格。见 ``review_case_single_agent``。"""
+    return WorkerSpec(
+        # ``worker_type`` 是占位：基线不按 lane 分，但契约要求这个字段。
+        # 取 SECURITY 不改变任何行为 —— 结果里的 ``worker_type`` 只影响
+        # ``totals.per_worker_ms`` 的键名，评测不读它。
+        worker_type=WorkerType.SECURITY,
+        consumer_group="baseline",
+        stream="review_tasks",
+        categories=tuple(c for s in SPECS.values() for c in s.categories),
+        core_rule_ids=tuple(r for s in SPECS.values() for r in s.core_rule_ids),
+        persona=baseline_persona(),
+        # 基线自己拼规则（见上），这个值不会被用到 —— 留默认。
+        top_k_rules=8,
+    )
+
+
+def _finish_run(
+    case: EvalCase,
+    results: list[WorkerResult],
+    planned: tuple[WorkerType, ...],
+    wall_ms: int,
+    files_total: int,
+    files_reviewed: int,
+    truncated: bool,
+) -> CaseRun:
+    """把一批上报收成一份报告。三种跑法（多 Worker / 消融 / 基线）共用这一段。
+
+    ``task_id`` 从上报里取而不是另传一个参数：报告和结果必须是同一个 run 的，
+    多一个可以传错的参数就多一种对不上的方式，而那种错会让
+    ``aggregate_run`` 拿一批别人的结果去汇总。
+    """
     now = datetime.now(UTC)
     run = RunRow(
-        task_id=task_id,
+        task_id=results[0].task_id,
         idempotency_key=f"eval:{case.id}",
         repo_id="0",
         repo_node_id="R_eval",
@@ -217,13 +323,27 @@ async def review_case(
         status=RunStatus.AGGREGATING,
         deadline_at=now + timedelta(minutes=5),
         planned_workers=list(planned),
-        files_total=parsed.total_files,
-        files_reviewed=len(patches),
+        files_total=files_total,
+        files_reviewed=files_reviewed,
         diff_truncated=truncated,
         created_at=now,
         dispatched_at=now,
     )
-    report = finalize_run(aggregate_run(run, results, now=now))
+    # 成本在这里算，**不是**让 ``aggregate_run`` 去查库：评测不连数据库。
+    # 生产链路上这笔账来自 ``llm_calls`` 表（Worker 写结果时记的），
+    # 而评测手上只有 ``WorkerResult`` 里的 token 计数 —— 于是复用同一张价目表
+    # （``pricing.estimate_cost_usd``），口径和生产完全一致。
+    # **Mock 的单价是 0，那不是「没算」**，见 pricing.py 的模块文档第 3 条。
+    cost_usd = sum(
+        estimate_cost_usd(
+            result.model,
+            tokens_in=result.tokens_in,
+            tokens_out=result.tokens_out,
+            cached_tokens=result.cached_tokens,
+        )
+        for result in results
+    )
+    report = finalize_run(aggregate_run(run, results, cost_usd=cost_usd, now=now))
 
     return CaseRun(
         case=case,
@@ -232,8 +352,21 @@ async def review_case(
         tokens_in=sum(r.tokens_in for r in results),
         tokens_out=sum(r.tokens_out for r in results),
         cached_tokens=sum(r.cached_tokens for r in results),
-        cost_usd=report.totals.cost_usd,
+        cost_usd=cost_usd,
     )
+
+
+def budget_from_env(default: float = 5.0) -> float:
+    """真实层的花费上限，读 ``EVAL_BUDGET_USD``。
+
+    上限**必须存在且必须真的会拦**：一个没有上限的评测脚本迟早会在
+    某次「就再跑一遍」里花掉一个不打算花的数，而那时没有东西会拦它。
+    """
+    raw = os.environ.get("EVAL_BUDGET_USD", "")
+    try:
+        return float(raw) if raw else default
+    except ValueError:
+        return default
 
 
 def run_all(
@@ -241,16 +374,38 @@ def run_all(
     *,
     settings: Settings | None = None,
     workers: Sequence[WorkerType] | None = None,
+    budget_usd: float | None = None,
 ) -> list[CaseRun]:
     """顺序跑完一批用例。
 
     **故意串行**：并发会让 p50/p95 延迟失去意义，也会让真实层的限流
     变成一串重试 —— 而重试会污染 token 统计。评测慢一点没关系，
     数字被污染才是问题。
+
+    ``budget_usd`` 给定时**边跑边记花费**，超了就停在当前用例上并返回
+    已经跑完的部分。停在哪比「跑到一半被 provider 拒绝」好：
+    前者是报告里写明的一行，后者是一串看不出原因的报错。
     """
+    logger = get_logger(__name__)
+    pending = list(cases)
 
     async def _main() -> list[CaseRun]:
-        return [await review_case(case, settings=settings, workers=workers) for case in cases]
+        runs: list[CaseRun] = []
+        spent = 0.0
+        for case in pending:
+            run = await review_case(case, settings=settings, workers=workers)
+            runs.append(run)
+            spent += run.cost_usd
+            if budget_usd is not None and spent >= budget_usd:
+                logger.warning(
+                    "eval.budget_exhausted",
+                    spent=round(spent, 4),
+                    budget=budget_usd,
+                    done=len(runs),
+                    total=len(pending),
+                )
+                break
+        return runs
 
     return asyncio.run(_main())
 
@@ -471,6 +626,66 @@ def threshold_sweep(runs: Sequence[CaseRun], thresholds: Sequence[float]) -> lis
             )
         )
     return rows
+
+
+@dataclass(slots=True)
+class Variant:
+    """一次消融配置的跑分。``calls`` 是**总 LLM 调用次数**（用例数 × 每条几个 Worker）。"""
+
+    label: str
+    metrics: Metrics
+    calls: int
+
+
+def render_ablation(variants: Sequence[Variant]) -> list[str]:
+    """消融与基线的对照表。返回 Markdown 行。
+
+    **这张表回答的是「多 Agent 到底值不值」**，而那需要两样东西才算回答完整：
+    一个单 Agent 基线（不然只有「我的系统多少分」），
+    和一条增量曲线（不然不知道第三个 Worker 是不是白花钱）。
+
+    「每多发现一个真问题的边际成本」只在**相邻两档之间**才有定义 ——
+    拿它去和基线比是没有意义的，基线的「增量」不是从零开始的。
+    """
+    if not variants:
+        return []
+
+    lines = [
+        "## 消融与基线",
+        "",
+        "| 配置 | LLM 调用 | 发布 | 命中真问题 | 严格召回率 | 精确率 | 成本 | 相对上一档 |",
+        "|---|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    for index, variant in enumerate(variants):
+        m = variant.metrics
+        if index == 0:
+            delta = "—（基线）"
+        else:
+            previous = variants[index - 1]
+            gained = m.strict.tp - previous.metrics.strict.tp
+            spent = m.cost_usd - previous.metrics.cost_usd
+            if gained > 0:
+                delta = f"+{gained} 条，每多一条 ${spent / gained:.4f}"
+            elif spent > 0:
+                delta = f"**+0 条，多花 ${spent:.4f}**"
+            else:
+                delta = "+0 条，$0"
+        lines.append(
+            f"| {variant.label} | {variant.calls} | {m.published} | {m.strict.tp} | "
+            f"{m.strict.recall * 100:.1f}% | {m.strict.precision * 100:.1f}% | "
+            f"${m.cost_usd:.4f} | {delta} |"
+        )
+
+    lines += [
+        "",
+        "> **「+0 条」不等于那一档没用。** 召回率只看 ground truth 命中，"
+        "而增量 Worker 常常发现的是没被标注的真问题（评测集标不完）。"
+        "所以这一列真正能下结论的是**成本**那一半：花钱买不到标注里的召回时，"
+        "该问的是「它报出来的那些是不是真的」，那要用发布的原始条目去人工抽查 ——"
+        "自动化指标到这里就到头了。",
+        "",
+    ]
+    return lines
 
 
 @dataclass(slots=True)

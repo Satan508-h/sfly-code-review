@@ -480,7 +480,7 @@ def cmd_test_e2e(_: argparse.Namespace) -> None:
     _pytest("e2e")
 
 
-def cmd_eval(_: argparse.Namespace) -> None:
+def cmd_eval(args: argparse.Namespace) -> None:
     """评测集跑一遍，出 ``reports/eval-<git-sha>.md``。
 
     **两个层次，读数完全不同**（见 ``tests/eval/harness.py`` 的模块文档）：
@@ -494,8 +494,88 @@ def cmd_eval(_: argparse.Namespace) -> None:
     阈值扫描** —— 那是评测集存在的主要理由。门槛是唯一一个纯策略数字，
     不该靠猜。
     """
-    _step("评测集（离线层 · Mock LLM）：精确率 / 召回率 / 误报率 / 成本 / 阈值扫描")
+    if args.real:
+        # **子进程继承 ``os.environ``** —— 和 ``docker compose`` 的规则正好相反
+        # （那边命令行前面的 ``FOO=bar`` 不会进容器，见 CLAUDE.md）。
+        # 在 Python 里改 ``os.environ`` 再起子进程，子进程一定看得到。
+        _require_real_llm_key()
+        os.environ["LLM_PROVIDER"] = args.provider
+        os.environ["EVAL_BUDGET_USD"] = str(args.budget)
+        _step(f"评测集（真实层 · {args.provider}，上限 ${args.budget}）：会真的花钱")
+    else:
+        _step("评测集（离线层 · Mock LLM）：精确率 / 召回率 / 误报率 / 成本 / 阈值扫描")
+
     run([_py(), "-m", "pytest", "-m", "eval", "-o", "addopts=-q -s", "tests/eval"])
+
+
+def _read_clipboard() -> str:
+    """从剪贴板读文本。
+
+    **为什么走剪贴板**：在命令行里敲 key 会进 shell 历史、进进程列表；
+    粘进聊天窗口会进聊天记录。剪贴板是唯一一条不落地的通道。
+    """
+    if sys.platform == "win32":
+        cmd = ["powershell", "-NoProfile", "-Command", "Get-Clipboard"]
+    elif _which("pbpaste"):
+        cmd = ["pbpaste"]
+    elif _which("xclip"):
+        cmd = ["xclip", "-selection", "clipboard", "-o"]
+    else:
+        _die("找不到读剪贴板的工具。直接把 key 写进 .env 的 LLM_API_KEY= 后面。")
+    return run(cmd, capture=True).stdout
+
+
+def _set_env_var(name: str, value: str) -> None:
+    """把 ``.env`` 里的某一项改成 ``value``（没有就追加）。**不回显值。**"""
+    path = ROOT / ".env"
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    out: list[str] = []
+    replaced = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(f"{name}=") or stripped.startswith(f"{name} ="):
+            out.append(f"{name}={value}")
+            replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        out.append(f"{name}={value}")
+    path.write_text("\n".join(out) + "\n", encoding="utf-8", newline="")
+
+
+def cmd_set_llm_key(_: argparse.Namespace) -> None:
+    """把剪贴板里的 LLM key 写进 ``.env``。
+
+    先复制 key，再跑这一条 —— **它不会打印 key，连长度都不打印**
+    （长度、前缀切片一样是凭证外泄：它缩小了猜测空间，也让截图变得危险）。
+    """
+    key = _read_clipboard().strip()
+    if len(key) < 16:
+        _die("剪贴板里没有像 key 的东西（为空或太短）。先复制 key，再跑这条命令。")
+    _set_env_var("LLM_API_KEY", key)
+    _ok("已写入 .env：LLM_API_KEY（没有回显内容，也没有回显长度）")
+    print("  下一步：python tasks.py eval --real --budget 5", file=sys.stderr)
+
+
+def _require_real_llm_key() -> None:
+    """真实层开跑**之前**就检查密钥，而不是跑到第一次调用才报错。
+
+    提前拦的价值在于「跑一半」的样子：30 个用例里前几个写进了报告、
+    后面全是失败，然后报告看起来是一份**完整的**结果 ——
+    一个带着半份数据、却毫无标记的数字比一次干脆的失败危险得多。
+    """
+    from sfly_shared.config import Settings
+
+    settings = Settings()
+    if settings.llm_api_key.strip():
+        return
+    _die(
+        "LLM_API_KEY 是空的，真实层跑不了。\n"
+        "  把 key 复制到剪贴板，然后跑：\n"
+        "    python tasks.py set-llm-key\n"
+        "  （或者直接编辑 .env 里的 LLM_API_KEY。）\n"
+        "  这个脚本**不会**打印 key，也不会把它写进任何日志或报告。",
+    )
 
 
 # -- 质量 ------------------------------------------------------------------- #
@@ -824,7 +904,26 @@ def build_parser() -> argparse.ArgumentParser:
     add("test", cmd_test, "单测（默认，无需 Docker/密钥）")
     add("test-int", cmd_test_int, "集成测试（需要 Docker）")
     add("test-e2e", cmd_test_e2e, "端到端测试（需要真实密钥，会花钱）")
-    add("eval", cmd_eval, "评测集：精确率/召回率/成本")
+    add(
+        "eval",
+        cmd_eval,
+        "评测集：精确率/召回率/成本/阈值扫描（默认离线层，$0，秒级）",
+        [
+            (
+                ("--real",),
+                {"action": "store_true", "help": "跑真实模型（会花钱、会抖，需要 LLM_API_KEY）"},
+            ),
+            (
+                ("--provider",),
+                {"default": "deepseek", "help": "真实层用哪个 provider（默认 deepseek）"},
+            ),
+            (
+                ("--budget",),
+                {"type": float, "default": 5.0, "help": "真实层的花费上限（美元，默认 5）"},
+            ),
+        ],
+    )
+    add("set-llm-key", cmd_set_llm_key, "把剪贴板里的 LLM key 写进 .env（不回显内容）")
 
     add(
         "stub-github",
