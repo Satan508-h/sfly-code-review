@@ -216,6 +216,7 @@ export function reviewReport(over: Partial<ReviewReport> = {}): ReviewReport {
     decision_reason: 'secrets_found',
     degraded: false,
     missing_workers: [],
+    scanned_only: false,
     files_total: 4,
     files_reviewed: 4,
     diff_truncated: false,

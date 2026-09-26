@@ -319,6 +319,15 @@ watch(
             降级运行 —— {{ run.missing_workers.length }} 个 Worker 未上报
           </el-tag>
           <el-tag v-if="run.block_merge" type="danger" effect="plain">建议阻止合并</el-tag>
+          <!--
+            「结果来自扫描器」和「有 Worker 没上报」是**两件事**，所以是两个
+            徽章：那边说报告不完整，这边说报告完整但来源不同。合并成一个会把
+            「今天配额用完了」显示成「系统坏了」—— 而扫描器的 finding 和模型的
+            finding 在这一页上长得一模一样，这个徽章是访客唯一能分辨的地方。
+          -->
+          <el-tag v-if="report?.scanned_only" type="info" effect="plain">
+            结果来自规则扫描器，不是模型
+          </el-tag>
 
           <el-button
             v-if="report?.comment_body"

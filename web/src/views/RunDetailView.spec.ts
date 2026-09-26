@@ -178,6 +178,30 @@ describe('RunDetailView', () => {
     expect(wrapper.text()).toContain('1 个 Worker 未上报')
   })
 
+  it('结果来自扫描器时明说 —— 它和「降级运行」是两件事', async () => {
+    const wrapper = await render({
+      run: runRow(),
+      report: reviewReport({ scanned_only: true }),
+      events: [],
+    })
+
+    // 这一页上扫描器的 finding 和模型的 finding 长得**一模一样**，
+    // 所以这个徽章是访客唯一能分辨的地方。
+    expect(wrapper.text()).toContain('结果来自规则扫描器，不是模型')
+    // 反面：报告是**完整**的，不该顺带说它降级了 —— 混在一起会把
+    // 「今天配额用完了」显示成「系统坏了」。
+    expect(wrapper.text()).not.toContain('降级运行')
+  })
+
+  it('模型产的报告不会挂上扫描器的徽章', async () => {
+    const wrapper = await render({
+      run: runRow(),
+      report: reviewReport({ scanned_only: false }),
+      events: [],
+    })
+    expect(wrapper.text()).not.toContain('结果来自规则扫描器')
+  })
+
   // ── 实时时间线（SSE）的接法 ─────────────────────────────────────────── //
 
   it('正在跑的 run：从首屏最大的 seq 接着开流，新事件进时间线', async () => {

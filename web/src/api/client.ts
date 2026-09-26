@@ -193,6 +193,9 @@ export interface ReviewReport {
   decision_reason: string
   degraded: boolean
   missing_workers: WorkerType[]
+  /** 这次的发现全来自确定性扫描器（今日配额用完 / 线上关了真实模型）。
+   *  **和 `degraded` 是两件事**，见后端 `contracts.py` 里那个字段的说明。 */
+  scanned_only: boolean
   files_total: number
   files_reviewed: number
   diff_truncated: boolean
