@@ -1,6 +1,6 @@
-# sfly 评测报告（离线层 · Mock LLM）· 379b920
+# sfly 评测报告（离线层 · Mock LLM）· 22e7b5b
 
-- 代码版本：`379b920`（**生成时工作区有未提交改动**，这份数字不一定精确对应上面那个 commit）
+- 代码版本：`22e7b5b`（生成时工作区干净，数字精确对应这个 commit）
 - 用例：30 个（rebuilt 10，injected 15，clean 5）
 - LLM：**Mock**（确定性正则扫描器，不产生任何模型调用，成本恒为 $0）
 - 命令：`python tasks.py eval`
@@ -85,7 +85,7 @@
 | `clean-validation` | clean | 0 | 0 | 0 | 0 | 0 | 0 | 1 ms |
 | `inj-blocking` | injected | 1 | 1 | 0 | 1 | 0 | 0 | 1 ms |
 | `inj-cmdi` | injected | 1 | 1 | 0 | 1 | 0 | 0 | 0 ms |
-| `inj-crypto` | injected | 2 | 3 | 0 | 2 | 1 | 0 | 0 ms |
+| `inj-crypto` | injected | 2 | 3 | 0 | 2 | 1 | 0 | 1 ms |
 | `inj-deser` | injected | 2 | 2 | 0 | 2 | 0 | 0 | 1 ms |
 | `inj-mutable-default` | injected | 1 | 1 | 0 | 1 | 0 | 0 | 0 ms |
 | `inj-pathtraversal` | injected | 1 | 1 | 0 | 1 | 0 | 0 | 0 ms |
