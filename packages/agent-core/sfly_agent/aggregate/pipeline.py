@@ -6,27 +6,34 @@
 同一批 ``WorkerResult`` 跑一百遍必须得到一模一样的报告，否则
 「改了聚类阈值，精确率涨了 3%」这句话就没有意义 —— 涨幅可能只是模型抖动。
 
-### M5 做到哪一步
+### 合并分两层，两层都在 ``cluster.py`` 里
 
-M5 完成的是：**按指纹精确合并 + 置信度重算 + 分档 + 汇总**。
+M5 只做了第一层：**按指纹精确合并**（同一个 Worker 用同一句话描述同一处）。
+M9 补上第二层：**相似度聚类**（并查集 + rapidfuzz 阈值）。
 
-``fingerprint`` 是 ``sha1(路径 | 行号//3 | 类目 | 归一的 message)`` ——
-它只合并「同一个 Worker 用同一句话描述同一处」这种情况，也就是**完全相同的声称**。
+分两步做是刻意的，但**不要把这两层理解成「快速路径 + 慢速兜底」** ——
+它们其实是同一个判断的两个口径，而 M9 之后由第二层单独承担全部合并：
 
-还差的一步是**相似度聚类**（M9）：两个 Worker 用不同措辞说同一处问题、
-或者模型这次报第 10 行下次报第 12 行时，指纹不同而它们其实是同一件事。
-那一步是 O(n²) 的并查集 + rapidfuzz 阈值（同 Worker 0.75 / 跨 Worker 0.55），
-在这里插进来 —— :func:`merge_findings` 就是它的扩展点。
+* 指纹相同 → 路径、类目、行号桶、归一化措辞全相同，那么聚类那四条判据
+  **必然全部满足**（同一个桶内 ``|Δline| ≤ 2 < 3``，措辞相同则相似度为 1）。
+  也就是说第一层能被第二层完全覆盖。
+* 反过来不行：指纹不同而聚类该合并的情况，正是第二层存在的理由。
 
-之所以敢分成两步：**指纹那一步永远不会被替换掉**，它是并查集的快速路径
-（指纹相同直接合并，不必做字符串相似度）。M9 加的是它后面的兜底，
-不是把它推倒重来。
+那为什么不先按指纹分组、只比较组代表？因为 **``line // 3`` 的桶边界会咬人**：
+第 0 行和第 4 行分属两个桶（差 4 > 3，确实不该合并），但 ``{第 0 行, 第 2 行}``
+这一组和第 4 行的那一组，代表选举（同分取行号小的）会选出第 0 行 ——
+于是**一对本来该合并的成员（第 2 行与第 4 行）被代表挡住了**。
+按发现全量两两比较就没有这个问题，而 n 只有几百，全量比较的代价可以忽略。
+
+``fingerprint`` 因此不再参与合并判断，但它**没有变成死代码**：
+它是 ``review_results.fingerprint`` 那一列的值，用于跨 run 的分析与排查。
+合并逻辑与落库标识分开，本来就是两件事。
 
 ### 冲突消解不在这个文件里
 
-同路径 + 邻近行号 + 不同 Worker + 严重度差 ≥ 2 才是冲突（``conflicts.py``，M9）。
-M5 的 ``report.conflicts`` 因此恒为空 —— 前端（M8）要在空列表上正常工作，
-这比先塞一堆假数据进去安全。
+同路径 + 邻近行号 + 不同 Worker + 严重度差 ≥ 2 才是冲突（``conflicts.py``）。
+**聚类在这里特意给冲突让了路**：类目不同的两条永不合并，因为「同一处、
+不同类目」正是冲突的定义，合并掉它就等于把整节冲突消解静默吃掉。
 """
 
 from __future__ import annotations
@@ -34,9 +41,9 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 
+from sfly_agent.aggregate.cluster import cluster_findings
 from sfly_agent.aggregate.confidence import SUPPRESS_THRESHOLD, adjusted_confidence
 from sfly_agent.aggregate.decision import decide
-from sfly_agent.aggregate.fingerprint import fingerprint
 from sfly_agent.aggregate.render import render_comment
 from sfly_shared.contracts import (
     SEVERITY_RANK,
@@ -52,27 +59,23 @@ from sfly_shared.contracts import (
 
 
 def merge_findings(results: Sequence[WorkerResult]) -> list[AggregatedFinding]:
-    """把全部 Worker 的发现按指纹合并，返回每个簇的代表。
+    """把全部 Worker 的发现聚成簇，返回每个簇的代表。
 
     **只有代表进入结果**，簇里的其它成员不单独出现 —— 但 ``sources`` 和
     ``corroboration_count`` 把它们记了下来。跨 Worker 印证是去重最值钱的产物：
     两个专家独立地说同一件事，比一个专家说两遍可信得多。
-    """
-    # **``(worker_type, Finding)`` 配对，不是裸的 Finding** ——
-    # ``Finding`` 上没有 ``worker_type``（它属于 ``WorkerResult``），
-    # 而 ``AggregatedFinding.sources`` 恰恰要回答「哪几个 Worker 报了它」。
-    # 第一次写这里时按直觉用了 ``list[Finding]``，mypy 当场指出来。
-    groups: dict[str, list[tuple[WorkerType, Finding]]] = {}
-    for result in results:
-        # 失败的结果没有 findings（``WorkerResult.failed`` 不产出），
-        # 但别假设它 —— 契约允许 partial 带 findings 同时带 error。
-        for finding in result.findings:
-            groups.setdefault(fingerprint(finding), []).append((result.worker_type, finding))
 
-    merged = [_representative(members) for members in groups.values()]
+    簇怎么划在 ``cluster.py``；这里只管选代表、排序、写统计量。
+    """
+    merged = [_representative(members) for members in cluster_findings(results)]
     # 排序必须在**分档之前**：suppressed 也要按同样的顺序存，
     # 否则评测拿到的 suppressed 列表顺序是哈希序 —— 而它是用来人工抽查的。
     merged.sort(key=_sort_key)
+    # ``cluster_id`` 排在排序之后分配，因为它记的是**这个簇在报告里的位置**，
+    # 不是发现的属性。提前分配会让它跟着输入顺序漂（三条结果从 Redis 来的
+    # 顺序不固定），于是同一份 diff 在不同机器上得到不同的 cluster_id。
+    for index, finding in enumerate(merged):
+        finding.cluster_id = index
     return merged
 
 

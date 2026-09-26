@@ -348,6 +348,21 @@ comment id 写回了库 —— 顺带证明「发出去但没记住」能自愈�
 根本没读到那个密钥。**验证配置类功能的实验，要先确认配置真的进去了**
 （`/api/health` 的 `config` 回显就是干这个的）。
 
+**`python tasks.py review` 验证的是镜像还是工作区，取决于 orchestrator 容器开没开。**
+本地的 `python -m sfly_orchestrator` 和 orchestrator 容器消费的是**同一条
+bootstrap 流、同一个消费者组**，而 Redis 只把消息投给组里的一个成员 ——
+容器开着时，那个 run 很可能整个被容器处理掉，跑的是**上一次
+`docker compose build` 的镜像**。M9 实测踩到：加完聚类跑 `review`，报告里
+`cluster_id` 全是 `null`，看起来像聚类没生效，其实是那份报告由容器里的旧代码
+产出，工作区的新代码一行都没执行 —— 而容器跑得好好的，**没有任何东西会报错**。
+靠的是"看起来对不上"才发现的。
+所以 `review` 现在会检查容器在不在，在就拒绝并给出两条出路
+（`docker compose stop orchestrator` / `--allow-container`）。
+**注意 `review` 的文档以前把这条说反了**：Worker 容器同时开着确实无所谓
+（三条 lane 是同一批消费者组，那是分担负载），但 orchestrator 容器不是 Worker。
+**验证代码类改动的实验，先问「被验证的是哪一份代码」** —— 和上面那条确认
+「配置有没有进去」是同一族问题。
+
 **本地 venv 装了全部 workspace 包，所以「缺依赖」在本地测不出来。**
 `uv sync --all-packages` 让 `import sfly_agent` 在开发机上永远成功，
 而 `apps/api/pyproject.toml` 里根本没有那个依赖 —— 容器里才发现

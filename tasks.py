@@ -518,18 +518,64 @@ def cmd_typecheck(_: argparse.Namespace) -> None:
 # -- 演示 ------------------------------------------------------------------- #
 
 
+def _container_orchestrator_is_running() -> bool:
+    """``orchestrator`` 容器是不是正在跑。
+
+    **任何异常都当成「没在跑」**：这条检查的目的是提醒，不是安全。
+    它自己出问题（docker 没装、compose 文件读不了）时把一个本来能跑的命令
+    拦下来，是把一个提醒变成了一个新的故障点。
+    """
+    try:
+        result = _compose("ps", "--status", "running", "--services", capture=True)
+    # 故意吞掉所有异常 —— 见 docstring：检查失败不该阻断一条本来能跑的命令。
+    except Exception:
+        return False
+    return "orchestrator" in result.stdout.split()
+
+
+def _refuse_if_container_orchestrator() -> None:
+    """挡住一个**看起来通过了、其实什么都没验证**的实验。
+
+    本地 ``python -m sfly_orchestrator`` 和 orchestrator 容器消费的是同一条
+    bootstrap 流、同一个消费者组 —— Redis 只会把消息投给组里的**一个**成员。
+    所以容器开着的时候跑 ``tasks.py review``，那个 run 很可能整个被容器处理掉，
+    而容器里跑的是**镜像里的代码**（上一次 ``docker compose build`` 的产物），
+    不是你正在改的工作区。
+
+    这个坑是实测踩到的：M9 加完聚类后跑 ``review``，报告里 ``cluster_id``
+    全是 ``null`` —— 看起来像聚类没生效，实际是那份报告由容器里的旧代码产出，
+    工作区里的新代码一行都没执行。**没有任何东西会报错**，因为容器跑得很好。
+
+    同一类陷阱在 CLAUDE.md 里已经记过一条（``docker compose`` 的命令行环境变量
+    不进容器）：验证配置类或代码类的改动之前，先确认**被验证的到底是哪一份代码**。
+    """
+    if not _container_orchestrator_is_running():
+        return
+    _die(
+        "orchestrator 容器正在运行 —— 这个 run 可能会被它处理，于是你测的是镜像里的旧代码，\n"
+        "而不是当前工作区。两种改法：\n"
+        "  docker compose stop orchestrator    # 停掉容器，跑完再 start（推荐）\n"
+        "  python tasks.py review --allow-container   # 明确表示「我就是要看容器那份」",
+    )
+
+
 def cmd_review(args: argparse.Namespace) -> None:
     """M5 的端到端验收：一条 diff 走完整张图（Mock LLM）。
 
     **单进程形态**：图 + 协调协程 + 超时扫描器 + 三个 Worker 全在一个进程里，
     所以它证明的是「整条链路是通的」—— 分容器跑的时候「没出报告」有十几种可能
     （Worker 没起来、Redis 连错、消费者组没建…），单进程把变量全部固定，
-    只剩业务逻辑本身。Worker 容器同时开着也无所谓：三条 lane 加入的是同一批
+    只剩业务逻辑本身。**Worker 容器同时开着无所谓**：三条 lane 加入的是同一批
     消费者组，Redis 保证一条消息只投给组内一个成员，所以那是分担负载。
 
     仍然需要 Postgres 和 Redis 可达（``python tasks.py up postgres redis``）——
     它们不是「测试替身」，是这条链路的真实组成部分。
+
+    **但 orchestrator 容器开着就有所谓**（见 :func:`_refuse_if_container_orchestrator`）：
+    它和本进程抢同一条 bootstrap，而 Redis 只会把消息投给其中一个。
     """
+    if not args.allow_container:
+        _refuse_if_container_orchestrator()
     cmd = [_py(), "-m", "sfly_orchestrator", "--diff", args.diff]
     if not args.replay:
         # 不带 --new 时会复用同一个 run（幂等键 = repo:pr:head_sha）。
@@ -833,6 +879,13 @@ def build_parser() -> argparse.ArgumentParser:
         [
             (("--diff",), {"default": "fixtures/security_demo.diff", "metavar": "PATH"}),
             (("--replay",), {"action": "store_true", "help": "复用已有 run，验证幂等（默认每次新建）"}),
+            (
+                ("--allow-container",),
+                {
+                    "action": "store_true",
+                    "help": "orchestrator 容器开着时也照跑（那时处理这个 run 的可能是镜像里的代码）",
+                },
+            ),
         ],
     )
     add("web-install", cmd_web_install, "安装前端依赖")

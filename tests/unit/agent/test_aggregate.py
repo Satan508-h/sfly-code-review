@@ -90,8 +90,17 @@ def test_the_same_finding_from_two_workers_merges_into_one() -> None:
     assert merged[0].corroboration_count == 2
 
 
-def test_findings_that_differ_get_their_own_entry() -> None:
-    """措辞不同就**不合并** —— M5 只做指纹精确匹配。"""
+def test_a_cross_worker_paraphrase_still_yields_two_entries() -> None:
+    """**已知极限**：跨 Worker 的同义改写不会被合并。
+
+    这两句话说的是同一件事，但词面相似度只有 0.2 上下 —— 而阈值无论怎么调
+    都分不开它和「同一处代码上的两件不同的事」（两种分布在 0.29–0.87 上完全
+    重叠，见 ``cluster.py`` 的实测一节）。要真正解决得上 embedding，
+    而那会牺牲评测要的确定性。
+
+    写成测试是为了让这条限制**可见**：将来它被解决时这条会挂，
+    而挂掉正是在提醒「README 的已知限制那一节该改了」。
+    """
     merged = merge_findings(
         [
             result(
@@ -104,6 +113,48 @@ def test_findings_that_differ_get_their_own_entry() -> None:
         ]
     )
     assert len(merged) == 2
+
+
+def test_near_duplicates_with_line_drift_merge_into_one() -> None:
+    """M9 新增的能力：**措辞接近 + 行号漂移** → 合并成一条。
+
+    这一对是「指纹精确匹配」抓不到的典型 —— 行号落在两个桶里（10 → 13），
+    而措辞也只是接近而非相同。它正是聚类存在的理由。
+    """
+    merged = merge_findings(
+        [
+            result(
+                "t1",
+                findings=[
+                    finding(message="循环里逐个查询数据库，产生 N+1 次往返", line=10),
+                    finding(message="循环内逐个查询数据库，产生 N+1 次往返", line=13),
+                ],
+            )
+        ]
+    )
+
+    assert len(merged) == 1
+    assert merged[0].corroboration_count == 2
+
+
+def test_cluster_ids_are_assigned_after_sorting() -> None:
+    """``cluster_id`` 记的是**簇在报告里的位置**，所以排在排序之后分配。
+
+    提前分配会让它跟着输入顺序漂（三条结果从 Redis 来的顺序不固定），
+    于是同一份 diff 在不同机器上得到不同的 cluster_id ——
+    而前端和评测都拿它当稳定标识用。
+    """
+    findings = [
+        finding(message="A", category="sqli", line=10, severity=Severity.LOW),
+        finding(message="B", category="xss", line=20, severity=Severity.CRITICAL),
+        finding(message="C", category="secrets", line=30, severity=Severity.MEDIUM),
+    ]
+    forward = merge_findings([result("t1", findings=list(findings))])
+    backward = merge_findings([result("t1", findings=list(reversed(findings)))])
+
+    assert [f.cluster_id for f in forward] == [0, 1, 2]
+    assert [f.category for f in forward] == [f.category for f in backward]
+    assert [f.cluster_id for f in forward] == [f.cluster_id for f in backward]
 
 
 def test_a_single_workers_duplicate_is_not_counted_as_cross_worker() -> None:
