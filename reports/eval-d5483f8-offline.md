@@ -1,6 +1,6 @@
-# sfly 评测报告（离线层 · Mock LLM）· 66c36cf
+# sfly 评测报告（离线层 · Mock LLM）· d5483f8
 
-- 代码版本：`66c36cf`（**生成时工作区有未提交改动**，这份数字不一定精确对应上面那个 commit）
+- 代码版本：`d5483f8`（**生成时工作区有未提交改动**，这份数字不一定精确对应上面那个 commit）
 - 用例：30 个（rebuilt 10，injected 15，clean 5）
 - LLM：**Mock**（确定性正则扫描器，不产生任何模型调用，成本恒为 $0）
 - 命令：`python tasks.py eval`
@@ -43,6 +43,24 @@
 - 干净组：5 个用例，共发布 **1** 条发现 → 每个干净 PR 平均 0.20 条
 - 被置信度闸砍掉、但确实命中 ground truth：**3** 条（这就是那道闸的召回代价；它只入库不发布，所以不在上面几个数里）
 - 冲突裁决：0 次
+
+### 假阳性明细（**前 20 条**）
+
+这些是严格档下没认领到 ground truth 的发现 —— 而**它们不一定是错的**。
+评测集永远标不完：一条真的、但没被标注的问题，在这里也长得和假阳性一样。
+所以这一节不是装饰，它是「自动化指标到头了」那个位置的入口 ——
+精确率低的时候，**唯一能继续走的一步是逐条读它们**，然后回答一个问题：
+「这条如果出现在我的 PR 上，我愿不愿意看到它？」
+
+| # | 用例 | 位置 | 严重度 | 说了什么 |
+|---:|---|---|---|---|
+| 1 | `clean-pagination` | `app/orders.py:24` | medium | 无上限的查询：结果集大小由数据量决定，表一大就 OOM |
+| 2 | `inj-crypto` | `app/signing.py:16` | high | 请求的 URL 来自变量，若可控则可访问内网元数据等内部服务 |
+| 3 | `inj-secrets` | `app/client.py:13` | high | 请求的 URL 来自变量，若可控则可访问内网元数据等内部服务 |
+| 4 | `rebuilt-langgraph-limit-sqli` | `libs/checkpoint-sqlite/langgraph/checkpoint/sqlite/__init__.py:333` | medium | 循环里做字符串累加，每次都会复制整个已有字符串 |
+| 5 | `rebuilt-mistune-admonition-xss` | `src/mistune/directives/admonition.py:67` | medium | 循环里做字符串累加，每次都会复制整个已有字符串 |
+
+## 成本与延迟
 
 ## 置信度闸的阈值扫描
 
@@ -87,12 +105,12 @@
 | `inj-cmdi` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 0 ms |
 | `inj-crypto` | injected | 2 | 3 | 0 | 2 | 1 | 0 |  | 0 ms |
 | `inj-deser` | injected | 2 | 2 | 0 | 2 | 0 | 0 |  | 1 ms |
-| `inj-mutable-default` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 0 ms |
-| `inj-pathtraversal` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 0 ms |
+| `inj-mutable-default` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 1 ms |
+| `inj-pathtraversal` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 1 ms |
 | `inj-quadratic` | injected | 2 | 1 | 1 | 1 | 0 | 0 |  | 1 ms |
 | `inj-random` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 0 ms |
 | `inj-secrets` | injected | 2 | 2 | 0 | 1 | 1 | 0 |  | 1 ms |
-| `inj-sql-format` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 1 ms |
+| `inj-sql-format` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 0 ms |
 | `inj-sql-fstring` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 1 ms |
 | `inj-ssrf` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 1 ms |
 | `inj-style` | injected | 5 | 3 | 2 | 3 | 0 | 0 |  | 1 ms |

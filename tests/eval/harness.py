@@ -296,8 +296,13 @@ async def review_case_single_agent(
         log.warning("eval.baseline_failed", case=case.id, error=str(exc)[:200])
         result = failed_result(task_id, spec.worker_type, exc)
     wall_ms = int((time.perf_counter() - started) * 1000)
+    # ``planned`` 必须**只写它自己那一个 Worker**。写成 ``tuple(WorkerType)``
+    # 的话，聚合层会算出「有三个 Worker 没产出可用结果」，于是每个基线用例都被
+    # 标成降级 —— 而「降级」这一列是给「有 Worker 超时/报错」用的，
+    # 拿它去描述「本来就只有一个人干活」会让整列失去意义。
+    # （实测踩到过：基线的降级列显示 30/30，读起来像基线整个坏了。）
     return _finish_run(
-        case, [result], tuple(WorkerType), wall_ms, parsed.total_files, len(patches), truncated
+        case, [result], (spec.worker_type,), wall_ms, parsed.total_files, len(patches), truncated
     )
 
 
@@ -533,13 +538,23 @@ class Metrics:
         return ordered[index]
 
 
-def _tally(case: EvalCase, published: Sequence[Any]) -> tuple[Counts, Counts]:
+@dataclass(slots=True)
+class Tally:
+    strict: Counts
+    loose: Counts
+    #: 严格档下没认领到任何 ground truth 的那些**发现本身**。
+    #: 报告要能把它们印出来 —— 见 ``render_report`` 的「假阳性明细」一节。
+    false_positives: list[Any]
+
+
+def _tally(case: EvalCase, published: Sequence[Any]) -> Tally:
     """按一份**已发布的发现集合**算出两档混淆矩阵。
 
     **贪心认领**：每条发现最多认领一条 ground truth。不给这一步的话，
     同一个问题报三遍会被算成三次真阳性 —— 于是去重做得越差，精确率越高。
     """
     strict, loose = Counts(), Counts()
+    false_positives: list[Any] = []
     for is_strict, counts in ((True, strict), (False, loose)):
         unclaimed = list(case.expected)
         for finding in published:
@@ -552,8 +567,10 @@ def _tally(case: EvalCase, published: Sequence[Any]) -> tuple[Counts, Counts]:
                     break
             else:
                 counts.fp += 1
+                if is_strict:
+                    false_positives.append(finding)
         counts.fn += len(unclaimed)
-    return strict, loose
+    return Tally(strict=strict, loose=loose, false_positives=false_positives)
 
 
 def all_merged(run: CaseRun) -> list[Any]:
@@ -605,8 +622,9 @@ def score(runs: Sequence[CaseRun]) -> Metrics:
             m.clean_cases += 1
             m.clean_findings += len(published)
 
-        m.strict.add(_tally(run.case, published)[0])
-        m.loose.add(_tally(run.case, published)[1])
+        tally = _tally(run.case, published)
+        m.strict.add(tally.strict)
+        m.loose.add(tally.loose)
 
         for suppressed in run.report.suppressed:
             if any(_matches(e, suppressed, strict=False) for e in run.case.expected):
@@ -642,9 +660,9 @@ def threshold_sweep(runs: Sequence[CaseRun], thresholds: Sequence[float]) -> lis
             if run.case.group == "clean":
                 clean_cases += 1
                 clean_findings += len(kept)
-            run_strict, run_loose = _tally(run.case, kept)
-            strict.add(run_strict)
-            loose.add(run_loose)
+            run_tally = _tally(run.case, kept)
+            strict.add(run_tally.strict)
+            loose.add(run_tally.loose)
         rows.append(
             SweepRow(
                 threshold=threshold,
@@ -757,6 +775,15 @@ def render_report(
     def pct(value: float) -> str:
         return f"{value * 100:.1f}%"
 
+    # 逐条列出没认领到 ground truth 的发现。**报告里必须有这一节** ——
+    # 精确率是唯一一个「低下去之后无法靠自动化指标继续解释」的数字，
+    # 再往下只能逐条读它们。不印出来，那个动作就没有入口。
+    false_positives: list[tuple[str, Any]] = [
+        (run.case.id, finding)
+        for run in runs
+        for finding in _tally(run.case, run.report.findings).false_positives
+    ]
+
     # meta 里的一条**空串表示分段**：它之前的条目是项目符号，之后的是正文段。
     # 直接产出一行空的 ``- `` 会看起来像「有一项忘了填」。
     bullets: list[str] = []
@@ -832,6 +859,30 @@ def render_report(
         f"- 冲突裁决：{metrics.conflicts} 次",
         "",
     ]
+
+    if false_positives:
+        lines += [
+            "### 假阳性明细（**前 20 条**）",
+            "",
+            "这些是严格档下没认领到 ground truth 的发现 —— 而**它们不一定是错的**。",
+            "评测集永远标不完：一条真的、但没被标注的问题，在这里也长得和假阳性一样。",
+            "所以这一节不是装饰，它是「自动化指标到头了」那个位置的入口 ——",
+            "精确率低的时候，**唯一能继续走的一步是逐条读它们**，然后回答一个问题：",
+            "「这条如果出现在我的 PR 上，我愿不愿意看到它？」",
+            "",
+            "| # | 用例 | 位置 | 严重度 | 说了什么 |",
+            "|---:|---|---|---|---|",
+        ]
+        for index, (case_id, finding) in enumerate(false_positives[:20], start=1):
+            lines.append(
+                f"| {index} | `{case_id}` | `{finding.file}:{finding.line}` | "
+                f"{finding.severity.value} | {escape_cell(finding.message[:96])} |"
+            )
+        if len(false_positives) > 20:
+            lines.append(f"| … | | | | 另有 {len(false_positives) - 20} 条 |")
+        lines += [""]
+
+    lines += ["## 成本与延迟", ""]
 
     if sweep:
         lines += [
