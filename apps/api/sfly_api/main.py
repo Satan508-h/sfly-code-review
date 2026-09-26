@@ -11,6 +11,13 @@
 那些是编排层 ``plan`` 节点的职责。API 保持又薄又快，webhook 路径上只有
 一次数据库写和一次 XADD。
 
+**它有两种宿主形态**（``create_app`` 的 ``deps`` 参数决定）：
+
+* **自己当家**（完整模式，默认）：lifespan 开依赖、建表、管心跳，退出时关掉。
+* **做客**（精简模式）：宿主 ``sfly_lite`` 已经开好了这一切，并且**必须**是
+  同一份 —— 那个 ``InMemoryQueue`` 得同时被 API 和 ``GraphRunner`` 看见。
+  各开一套的后果见 ``create_app`` 的文档，它不会报错。
+
 路径约定：业务接口全部挂在 ``/api`` 下；``/healthz`` 留在根路径给容器探针。
 nginx（完整模式）做直通代理，所以本地和线上用的是同一套 URL。
 """
@@ -48,6 +55,20 @@ _heartbeat = Heartbeat()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    if getattr(app.state, "host_deps", False):
+        # **宿主模式**（精简模式）：这个 app 跑在别的进程里 —— 依赖、心跳、
+        # 日志、建表全部归宿主。这里一件事都不做。
+        #
+        # 尤其是**不能 close 依赖**：那个队列还活在同一个事件循环的另外几条
+        # 协程手里（GraphRunner / WorkerPool）。关掉它，图会在下一次派发时
+        # 报一个和「谁关的」毫无关系的错。
+        #
+        # 这段分支必须走在这个函数的**最前面**：下面每一行都是「自己拥有一套
+        # 进程级资源」的假设，包括那个模块级的 ``_heartbeat`` 单例。
+        log.info("api.ready", mode=get_settings().mode, deps="injected")
+        yield
+        return
+
     settings = get_settings()
     setup_logging(settings.log_level, settings.log_json)
     # HTTP 服务本来就有探针，心跳是给统一排查用的
@@ -75,7 +96,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await _heartbeat.stop()
 
 
-def create_app() -> FastAPI:
+def create_app(*, deps: Dependencies | None = None) -> FastAPI:
+    """建网关 app。
+
+    ``deps`` 留给**精简模式**：那个进程里 API 和编排器在同一个事件循环上，
+    它们必须看见**同一个队列对象**。让 lifespan 各开一套的后果不是报错，
+    而是 webhook 返回 202、然后什么都不会发生 —— 消息投进了 API 自己那个
+    ``InMemoryQueue``，而 ``GraphRunner`` 在另一个上游荡。两个队列都是好的，
+    各自也都「工作正常」，所以没有任何一层会报警。
+
+    完整模式（``deps=None``，也是默认）下生命周期归 lifespan 自己，
+    和 M0 以来的行为一模一样。
+    """
     settings = get_settings()
 
     app = FastAPI(
@@ -87,6 +119,13 @@ def create_app() -> FastAPI:
         redoc_url=None,
         openapi_url="/api/openapi.json",
     )
+
+    if deps is not None:
+        # 宿主模式：依赖接过来，并且**声明我们不是它的主人**。lifespan 靠这个
+        # 标记决定什么都不做（见那里）。写在 create_app 里而不是 lifespan 里，
+        # 是因为「依赖从哪来」是构造期的事实，不是运行期的判断。
+        app.state.deps = deps
+        app.state.host_deps = True
 
     # 完整模式下前端由 nginx 同源代理，用不上 CORS。
     # 精简模式下前端在 Vercel、后端在 Render，**必须**显式列出来，
