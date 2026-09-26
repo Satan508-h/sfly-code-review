@@ -29,7 +29,9 @@ from pathlib import Path
 
 import pytest
 from harness import (
+    CaseRun,
     Variant,
+    budget_from_env,
     load_cases,
     render_ablation,
     review_case,
@@ -40,6 +42,7 @@ from test_eval import _sha, _working_tree_is_dirty
 
 from sfly_shared.config import Settings
 from sfly_shared.contracts import WorkerType
+from sfly_shared.logging import get_logger
 
 pytestmark = pytest.mark.eval
 
@@ -56,27 +59,45 @@ STAGES: tuple[tuple[str, tuple[WorkerType, ...]], ...] = (
 
 @pytest.fixture(scope="module")
 def variants() -> list[Variant]:
-    """四档跑完。**整个模块共用一次** —— 真实层上这里是真金白银。"""
+    """四档跑完。**整个模块共用一次** —— 真实层上这里是真金白银。
+
+    预算**跨四档累加**（不是每档各给一份）：这一组总共要跑
+    ``30 × (1+1+2+3) = 210`` 次调用，四档各给一份上限会让真实上限变成四倍，
+    而「上限」这个词就不再描述任何东西了。超了就停在当前档，
+    后面几档不跑 —— 报告里那一档的数字缺失，比一个悄悄花超的账单好。
+    """
     cases = load_cases()
+    budget = budget_from_env()
     out: list[Variant] = []
+    spent = 0.0
+    logger = get_logger(__name__)
 
-    async def _sequential(coros: list[object]) -> list[object]:
-        return [await coro for coro in coros]  # type: ignore[misc]
+    def _run(awaitables: list[object]) -> list[CaseRun]:
+        """顺序跑完，累加花费；超预算就提前停下并返回已经跑完的部分。"""
 
-    baseline = asyncio.run(_sequential([review_case_single_agent(c) for c in cases]))
-    out.append(
-        Variant(label="**单 Agent 基线**", metrics=score(baseline), calls=len(cases))  # type: ignore[arg-type]
-    )
+        async def _main() -> list[CaseRun]:
+            nonlocal spent
+            done: list[CaseRun] = []
+            for coro in awaitables:
+                run = await coro  # type: ignore[misc]
+                done.append(run)
+                spent += run.cost_usd
+                if spent >= budget:
+                    logger.warning("eval.ablation_budget_exhausted", spent=round(spent, 4))
+                    break
+            return done
+
+        return asyncio.run(_main())
+
+    baseline = _run([review_case_single_agent(c) for c in cases])
+    out.append(Variant(label="**单 Agent 基线**", metrics=score(baseline), calls=len(baseline)))
 
     for label, workers in STAGES:
-        runs = asyncio.run(_sequential([review_case(c, workers=workers) for c in cases]))
-        out.append(
-            Variant(
-                label=label,
-                metrics=score(runs),  # type: ignore[arg-type]
-                calls=len(cases) * len(workers),
-            )
-        )
+        if spent >= budget:
+            break
+        runs = _run([review_case(c, workers=workers) for c in cases])
+        out.append(Variant(label=label, metrics=score(runs), calls=len(runs) * len(workers)))
+    return out
     return out
 
 
@@ -86,13 +107,20 @@ def test_the_ablation_is_monotone_in_cost(variants: list[Variant]) -> None:
     看着像句废话，但它能抓住一类很隐蔽的错：``review_case`` 的 ``workers``
     参数被忽略（或者被默认值盖掉）时，四档跑的是同一个配置，
     而**每一档的数字都会正常显示**，曲线平得像一条直线而没有任何报错。
-    """
-    for label, workers in STAGES:
-        expected = len(load_cases()) * len(workers)
-        actual = next(v.calls for v in variants if v.label == label)
-        assert actual == expected, f"{label} 的调用次数不对：{actual} != {expected}"
 
-    calls = [v.calls for v in variants if v.label != "**单 Agent 基线**"]
+    超预算提前停下时，档数会少于 4 —— 那时只检查已经跑过的那几档，
+    但**必须至少两档**，否则这条测试什么也没验证。
+    """
+    cases = len(load_cases())
+    stages = [v for v in variants if v.label != "**单 Agent 基线**"]
+    assert len(stages) >= 2, f"只跑完 {len(stages)} 档，消融没有意义（多半是超预算）"
+
+    for variant in stages:
+        workers = next(w for label, w in STAGES if label == variant.label)
+        # 提前停止的档位会少跑几个用例，所以只要求「不超过」。
+        assert variant.calls <= cases * len(workers), f"{variant.label} 的调用次数超了"
+
+    calls = [v.calls for v in stages]
     assert calls == sorted(calls), f"调用次数没有随 Worker 数递增：{calls}"
 
 
@@ -115,13 +143,15 @@ def test_write_the_ablation_report(variants: list[Variant]) -> None:
     sha = _sha()
     dirty = _working_tree_is_dirty()
     provider = Settings().llm_provider
+    # 层名进文件名，理由见 ``test_eval.py`` 里的同一处。
+    layer_slug = "offline" if provider == "mock" else f"real-{provider}"
     lines = [
         f"# sfly 消融与基线报告 · {sha}",
         "",
         f"- 代码版本：`{sha}`" + ("（**生成时工作区有未提交改动**）" if dirty else "（生成时工作区干净）"),
         f"- 用例：{len(load_cases())} 个",
         f"- LLM：`{provider}`",
-        f"- 数据来源：与 `eval-{sha}.md` 同一批用例，配置不同",
+        f"- 数据来源：与 `eval-{sha}-{layer_slug}.md` 同一批用例，配置不同",
         "",
         "这四档之间**只有拓扑不同**：用例、规则库、`WorkerRunner`、聚合层逐字相同。",
         "所以表里的差值是拓扑带来的，不是实现差异带来的。",
@@ -157,7 +187,7 @@ def test_write_the_ablation_report(variants: list[Variant]) -> None:
     body = "\n".join(lines).rstrip() + "\n"
 
     REPORTS_DIR.mkdir(exist_ok=True)
-    path = REPORTS_DIR / f"eval-{sha}-ablation.md"
+    path = REPORTS_DIR / f"eval-{sha}-ablation-{layer_slug}.md"
     path.write_text(body, encoding="utf-8", newline="")
 
     print(f"\n消融报告写入 {path.relative_to(REPO_ROOT)}")

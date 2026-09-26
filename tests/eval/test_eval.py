@@ -314,7 +314,11 @@ def test_write_the_report(eval_runs) -> None:  # type: ignore[no-untyped-def]
     )
 
     REPORTS_DIR.mkdir(exist_ok=True)
-    path = REPORTS_DIR / f"eval-{sha}.md"
+    # **层名进文件名。** 两层跑的是同一批用例、同一个 sha，只按 sha 命名的话
+    # 后跑的那次会把先跑的覆盖掉 —— 而离线层那份是**可复现**的那一份，
+    # 恰恰是最不该丢的。名字里带层，两份就都能留在仓库里。
+    layer_slug = "offline" if is_mock else f"real-{provider}"
+    path = REPORTS_DIR / f"eval-{sha}-{layer_slug}.md"
     path.write_text(body, encoding="utf-8", newline="")
 
     print(f"\n报告写入 {path.relative_to(REPO_ROOT)}")
