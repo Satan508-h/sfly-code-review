@@ -1,0 +1,81 @@
+# Render Blueprint —— 精简模式的部署定义（一个容器跑完整个系统）。
+#
+# 用法：Render 控制台 → New → Blueprint → 选这个仓库 → Apply。
+# 它会读出下面的内容，只问你那几个**没有默认值**的变量（sync: false 的那些）。
+#
+# 「一套代码、两种拓扑」在这里是字面意义上的**同一个 Dockerfile**：
+# 不带任何 build arg 构建出来的就是精简模式（见 Dockerfile 里 ARG APP 那段），
+# 而容器里跑的是 orchestrator 容器和三个 worker 容器用的**同一批类**
+# （见 apps/lite/sfly_lite/__main__.py —— 那里一行都没有改）。
+#
+# 这个文件里每一个字段都是查证过的。**`dockerBuildArgs` 我查不到权威说明，
+# 所以没有用它** —— 猜错的后果是构建出一个只有 API、没有编排器和 Worker 的
+# 镜像：它接受 webhook、返回 202、然后永远不出报告，而表面上完全正常。
+# 宁可把默认值改成精简模式（Dockerfile 里写了理由），也不要赌一个没验证的字段。
+
+services:
+  - type: web
+    name: sfly-lite
+    runtime: docker
+    plan: free
+    # 离国内近一点。写错的话 Render 会在创建时直接报「无效区域」——
+    # 一个看得见的失败，不是静默的。
+    region: singapore
+    # 存活探针。它**故意不探依赖**（约定 #7）：数据库抖动时不该让容器被重启，
+    # 那只会让故障扩大。依赖状态在 /api/health 里看。
+    healthCheckPath: /healthz
+    autoDeploy: true
+
+    envVars:
+      # ---- 精简模式的三件事（其余全用默认值）------------------------------ #
+      - key: MODE
+        value: lite
+      # 进程内队列 + 进程内锁。**全代码库只有 sfly_bus/factory.py 读它们**
+      # （CLAUDE.md 约定 #4），所以换掉它们不会让任何业务代码走到另一条路上。
+      - key: QUEUE_BACKEND
+        value: memory
+      - key: LOCK_BACKEND
+        value: memory
+      - key: LOG_JSON
+        value: "true"
+      # PORT 由 Render 注入，**不要在这里写死** —— 写死会得到 502。
+
+      # ---- 成本闸（公网上的真钱）----------------------------------------- #
+      # 每天允许的真实模型调用次数，超了自动降级成扫描器（不是报错）。
+      # 一次审查三个 Worker，所以「每天 15 次审查」= 45 次调用。
+      - key: DAILY_LLM_CALL_BUDGET
+        value: "45"
+      - key: DAILY_LLM_COST_BUDGET_USD
+        value: "2.0"
+      # 关掉推理模型的思维链。**这个默认值救过一次线上**：开着的时候
+      # style 那一路会把整个输出预算用在思考上、正文一个字不写，而报告会
+      # 以「未发现问题」发布出去。实测数据在 .env.example 里。
+      - key: LLM_REASONING_EFFORT
+        value: none
+
+      # ---- 下面这些必须你自己填 ------------------------------------------ #
+      # sync: false = 创建时 Render 会在网页上问你要值，仓库里不存明文。
+
+      # Neon 的连接串。**用连接池端点**（带 -pooler 的那个主机名），
+      # 免费版超过 10 条并发连接会被拒。
+      - key: DATABASE_URL
+        sync: false
+      # DeepSeek 的 key
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_PROVIDER
+        value: deepseek
+      # 靶场仓库的 token，用来把审查评论发回去。
+      # **留空 = dry-run**：链路照样跑通、报告照样生成，只是不发请求。
+      - key: GITHUB_TOKEN
+        sync: false
+      # GitHub webhook 的签名密钥。**精简模式下这一项不能留空** ——
+      # 公网地址上没有验签的 webhook 入口等于把审查配额送人
+      # （api/routes/webhook.py 里会直接返回 503）。
+      - key: GITHUB_WEBHOOK_SECRET
+        sync: false
+      # 前端在 Vercel 的地址。**必须填**，否则浏览器的 CORS 会拦掉请求。
+      # 逗号分隔可以填多个（生产域名 + 预览域名）。
+      # 例：https://sfly.vercel.app
+      - key: CORS_ORIGINS
+        sync: false

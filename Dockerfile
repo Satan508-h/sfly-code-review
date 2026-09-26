@@ -44,7 +44,18 @@ COPY packages/shared/pyproject.toml      packages/shared/
 COPY packages/bus/pyproject.toml         packages/bus/
 COPY packages/agent-core/pyproject.toml  packages/agent-core/
 
-ARG APP=sfly-api
+# 默认目标是**精简模式**，而不是 api。这个默认值是给**不带参数**的构建用的，
+# 而全世界只有一个地方会那样构建：Render。它的 Blueprint 里能不能传
+# docker build args 我没有可验证的答案，而猜错的后果是**它构建出一个只有 API、
+# 没有编排器和 Worker 的镜像** —— 那个服务会接受 webhook、返回 202、
+# 然后永远不出报告，表面上一切正常。这正是本里程碑一直在防的那类失败，
+# 所以宁可让默认值指向唯一一个「不带参数构建有意义的场景」。
+#
+# 其余四个服务（api / orchestrator / workers）全部由 docker-compose 显式传
+# APP，一个都不受这个默认值影响（见 compose 里每个服务的 build.args）。
+# 手工构建它们时要带上参数：
+#   docker build --build-arg APP=sfly-api --build-arg APP_MODULE=sfly_api .
+ARG APP=sfly-lite
 
 # --no-install-workspace：只装第三方依赖，不装 workspace 成员自己 ——
 # 因为此刻成员目录里还没有源码。
@@ -68,7 +79,8 @@ ENV PATH="/app/.venv/bin:$PATH" \
 # 运行时
 # --------------------------------------------------------------------------- #
 
-ARG APP_MODULE=sfly_api
+# 和上面那个 ARG APP 同一个默认值，理由见那里。
+ARG APP_MODULE=sfly_lite
 
 # 非 root 运行。uid 固定，方便挂载卷时的权限排查。
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin sfly \

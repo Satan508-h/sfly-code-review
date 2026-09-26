@@ -543,6 +543,62 @@ def _set_env_var(name: str, value: str) -> None:
     path.write_text("\n".join(out) + "\n", encoding="utf-8", newline="")
 
 
+def _write_clipboard(text: str) -> None:
+    """把文本写进剪贴板。``_read_clipboard`` 的镜像操作。"""
+    if sys.platform == "win32":
+        # 走管道而不是命令行参数：参数会进进程列表，而这里传的是密钥。
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", "$input | Set-Clipboard"],  # noqa: S607 - powershell 在 PATH 里，写全路径反而更脆
+            input=text,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    elif _which("pbcopy"):
+        proc = subprocess.run(["pbcopy"], input=text, text=True, capture_output=True, check=False)  # noqa: S607
+    elif _which("xclip"):
+        proc = subprocess.run(
+            ["xclip", "-selection", "clipboard"],  # noqa: S607
+            input=text,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    else:
+        _die("找不到写剪贴板的工具。直接打开 .env，手动复制那一行的值。")
+    if proc.returncode != 0:
+        _die(f"写剪贴板失败（{proc.returncode}）。直接打开 .env 手动复制。")
+
+
+def cmd_copy_env(args: argparse.Namespace) -> None:
+    """把 ``.env`` 里某一项的值复制到剪贴板（**部署时往 Render 表单里粘**）。
+
+    它不打印任何东西 —— 值、长度、前缀都不打印，理由和 ``set-llm-key``
+    完全一样。跑完它去目标网页 Ctrl+V 就行。
+
+    **为什么要有这条命令**：部署时要把三个值填进 Render 的网页表单，
+    而手动打开 .env 复制很容易带上行尾的空格或者抄错行 —— 那种错误的表现是
+    「签名怎么都验不过」「token 无效」，排查方向会先跑偏到「值是不是过期了」。
+    """
+    name = args.name
+    path = ROOT / ".env"
+    if not path.exists():
+        _die("找不到 .env。先跑 python tasks.py env 生成一份。")
+    value = ""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(f"{name}="):
+            value = stripped[len(name) + 1 :].strip()
+            break
+    if not value:
+        _die(
+            f".env 里 {name} 是空的。要么它本来就不需要（比如不打算发评论时的 GITHUB_TOKEN），要么你还没填。"
+        )
+    _write_clipboard(value)
+    _ok(f"已把 {name} 的值复制到剪贴板（没有回显内容，也没有回显长度）")
+    print("  下一步：到需要它的那个网页表单里 Ctrl+V。", file=sys.stderr)
+
+
 def cmd_set_llm_key(_: argparse.Namespace) -> None:
     """把剪贴板里的 LLM key 写进 ``.env``。
 
@@ -924,6 +980,12 @@ def build_parser() -> argparse.ArgumentParser:
         ],
     )
     add("set-llm-key", cmd_set_llm_key, "把剪贴板里的 LLM key 写进 .env（不回显内容）")
+    add(
+        "copy-env",
+        cmd_copy_env,
+        "把 .env 里某一项的值复制到剪贴板（部署时往网页表单里粘，不回显内容）",
+        [(("name",), {"help": "变量名，例如 GITHUB_TOKEN"})],
+    )
 
     add(
         "stub-github",
