@@ -47,6 +47,9 @@ packages/
   shared/        sfly_shared — 领域契约（contracts.py）、配置、ID 生成、console 编码、
                  **diff.py**（unified diff 解析 —— 网关/编排器/Worker 三处共用，
                  所以它在这里。放在 agent-core 会让网关拖进整个 LLM 栈）
+                 **github_files.py** 同理：GitHub 的 /pulls/{n}/files 响应 → FilePatch，
+                 网关（读录制载荷）和编排器（读自己拉回来的）两个消费者
+                 必须用同一份实现
   bus/           sfly_bus — TaskQueue / RunStore / Lock 协议 + 两种实现
                  （锁和队列放在一起：memory.py 有 InMemoryQueue + InMemoryLock，
                    redis_streams.py 有 RedisStreamsQueue + RedisLock；
@@ -79,6 +82,11 @@ tests/           contracts/（两后端共用的契约，被 unit 与 integratio
 reports/         评测报告，提交进仓库。**层名在文件名里**：
                  `eval-<sha>-offline.md` / `-real-<provider>.md`，消融同理。
                  两层同 sha，只按 sha 命名会让后跑的覆盖先跑的
+docs/            DEPLOY.md —— 部署手册（Render / Vercel / Neon 六步 + 排查顺序），
+                 写给非技术读者。render.yaml 是它的可执行版本
+render.yaml      Render Blueprint（精简模式）。**不带任何 build arg** ——
+                 Dockerfile 的 ARG 默认值就是精简模式，理由见那里
+web/vercel.json  SPA 重写（前端用 createWebHistory，刷新深链接要它）
 ```
 
 **`tests/contracts/` 是「两种拓扑」这个卖点的证据本身**：`queue_contract.py`
@@ -535,6 +543,54 @@ M9 写评测集时撞出来两条正则对最地道的写法完全失效，两�
 （120 秒读超时），所以逐用例表和消融表都有自己的「降级」列。
 不标出来的话，最坏的情况是拿着一次网络抖动去讲模型的召回率。
 
+**推理模型的思维链会把输出预算整个吃掉，而报告会以「未发现问题」发布。**
+M10 实测（`deepseek-flash`）：`max_tokens` 同时管住思维链和正文，而它会先想后写。
+style 那一路在一个 4 文件的 PR 上想了 **28525 个字符**还没开始写正文 ——
+`completion_tokens=8192` / `reasoning_tokens=8192` / `content=""`。上游看到的
+现象只是「解析不出 JSON」，排查方向会全跑偏。**默认 `LLM_REASONING_EFFORT=none`**
+（量出来的：关掉之后三个 lane 都出得来、输出 token 只有约 1/3，performance
+反而找得更多 —— 审查要的是一份结构化列表，不是一道需要多步推理的题）。
+provider 层另有一条 `llm.empty_content` 日志把这个名字点出来。
+
+**空的 `findings` 数组在「之前出现过内容」时是丢失，不是「没有问题」。**
+同一次实测的另一半：截断的响应走修复阶梯，而修复提示词里那句「宁少勿多」会把
+模型推向一个空数组 —— 于是**一串本来可用的发现变成「未发现问题」**，而
+`status=ok`、`error=None`、报告不降级。判据在 `structured._empty_is_an_answer`：
+解析不出来、或者上一轮有过非空条目，都算「内容存在过」。反面也测了 ——
+真正干净的 PR 不能被标成降级，一个永远亮着的徽章等于没有徽章。
+
+**成本闸读的是数据库，不是进程内计数器。** 精简模式跑在 Render 免费档上，
+15 分钟没人访问就休眠、下次访问换一个进程 —— 内存计数器每天会被重置几十次，
+而它失败的方向是**多花钱**。计数还要**排除 Mock**（单价为零，算进去会让
+「今天还能花几次」因为「今天已经降级过一次」而变小）。查不到花费时按超预算
+处理（fail closed）：降级的代价只是一份来自扫描器的报告，而它是诚实的。
+
+**精简模式里 `create_app()` 的依赖必须注入，省掉它会得到一个「沉默的系统」。**
+lifespan 自己 `open_dependencies()`，于是 API 手里是**第二个 `InMemoryQueue`** ——
+webhook 投进那一条，`GraphRunner` 在另一条上等。实测：`HTTP 202 accepted`、
+打印了一个 task_id、健康检查全绿、而 `GET /api/runs` 是 `{"runs":[],"count":0}`。
+**唯一的可观察差异是一行日志**（`api.ready deps=injected` 对
+`api.ready mode=lite`）。测试断言的是「依赖**没有**被再开一套」（用调用即爆炸的
+替身），而不是「结果碰巧对」。
+
+**GitHub 的 `pull_request` 事件不带任何代码 —— 文件得自己去拉。**
+线上 `msg.file_patches` 永远是空的，而**拉不到 ≠ 没有可审的文件**：前者抛
+（重试到上限然后判 `failed`），后者标 `skipped`。归错就是把「我们根本没看到
+代码」说成「代码没有问题」，一份看起来完全正常的空报告。本地一直没暴露它，
+因为 fixture 是**录出来的**（`fixtures/webhook_live_pr.json` 是同一份载荷去掉
+`files` 的形态，也就是 GitHub 真正会发的东西）。转换函数 `patches_from_files`
+住在 `sfly_shared` —— 网关和编排器两个消费者**必须用同一份实现**，分叉的后果
+正是「回放时能审、真上线审不了」。
+
+**回收是 `queued` 的唯一恢复路径，而它以前没有调用者。** `GraphRunner` 失败时
+不 ack（注释里写着「等 reclaim 重投」），但 `reclaim` 只有 Worker 池在调
+（回收 `review_tasks`），**没有人回收 `review_bootstrap`** —— 而扫描器够不着
+`queued`（`due_runs` 的判据是 `deadline_at`，那一行是 `plan` 写的）。症状是
+**那个 run 再也不动了**：没有报错、没有日志、UI 上一直「排队中」。现在扫描器
+每轮**先回收再扫描**（它负责触发，实际重投归队列层）。两边实现的
+`_target_groups(None)` 早就写好了要覆盖 bootstrap，契约测试也断言了 —— 缺的
+只是那个调用者。
+
 **重建组的用例只接受「替换了代码」的修复。**
 回退一个纯新增的修复（只加了一段校验）会得到纯删除的 diff，而被删的行
 **没有可锚的位置** —— 审查报出的行号必须落在新增行上。这类提交做不成用例，
@@ -570,6 +626,16 @@ python tasks.py eval       # 评测集：30 个用例，**离线层**（Mock，$
 python tasks.py eval --real --budget 5   # 真实层（DeepSeek）。**会花钱**
                            # 没有 LLM_API_KEY 会在开跑前就退出，不会跑一半
 python tasks.py set-llm-key  # 把剪贴板里的 key 写进 .env（不回显内容与长度）
+python tasks.py copy-env GITHUB_TOKEN
+                             # 把 .env 里某一项的值复制到剪贴板（部署时往
+                             # Render 的网页表单里粘）。**同样不回显内容与长度**
+
+# 精简模式：一个进程跑完整个系统（Render 上跑的就是它，本地也用同一段代码）。
+# 需要一个 Postgres，**不需要 Redis**。用独立的库 —— 完整模式的 orchestrator
+# 容器会捞到这边建的 run（它的扫描器只看 deadline_at，不看是谁建的）。
+MODE=lite QUEUE_BACKEND=memory LOCK_BACKEND=memory \
+DATABASE_URL=postgresql://sfly:sfly@localhost:55432/sfly_lite \
+PORT=8010 LLM_PROVIDER=mock python -m sfly_lite
 python tasks.py demo-reclaim  # 队列容错演示：副本猝死 → 回收 → attempt=2（只要 Redis）
 python tasks.py stub-github   # 起 GitHub 桩（限流/422/分页），手工看退避重发
                               # **必须走 tasks.py**：那个脚本 import 了 apps/api 的
@@ -661,7 +727,10 @@ python tasks.py demo --follow --drop-after 3   # 断开重连，SSE 无缺口
       **两层都跑完**，四份报告在 `reports/`：真实层 30 个用例 ≈ $0.15 / 10 分钟，
       重建组（回退真实 CVE）精确率 76.9% / 召回率 100%，
       三 Worker 比单 Agent 多召回 12.1 个百分点
-- [ ] M10 — 精简模式 + Render / Vercel 部署
+- [ ] M10 — 精简模式 + Render / Vercel 部署。**代码这一半全部完成并验证过**：
+      单进程跑通（`python -m sfly_lite`）、成本闸、冷启动前端、线上那条路
+      （`plan` 自己去拉代码）、部署配置与 `docs/DEPLOY.md`。
+      **剩下的是账号那一半**：Render / Vercel / Neon 注册 + 线上验收
 - [ ] M11 — 可选：pgvector、LLM 冲突消解 A/B
 
 详细计划见 `~/.claude/plans/1-agent-pr-curried-unicorn.md`。
