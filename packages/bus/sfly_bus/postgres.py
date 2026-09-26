@@ -50,6 +50,7 @@ from sfly_shared.contracts import (
     DeliveryStatus,
     ErrorClass,
     Finding,
+    LlmSpend,
     ResultStatus,
     ReviewReport,
     RunEvent,
@@ -865,6 +866,47 @@ class PostgresRunStore:
         if row is None:  # pragma: no cover —— 聚合查询一定有一行
             return {}
         return {k: float(v) for k, v in row.items()}
+
+    async def llm_spend_since(self, since: datetime) -> LlmSpend:
+        """全表（不分 run）在 ``since`` 之后花掉的调用次数与钱。
+
+        **按 ``created_at`` 过滤，不按「自然日」**：``since`` 由调用方算好
+        （``__main__`` 里的 UTC 零点），因为「今天」在哪个时区是部署决定，
+        不是存储层的决定。写死 ``date_trunc('day', now())`` 会让这个函数
+        在 UTC 和本地时区两种理解之间摇摆，而线上跑在哪个时区取决于
+        Render 的区域设置 —— 那种差异只在月末对账时才看得出来。
+
+        ``count(*)`` 数的是**调用**不是 run：一次审查有三个 Worker，所以
+        「每天 15 次审查」对应的调用预算是它的三倍（见 ``.env.example``）。
+        数 run 需要 join ``review_runs``，而 ``llm_calls`` 刻意没有外键
+        （成本记录要比 run 活得久），join 会漏掉 CLI 手动跑的那些调用 ——
+        而那些**同样花钱**。
+
+        ``model NOT LIKE 'mock%'`` 那一条**不是多余的**：Mock 走的是和真实模型
+        同一条记账路径（单价为零，见 ``pricing.py`` 的 ``FREE``），所以它也会
+        在这张表里留下一行。不滤掉的话，一次「降级到扫描器」的审查会**吃掉
+        真实调用的配额** —— 于是「今天还能花多少次」这个数会因为「今天已经
+        降级过一次」而变小，而它描述的事情根本不是这个。日志里那句
+        ``spent_calls=4, budget_calls=1`` 读起来像是花了四次钱，而实际只有一次。
+
+        这个前缀在 Python 侧有对应物（``sfly_agent.llm.mock.is_mock_model``），
+        SQL 调不到它，所以这里是同一件事的第二个表述 —— 两处都改了才算改对。
+        """
+        async with self._pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                SELECT count(*)                            AS calls,
+                       coalesce(sum(cost_usd), 0)::float8 AS cost_usd
+                  FROM llm_calls
+                 WHERE created_at >= %s
+                   AND model NOT LIKE 'mock%%'
+                """,
+                [since],
+            )
+            row: dict[str, Any] | None = await cur.fetchone()
+        if row is None:  # pragma: no cover —— 聚合查询一定有一行
+            return LlmSpend()
+        return LlmSpend(calls=int(row["calls"]), cost_usd=float(row["cost_usd"]))
 
     # -- 清理 -------------------------------------------------------------- #
 

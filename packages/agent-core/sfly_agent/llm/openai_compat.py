@@ -40,6 +40,7 @@ class OpenAICompatLLM:
         base_url: str = "",
         temperature: float = 0.1,
         max_tokens: int = 4096,
+        reasoning_effort: str = "",
         connect_timeout_s: int = 10,
         read_timeout_s: int = 120,
         client: AsyncOpenAI | None = None,
@@ -48,6 +49,8 @@ class OpenAICompatLLM:
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        #: 空字符串 = **不发这个参数**。见 ``complete`` 里那段说明。
+        self.reasoning_effort = reasoning_effort
         self._client = client or AsyncOpenAI(
             api_key=api_key,
             base_url=base_url or None,
@@ -76,6 +79,12 @@ class OpenAICompatLLM:
         temperature: float | None = None,
     ) -> LLMResponse:
         started = time.perf_counter()
+        # ``reasoning_effort`` 只在配了的时候才发出去。**不能发一个空串** ——
+        # 严格一点的 provider 会直接 400，而那是一个只在特定配置下才出现的
+        # 启动期故障。空 = 不提这件事，让 provider 用它自己的默认值。
+        extra: dict[str, Any] = {}
+        if self.reasoning_effort:
+            extra["reasoning_effort"] = self.reasoning_effort
         try:
             response = await self._client.chat.completions.create(
                 model=self.model,
@@ -86,6 +95,7 @@ class OpenAICompatLLM:
                 temperature=self.temperature if temperature is None else temperature,
                 max_tokens=max_tokens or self.max_tokens,
                 response_format={"type": "json_object"},
+                **extra,
             )
         except APITimeoutError as exc:
             # 必须排在 APIConnectionError 前面 —— 它是后者的子类，
@@ -101,8 +111,14 @@ class OpenAICompatLLM:
     def _to_response(self, response: Any, started: float) -> LLMResponse:
         choice = response.choices[0]
         usage = response.usage
+        text = choice.message.content or ""
+        if not text:
+            # 正文一个字都没有 —— 只可能是「预算全花在思维链上」。
+            # 这是 M10 实测里最难查的一段：上游看到的是「解析不出 JSON」，
+            # 于是去查 JSON、查 prompt、查修复阶梯，而真正的原因在这一层。
+            _warn_if_reasoning_ate_the_budget(self.name, self.model, usage, choice.finish_reason)
         return LLMResponse(
-            text=choice.message.content or "",
+            text=text,
             model=response.model or self.model,
             tokens_in=getattr(usage, "prompt_tokens", 0) or 0,
             tokens_out=getattr(usage, "completion_tokens", 0) or 0,
@@ -135,6 +151,41 @@ def _cached_tokens(usage: Any) -> int:
     details = getattr(usage, "prompt_tokens_details", None)
     nested = getattr(details, "cached_tokens", None)
     return nested if isinstance(nested, int) else 0
+
+
+def _reasoning_tokens(usage: Any) -> int:
+    """思维链花掉的输出 token（``completion_tokens`` 的**子集**，不是另算的）。"""
+    details = getattr(usage, "completion_tokens_details", None)
+    nested = getattr(details, "reasoning_tokens", None)
+    return nested if isinstance(nested, int) else 0
+
+
+def _warn_if_reasoning_ate_the_budget(
+    provider: str, model: str, usage: Any, finish_reason: str | None
+) -> None:
+    """正文是空的，而预算被思维链吃光了 —— 把原因**说出来**。
+
+    M10 实测：``deepseek-flash`` 是推理模型，``max_tokens`` 同时管住思维链和
+    正文，而它会先想后写。style 那一路在一个 4 文件的 PR 上想了 **28525 个字符**
+    还没开始写正文，``completion_tokens=8192`` / ``reasoning_tokens=8192`` /
+    ``content=""``。上游看到的现象是「解析不出 JSON」，于是排查方向全在
+    JSON、prompt 和修复阶梯上，而真正的原因在这个字段里。
+
+    所以这里什么都不改，只**把名字点出来** —— 一行日志就能省掉那次排查。
+    """
+    reasoning = _reasoning_tokens(usage)
+    if not reasoning:
+        return
+    log.error(
+        "llm.empty_content",
+        provider=provider,
+        model=model,
+        reasoning_tokens=reasoning,
+        completion_tokens=getattr(usage, "completion_tokens", 0),
+        finish_reason=finish_reason,
+        hint="推理模型把输出预算全用在思维链上，正文一个字都没写。"
+        "把它关掉：LLM_REASONING_EFFORT=none（见 .env.example）",
+    )
 
 
 def _describe_status(provider: str, model: str, exc: APIStatusError) -> str:

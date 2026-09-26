@@ -406,6 +406,24 @@ def _placeholder_like(value: str) -> bool:
     return any(hint in lowered for hint in ("xxx", "your", "example", "sample", "dummy", "test", "1234"))
 
 
+#: 扫描器产出的模型名一律以它开头。降级（``FallbackLLM`` / ``BudgetedLLM``）
+#: 是在这个名字后面缀原因，不改前缀 —— 所以这个判定对三种形态都成立。
+MOCK_MODEL_PREFIX = "mock"
+
+
+def is_mock_model(model: str | None) -> bool:
+    """这条结果是不是扫描器产的。
+
+    **为什么判据是模型名而不是 ``LLM_PROVIDER``**：一个 run 的结果可能一部分
+    来自模型、一部分来自扫描器（配额在审查中途用完，三个 Worker 各有各的账），
+    而那时配置里的 provider 仍然是 ``deepseek``。所以判据只能落在**每条结果
+    自己**携带的那个字符串上，那是唯一一个跟着结果走的事实。
+
+    ``None`` 和空串都算「不是」：没填模型名是「不知道」，不是「扫描器」。
+    """
+    return model is not None and model.startswith(MOCK_MODEL_PREFIX)
+
+
 class MockLLM:
     """见模块文档。实现 ``LLMProvider`` 协议。"""
 

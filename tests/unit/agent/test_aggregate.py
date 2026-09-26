@@ -435,6 +435,55 @@ def test_a_worker_that_never_reported_is_missing() -> None:
     assert set(report.missing_workers) == {WorkerType.PERFORMANCE, WorkerType.STYLE}
 
 
+def test_a_report_from_the_scanner_says_so() -> None:
+    """三次上报全来自扫描器 —— 报告必须自曝。
+
+    这是「配额用完之后访客看到的东西仍然是诚实的」那句话的落点：扫描器的
+    finding 和模型的 finding 在报告里长得**一模一样**，唯一能区分的就是这个
+    标记，而它会一路传到前端徽章。
+
+    注意它和 ``degraded`` 是两件事：报告是**完整**的，只是来源不同。
+    混在一起会把「今天配额用完了」显示成「系统坏了」。
+    """
+    report = aggregate_run(_run(), [result("t1", worker_type=w) for w in WorkerType])
+
+    assert report.scanned_only is True
+    assert report.degraded is False
+
+
+def test_one_model_backed_worker_is_enough_to_not_call_it_scanned() -> None:
+    """一半模型、一半扫描器（配额在审查跑到一半时用完）→ **不是**扫描器报告。
+
+    判据只能落在每条结果自己的模型名上：那一刻配置里的 provider 仍然是
+    ``deepseek``，按它判断会得出「这份报告来自模型」—— 而其中两条不是。
+    """
+    results = [
+        result("t1", worker_type=WorkerType.SECURITY, model="deepseek-chat"),
+        result("t1", worker_type=WorkerType.PERFORMANCE),
+        result("t1", worker_type=WorkerType.STYLE),
+    ]
+
+    assert aggregate_run(_run(), results).scanned_only is False
+
+
+def test_a_failed_worker_does_not_hide_that_the_report_came_from_the_scanner() -> None:
+    """一个 Worker 失败了，另外两个来自扫描器 —— 仍然是扫描器报告。
+
+    失败结果没有模型名（它什么都没产出）。让它参与 ``all()`` 会把
+    ``scanned_only`` 拉成假，于是一份「每一条发现都来自扫描器」的报告
+    看起来像模型产的 —— 而访客没有任何办法分辨。
+    """
+    results = [
+        result("t1", worker_type=WorkerType.SECURITY),
+        result("t1", worker_type=WorkerType.PERFORMANCE),
+        WorkerResult.failed("t1", WorkerType.STYLE, "模型返回了没法解析的东西"),
+    ]
+    report = aggregate_run(_run(), results)
+
+    assert report.scanned_only is True
+    assert report.degraded is True, "没产出的那个 Worker 由这一栏说"
+
+
 def test_the_report_is_json_round_trippable() -> None:
     """报告要进 jsonb 列。``model_dump(mode="json")`` 是那条路径的入口 ——
     它必须能吃下全部字段（包括枚举和 datetime）。"""

@@ -60,6 +60,7 @@ from sfly_agent.aggregate.conflicts import resolve_conflicts
 from sfly_agent.aggregate.decision import decide
 from sfly_agent.aggregate.fingerprint import fingerprint
 from sfly_agent.aggregate.render import render_comment
+from sfly_agent.llm.mock import is_mock_model
 from sfly_shared.contracts import (
     SEVERITY_RANK,
     AggregatedFinding,
@@ -193,8 +194,8 @@ def aggregate_run(
     # 按「没有可用结果」来算就不依赖任何额外输入，也顺带覆盖了「Worker 上报了
     # 一条失败结果」那一类 —— 那种情况审查同样是不完整的，而它很容易被漏掉，
     # 因为屏障闭合得非常干净（三条结果都在，只是其中一条是 failed）。
-    usable = {r.worker_type for r in results if r.status is not ResultStatus.FAILED}
-    missing = [w for w in run.planned_workers if w not in usable]
+    reported = [r for r in results if r.status is not ResultStatus.FAILED]
+    missing = [w for w in run.planned_workers if w not in {r.worker_type for r in reported}]
 
     # **顺序不能换：先裁冲突，再去重。**
     # 反过来的话，聚类会按代表选举取「严重度更高的那条」，把「两个 Worker
@@ -235,6 +236,17 @@ def aggregate_run(
         # 有人改动 ``missing`` 的定义时留下来继续说话。
         degraded=bool(missing),
         missing_workers=missing,
+        # 「这次的发现是不是全都来自扫描器」。判据落在**每条结果自己的模型名**上，
+        # 而不是 ``LLM_PROVIDER`` —— 一个 run 可能一半来自模型、一半来自扫描器
+        # （配额在审查中途用完，三个 Worker 各有各的账），那时 provider 配置
+        # 仍然是 deepseek。所以只有「全部都来自扫描器」才算 ``scanned_only``：
+        # 只要有一条是模型产的，这份报告就不是「规则扫描器的结果」。
+        #
+        # **只看 ``reported``**：失败的结果没有模型名（它什么都没产出），
+        # 拿它参与 ``all()`` 会把一份全扫描器的报告拉成「有模型的报告」——
+        # 而那份报告里的每一条发现确实都来自扫描器。没产出结果的 Worker
+        # 由 ``degraded`` 那一栏说，不用在这里再说一次。
+        scanned_only=bool(reported) and all(is_mock_model(r.model) for r in reported),
         totals=_totals(results, run, cost_usd=cost_usd, now=now),
     )
 

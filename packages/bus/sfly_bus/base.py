@@ -31,6 +31,7 @@ from sfly_shared.contracts import (
     DeliveryRow,
     DeliveryStatus,
     ErrorClass,
+    LlmSpend,
     ReviewReport,
     RunEvent,
     RunRow,
@@ -510,6 +511,21 @@ class RunStore(Protocol):
         ...
 
     async def sum_costs(self, task_id: str) -> dict[str, float]: ...
+
+    async def llm_spend_since(self, since: datetime) -> LlmSpend:
+        """从 ``since`` 起花掉的调用次数与钱 —— 线上成本闸读它。
+
+        **为什么是从表里 SUM，而不是进程内一个计数器**：精简模式跑在 Render
+        免费档上，15 分钟没人访问就休眠、下次访问重新拉起进程。内存计数器
+        每天会被重置几十次，于是「每日上限」看起来在保护、实际不保护 ——
+        而它失败的方向是多花钱，没有任何东西会报警。
+
+        代价是**检查在花完之后**（``_record_cost`` 写在结果落库之后）：
+        最坏情况下会多花「同时在跑的 Worker 个数」次调用的钱。这个方向是
+        刻意选的 —— 反过来要在调用前预扣，就得处理「调用失败要退」，
+        而那是一条会写错的路径，代价还比多花几厘钱大。
+        """
+        ...
 
     # -- 清理 -------------------------------------------------------------- #
 

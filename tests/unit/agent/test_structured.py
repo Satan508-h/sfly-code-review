@@ -33,6 +33,15 @@ from sfly_shared.contracts import Finding, Severity
 # 辅助
 # --------------------------------------------------------------------------- #
 
+#: 被 ``max_tokens`` 砍在**第一条 finding 内部**的响应。这类残片一条都抢救
+#: 不出来（``salvage_truncated`` 只能救已闭合的条目），所以它表现为解析失败 ——
+#: 而它和「模型说没有问题」在旧的判断里长得一模一样。这才是 M10 实测撞到的形态。
+_CUT_INSIDE_FIRST_ITEM = (
+    '{"findings": [{"file": "app/api.py", "line": 12, "severity": "high", '
+    '"category": "secrets", "message": "硬编码的数据库密码被提交进了仓库，'
+    "任何能读代码的人都能拿到它，而且它会留在 git 历史里"
+)
+
 GOOD = json.dumps(
     {
         "findings": [
@@ -506,6 +515,79 @@ async def test_empty_findings_is_success_not_failure() -> None:
     assert out.ok
     assert out.items == []
     assert out.dropped == 0
+
+
+@pytest.mark.unit
+async def test_a_truncated_answer_that_collapses_to_empty_is_a_failure() -> None:
+    """**M10 实测撞到的那条静默失败。**
+
+    链条：响应被 ``max_tokens`` 砍断 → 修复调用收到残片 → 回一个
+    ``{"findings": []}``（修复提示词里那句「宁少勿多」正是在推它这么做）
+    → 一串本来可用的 findings 变成「未发现问题」，而 ``status=ok``、
+    ``error=None``、报告不降级。
+
+    实测的形态（线上那个 fixture，security Worker）::
+
+        notes : ["L3 修复调用 #1：解析不出 JSON（finish_reason='length'）"]
+        items : 0      ok: True      error: None
+        raw   : {"findings": []}
+        tokens: 2661 in / 4291 out
+
+    一份因为被砍断而丢掉全部发现的报告，最后以「未发现问题」发布出去 ——
+    这正是本项目最想防的那类失败：**没有任何一层会报错**。
+    """
+    llm = FakeLLM(_CUT_INSIDE_FIRST_ITEM, '{"findings": []}', finish_reason=("length", "stop"))
+
+    out = await complete_structured(llm, system="s", user="u", item_type=Finding, max_repairs=1)
+
+    assert not out.ok, "空数组出现在一次截断之后 —— 那是丢失，不是「没有问题」"
+    assert out.error is not None and "丢失" in out.error
+    assert len(llm.calls) == 2, "仍然要给它一次修复机会，而不是直接放弃"
+
+
+@pytest.mark.unit
+async def test_an_empty_answer_after_an_unparseable_one_is_also_a_failure() -> None:
+    """上一轮压根解析不出来时，「不知道里面有什么」按**有内容**算。
+
+    这条是同一个判断的另一个入口：没有截断标志，只是没法解析。判错的话
+    得到的是一个更隐蔽的版本 —— 连 ``finish_reason`` 那条线索都没有。
+    """
+    llm = FakeLLM("我发现了 3 个问题，先说第一个……", '{"findings": []}')
+
+    out = await complete_structured(llm, system="s", user="u", item_type=Finding, max_repairs=1)
+
+    assert not out.ok
+    assert "丢失" in (out.error or "")
+
+
+@pytest.mark.unit
+async def test_an_empty_answer_after_dropped_items_is_a_failure() -> None:
+    """上一轮有 3 条、全都格式不对 → 修复后说「没有问题」同样是丢失。
+
+    非空条目（哪怕一条都没通过校验）是「内容存在过」的证据 —— 上一轮有三条
+    东西，这一轮一条都没有，消失的那三条就是丢了。
+    """
+    bad = json.dumps({"findings": [{"nope": 1}, {"nope": 2}, {"nope": 3}]})
+    llm = FakeLLM(bad, '{"findings": []}')
+
+    out = await complete_structured(llm, system="s", user="u", item_type=Finding, max_repairs=1)
+
+    assert not out.ok
+
+
+@pytest.mark.unit
+async def test_a_clean_pr_is_not_punished_for_saying_nothing() -> None:
+    """反面：真正干净的 PR 不该被标成降级。
+
+    判据**不能**是「空数组一律可疑」—— 那会让降级徽章失去意义，最后没人再看它
+    （和一个永远亮着的报警灯一样没用）。``{"findings": {}}`` 是模型按文件分组、
+    而一个文件都没出问题时的形态，同样是合法的「没有问题」。
+    """
+    for text in ('{"findings": []}', '{"findings": {}}'):
+        out = await complete_structured(FakeLLM(text), system="s", user="u", item_type=Finding)
+
+        assert out.ok, text
+        assert out.items == []
 
 
 @pytest.mark.unit

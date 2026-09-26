@@ -729,6 +729,15 @@ class ReviewReport(_Contract):
     #: 有 Worker 失败或超时。前端显示降级徽章。
     degraded: bool = False
     missing_workers: list[WorkerType] = Field(default_factory=list)
+    #: 这次的发现全部来自**确定性扫描器**，不是模型（今日配额用完、
+    #: 或者 ``ENABLE_REAL_LLM=false``）。前端显示另一种徽章。
+    #:
+    #: **它和 ``degraded`` 是两件事，不能合并。** ``degraded`` 说的是
+    #: 「报告不完整」（有 Worker 没交结果），这里说的是「报告完整，但它的
+    #: 来源不是模型」。混在一起的后果是把「今天配额用完了」显示成「系统坏了」，
+    #: 而访客看到的是一份看起来完全正常的审查结果 —— 这正是要标出来的原因：
+    #: 扫描器的 finding 和模型的 finding 在报告里长得一模一样。
+    scanned_only: bool = False
     files_total: int = 0
     files_reviewed: int = 0
     diff_truncated: bool = False
@@ -814,6 +823,22 @@ class DeliveryRow(_Contract):
     def is_settled(self) -> bool:
         """已经了结了吗。未了结的投递可以被下一次重投接管。"""
         return self.status is not DeliveryStatus.RECEIVED
+
+
+class LlmSpend(_Contract):
+    """一段时间内花掉的模型调用 —— **线上成本闸的唯一输入**。
+
+    它是从 ``llm_calls`` 表 SUM 出来的，不是内存里的计数器：精简模式跑在
+    Render 免费档上，**15 分钟没人访问就休眠，下次访问重新拉起一个进程**。
+    用内存计数的话，那个「每日上限」每天会被重置几十次，看起来在保护，
+    实际不保护任何东西 —— 而它失败的方向是**多花钱**，没有任何东西会报警。
+
+    ``cost_usd`` 是 ``numeric`` 列 SUM 出来的，所以它是 ``Decimal`` 的字符串
+    形态。这里只当数字用（比较、展示），不参与需要精确到分的结算。
+    """
+
+    calls: int = 0
+    cost_usd: float = 0.0
 
 
 # --------------------------------------------------------------------------- #

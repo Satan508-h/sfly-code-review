@@ -23,7 +23,7 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpe
 
 from sfly_agent.llm.base import LLMResponse
 from sfly_agent.llm.mock import MockLLM
-from sfly_agent.llm.openai_compat import OpenAICompatLLM
+from sfly_agent.llm.openai_compat import OpenAICompatLLM, _reasoning_tokens
 from sfly_agent.llm.registry import FallbackLLM, MissingApiKeyError, build_llm
 from sfly_shared.config import Settings
 from sfly_shared.contracts import WorkerType
@@ -112,6 +112,82 @@ async def test_request_asks_for_a_json_object() -> None:
     llm, client = _llm()
     await llm.complete(system="你是审查助手", user="审查这段 diff")
     assert client.calls[0]["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.unit
+async def test_reasoning_effort_is_sent_when_configured() -> None:
+    """配了 ``reasoning_effort`` 就要真的发出去。
+
+    M10 实测：不关掉思维链的话，它能把整个输出预算吃掉、正文一个字不剩 ——
+    而那条路径的上游表现是「解析不出 JSON」，排查会从 JSON 和 prompt 开始，
+    离真正的原因很远。
+    """
+    llm, client = _llm(reasoning_effort="none")
+    await llm.complete(system="s", user="u")
+    assert client.calls[0]["reasoning_effort"] == "none"
+
+
+@pytest.mark.unit
+async def test_reasoning_effort_is_omitted_when_empty() -> None:
+    """留空 = **不发这个参数**，不是发一个空串。
+
+    发空串的后果是严格一点的 provider 直接 400，而那是一个只在特定配置下
+    才出现的启动期故障 —— 换 provider 的人会以为是密钥或地址错了。
+    """
+    llm, client = _llm()
+    await llm.complete(system="s", user="u")
+    assert "reasoning_effort" not in client.calls[0]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        (object(), 0),
+        (SimpleNamespace(), 0),
+        (SimpleNamespace(completion_tokens_details=None), 0),
+        (SimpleNamespace(completion_tokens_details=SimpleNamespace()), 0),
+        (SimpleNamespace(completion_tokens_details=SimpleNamespace(reasoning_tokens=1234)), 1234),
+    ],
+)
+def test_reasoning_tokens_tolerates_every_usage_shape(usage: object, expected: int) -> None:
+    """取不到就返回 0。
+
+    **这个函数在每一次空正文时都会被调用**，而各家 provider 的 ``usage``
+    形状并不统一（有的整个没有 ``completion_tokens_details``，有的那栏是
+    ``None``）。它抛一次异常，「模型没写正文」就变成「代码崩了」——
+    而后者会把排查方向带到完全无关的地方。
+    """
+    assert _reasoning_tokens(usage) == expected
+
+
+@pytest.mark.unit
+async def test_an_empty_content_that_was_eaten_by_reasoning_is_still_returned_as_empty() -> None:
+    """正文为空就如实返回空，**不编、不猜、也不抛**。
+
+    M10 实测的这个形态是推理模型最常见的失败：``completion_tokens=8192``
+    里 ``reasoning_tokens=8192``、``content=""``。这一层只负责如实上报，
+    「这是失败」由上层（修复阶梯 → 降级徽章）判断 —— 见
+    ``structured._empty_is_an_answer``。
+    """
+    usage = SimpleNamespace(
+        prompt_tokens=1859,
+        completion_tokens=8192,
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=8192),
+    )
+    response = _Response()
+    response.choices = [_Choice(_Msg(None), finish_reason="length")]
+    # usage 是「SDK 返回的原样对象」，形状由 provider 决定 —— 用 SimpleNamespace
+    # 正是为了证明这一层不去假设某个类（``_Usage`` 那个假对象是协议契约的形状，
+    # 而这里要的是**别的**形状）。
+    response.usage = cast("Any", usage)
+
+    llm, _client = _llm(response)
+    got = await llm.complete(system="s", user="u")
+
+    assert got.text == ""
+    assert got.truncated is True
+    assert got.tokens_out == 8192
 
 
 @pytest.mark.unit

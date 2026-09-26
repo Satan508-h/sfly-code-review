@@ -314,6 +314,34 @@ def extract_json(text: str) -> Extraction | None:
 # --------------------------------------------------------------------------- #
 
 
+def _empty_is_an_answer(*, content_seen: bool) -> bool:
+    """一个空的 ``findings`` 数组，是「模型认为没有问题」还是「内容丢了」？
+
+    **这是本模块最容易出错的一处判断，而两个方向都很贵。**
+
+    把它当成「没有问题」当成默认，会得到一种**最坏的静默失败**：模型被
+    ``max_tokens`` 砍断 → 修复调用收到残片后回一个 ``{"findings": []}``
+    （修复提示词里那句「宁少勿多」正是在推它这么做）→ 一串完整可用的
+    findings 变成「未发现问题」，``status=ok``、``error=None``、报告不降级。
+    M10 实测撞到过，用的就是线上那个 fixture：``tokens_out=4291``、
+    ``raw={"findings": []}``、``items=0``。
+
+    反过来一律当成「丢了」也不行：一个真正干净的 PR 会被标成降级，
+    而它本来就不该有任何发现 —— 那会让「降级」这个徽章失去意义，
+    最后没人再看它。
+
+    所以判据是**在此之前有没有见过内容**，两个可观察的信号：
+
+    * 上一轮**压根解析不出来** → 不知道里面有什么，按有内容算；
+    * 上一轮有**非空的条目**（哪怕它们全都没通过校验）→ 内容确实存在过。
+
+    被截断（``finish_reason='length'``）不用单独判：它必然表现为上面两种之一
+    （``salvage_truncated`` 会尝试抢救出已闭合的条目，一条都救不回来就是
+    解析失败）。两个信号都没有过，才认为这个空数组是真的。
+    """
+    return not content_seen
+
+
 def items_from_payload(payload: Any, key: str) -> tuple[list[Any], str]:
     """从 payload 里取出条目列表，顺带说明遇到的是哪种非标准形态。
 
@@ -461,6 +489,8 @@ async def complete_structured[T: BaseModel](
     last_text = ""
     problem = ""
     truncated = False
+    #: 「这一轮之前，模型有没有产出过内容」。见 :func:`_empty_is_an_answer`。
+    content_seen = False
 
     for attempt in range(max_repairs + 1):
         level_hint = "（修复后）" if attempt else ""
@@ -488,6 +518,9 @@ async def complete_structured[T: BaseModel](
 
         extraction = extract_json(last_text)
         if extraction is None:
+            # 解析不出来 = **不知道**里面原本有什么。按「有内容」记 —— 宁可
+            # 多花一次修复调用，也不要把一次丢失伪装成「没有问题」。
+            content_seen = True
             problem = f"解析不出 JSON{level_hint}（finish_reason={response.finish_reason!r}）"
             outcome.level = L4_GAVE_UP
             continue
@@ -511,15 +544,27 @@ async def complete_structured[T: BaseModel](
                 outcome.notes.append(f"逐元素校验丢弃 {len(errors)} 条")
             return outcome
 
+        # 这一轮看见了内容吗？见 :func:`_empty_is_an_answer`。
+        #
+        # 这里**不单独判 ``response.truncated``** —— 它是多余的：被砍断的响应
+        # 必然表现为下面两种之一（解析不出来，或者抢救出至少一条）。多写一个
+        # 不改变结果的条件，只会在将来有人改了抢救逻辑时留下来继续说话。
+        content_seen = content_seen or bool(raw_items)
+
         # 解析出来了但一条都没通过校验 —— 这值得一次修复调用，而且
         # 把校验错误发回给模型比说「重来一遍」有效得多。
         if not raw_items:
-            problem = f"{key} 数组是空的{level_hint}"
-            outcome.items = []
-            outcome.dropped = 0
-            outcome.error = None
-            outcome.latency_ms = int((time.perf_counter() - started) * 1000)
-            return outcome
+            if _empty_is_an_answer(content_seen=content_seen):
+                outcome.items = []
+                outcome.dropped = 0
+                outcome.error = None
+                outcome.latency_ms = int((time.perf_counter() - started) * 1000)
+                return outcome
+            problem = (
+                f"{key} 数组是空的{level_hint}，但在这之前模型已经产出过内容"
+                "（被截断或没法解析）—— 空数组是**丢失**，不是「没有问题」"
+            )
+            continue
         problem = f"全部 {len(raw_items)} 条都没通过校验：{errors[0] if errors else '未知'}"
 
     outcome.items = []

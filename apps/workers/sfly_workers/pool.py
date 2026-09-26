@@ -291,7 +291,11 @@ async def serve_spec(
     """
     s = settings or get_settings()
     owns_llm = llm is None
-    provider: LLMProvider = llm or llm_factory(s, worker_types=(spec.worker_type,))
+    # ``ledger=deps_store`` 是**线上成本闸的接线**。它无条件传进去，而不是
+    # 让调用方决定：忘了传的后果是「公网上的服务没有任何花费上限」，而那个
+    # 后果不会以任何方式表现出来 —— 直到账单。store 本来就握在手里，没有
+    # 任何理由不接。见 sfly_agent/llm/budget.py。
+    provider: LLMProvider = llm or llm_factory(s, worker_types=(spec.worker_type,), ledger=deps_store)
     runner = WorkerRunner(spec, provider, s)
 
     # **心跳不在这里起。** 它是「进程还活着吗」的信号，而进程的边界由宿主决定：
