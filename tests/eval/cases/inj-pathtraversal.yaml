@@ -1,0 +1,9 @@
+id: inj-pathtraversal
+group: injected
+origin: handcrafted
+note: 文件名直接拼进路径，../ 可以逃出附件目录。
+expected:
+  - file: app/files.py
+    line: 10
+    category: path_traversal
+    severity: high

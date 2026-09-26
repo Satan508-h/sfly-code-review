@@ -1,0 +1,24 @@
+diff --git a/app/session.py b/app/session.py
+--- /dev/null
++++ b/app/session.py
+@@ -0,0 +1,23 @@
++"""会话载荷的编解码。"""
++from __future__ import annotations
++
++import base64
++import pickle
++
++import yaml
++
++MAX_PAYLOAD = 4096
++
++
++def decode(raw: bytes) -> dict:
++    """把客户端带来的载荷解成字典。"""
++    if len(raw) > MAX_PAYLOAD:
++        raise ValueError("payload too large")
++    return pickle.loads(base64.b64decode(raw))
++
++
++def load_options(text: str) -> dict:
++    return yaml.load(text)

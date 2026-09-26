@@ -1,0 +1,17 @@
+diff --git a/app/backup.py b/app/backup.py
+--- /dev/null
++++ b/app/backup.py
+@@ -0,0 +1,19 @@
++"""数据库备份。"""
++from __future__ import annotations
++
++import os
++
++BACKUP_DIR = "/var/backups/sfly"
++
++
++def dump(target: str) -> int:
++    """把指定库导出到 BACKUP_DIR。"""
++    os.makedirs(BACKUP_DIR, exist_ok=True)
++    path = BACKUP_DIR + "/" + target + ".sql"
++    return os.system(f"pg_dump {target} > {path}")

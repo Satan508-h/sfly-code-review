@@ -1,0 +1,19 @@
+diff --git a/app/export.py b/app/export.py
+--- /dev/null
++++ b/app/export.py
+@@ -0,0 +1,21 @@
++"""审计日志导出。"""
++from __future__ import annotations
++
++from db import Session
++
++FORMAT = "csv"
++
++
++def all_events(session: Session) -> list[dict]:
++    """取出全部审计事件。"""
++    return session.query("SELECT * FROM audit_events").all()
++
++
++def event_count(session: Session) -> int:
++    return session.query("SELECT count(*) FROM audit_events").scalar()

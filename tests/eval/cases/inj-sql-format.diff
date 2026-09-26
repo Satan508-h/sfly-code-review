@@ -1,0 +1,17 @@
+diff --git a/app/search.py b/app/search.py
+--- /dev/null
++++ b/app/search.py
+@@ -0,0 +1,21 @@
++"""商品搜索。"""
++from __future__ import annotations
++
++from db import get_connection
++
++DEFAULT_LIMIT = 20
++
++
++def search(keyword: str, limit: int = DEFAULT_LIMIT) -> list[dict]:
++    conn = get_connection()
++    cursor = conn.cursor()
++    cursor.execute("SELECT id, name FROM products WHERE name LIKE '%{}%'".format(keyword))
++    return [dict(row) for row in cursor.fetchall()[:limit]]

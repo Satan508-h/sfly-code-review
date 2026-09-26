@@ -35,6 +35,7 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
     "unit: 无 Docker、无密钥，< 10s",
     "integration: 需要 Docker（testcontainers 或 compose 栈），用 Mock LLM",
+    "eval: 评测集（离线层用 Mock，真实层要密钥；`python tasks.py eval`）",
     "e2e: 需要真实 DeepSeek 密钥 + 真实 GitHub，手动/夜间跑，有花费上限",
 ]
 # 默认只跑单测。integration/e2e 必须显式 -m 选择 —— 这样 `pytest` 在

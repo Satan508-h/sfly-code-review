@@ -1,0 +1,9 @@
+id: inj-sql-fstring
+group: injected
+origin: handcrafted
+note: f-string 拼接 SQL，用户输入可直接改写查询语义。
+expected:
+  - file: app/reports.py
+    line: 13
+    category: sqli
+    severity: critical

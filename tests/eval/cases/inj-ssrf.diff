@@ -1,0 +1,22 @@
+diff --git a/app/preview.py b/app/preview.py
+--- /dev/null
++++ b/app/preview.py
+@@ -0,0 +1,21 @@
++"""链接预览。"""
++from __future__ import annotations
++
++import httpx
++
++TIMEOUT_S = 5.0
++MAX_BODY = 64 * 1024
++
++
++def fetch_title(url: str) -> str:
++    """抓取目标页面并抽出标题。"""
++    response = httpx.get(url, timeout=TIMEOUT_S, follow_redirects=True)
++    body = response.text[:MAX_BODY]
++    start = body.find("<title>")
++    if start < 0:
++        return ""
++    end = body.find("</title>", start)
++    return body[start + 7 : end].strip()

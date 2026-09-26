@@ -106,8 +106,13 @@ PATTERNS: tuple[_Pattern, ...] = (
         rule_id="sec-secrets-001",
         message="疑似把凭据硬编码在源码里，会随仓库永久留存",
         suggestion="改从环境变量读取，并轮换这个已经泄露的值",
+        # ``(?<![A-Za-z0-9])`` 而不是 ``\b``：**下划线是词字符**，所以 ``\b``
+        # 在 ``DB_PASSWORD`` / ``BILLING_API_KEY`` 里找不到边界 —— 而那正是
+        # 模块级常量最常见的写法，也就是硬编码凭据最常见的落点。
+        # 实测漏掉了整条规则：一个写满凭据的文件被判成干净。
+        # 现在只排除「前面紧挨着字母或数字」的情况（``mysecret`` 这类不吃）。
         regex=_rx(
-            r"\b(?:password|passwd|pwd|secret|api_?key|access_?key|auth_?token|client_?secret|private_?key)"
+            r"(?<![A-Za-z0-9])(?:password|passwd|pwd|secret|api_?key|access_?key|auth_?token|client_?secret|private_?key)"
             r"\s*[:=]\s*[\"'][^\"'\s]{8,}[\"']"
         ),
         lanes=SEC,
@@ -220,7 +225,20 @@ PATTERNS: tuple[_Pattern, ...] = (
         # 刻意**不含** fetchall：它说的是「把结果取回来」，而不是
         # 「查询没有边界」—— 一句 `LIMIT 10` 之后的 fetchall 是完全正确的写法，
         # 而单看这一行无法区分。`SELECT *` 和 ORM 的 .all() 才是真正的信号。
-        regex=_rx(r"\b(?:SELECT\s+\*|\.all\s*\(\s*\)|\.scalars\s*\()"),
+        #
+        # ``\b`` 必须写在**第一个分支里面**，不能写在分组外面。
+        # 写在外面时它会要求「匹配起点前是词边界」，而这个起点是 ``.``——
+        # 点号前面是空白（链式调用换行后最常见的样子）时**根本没有边界**，
+        # 于是后两个分支永远匹配不到：
+        #
+        #     session.query(...)        # 这一行匹配不到
+        #         .all()                # 这一行也匹配不到（被 \b 挡住）
+        #     q.all()                   # 这一行匹配得到（q 与 . 之间有边界）
+        #
+        # 也就是说，**最地道的那种写法恰好是唯一看不见的**。
+        # 实测是在写评测集时撞上的：一个 `.limit(20).all()` 链式分页被
+        # 判成「干净」，而同一句挤在一行里就能被认出来。
+        regex=_rx(r"(?:\bSELECT\s+\*|\.all\s*\(\s*\)|\.scalars\s*\()"),
         lanes=PERF,
         confidence=0.6,
         unless=("#", "count(", "limit", "LIMIT"),

@@ -1,0 +1,9 @@
+id: inj-cmdi
+group: injected
+origin: handcrafted
+note: 把库名插进 shell 命令，分号与反引号会被解释。
+expected:
+  - file: app/backup.py
+    line: 13
+    category: command_injection
+    severity: critical

@@ -1,0 +1,6 @@
+id: clean-client
+group: clean
+origin: handcrafted
+note: 上游客户端：地址来自配置、超时显式给出、状态码显式检查。
+expected:
+  []

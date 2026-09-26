@@ -1,0 +1,9 @@
+id: inj-sql-format
+group: injected
+origin: handcrafted
+note: 用 .format() 把关键词插进 LIKE 子句，等价于字符串拼接。
+expected:
+  - file: app/search.py
+    line: 12
+    category: sqli
+    severity: high

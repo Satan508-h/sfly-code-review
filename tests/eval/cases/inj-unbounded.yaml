@@ -1,0 +1,9 @@
+id: inj-unbounded
+group: injected
+origin: handcrafted
+note: 无上限查询：SELECT * 不加 limit，表一大就 OOM。
+expected:
+  - file: app/export.py
+    line: 11
+    category: unbounded_query
+    severity: medium

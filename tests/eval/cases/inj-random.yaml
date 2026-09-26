@@ -1,0 +1,9 @@
+id: inj-random
+group: injected
+origin: handcrafted
+note: 用非密码学随机数生成密码重置令牌。
+expected:
+  - file: app/tokens.py
+    line: 13
+    category: insecure_random
+    severity: high

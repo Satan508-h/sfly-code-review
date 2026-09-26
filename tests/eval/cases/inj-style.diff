@@ -1,0 +1,29 @@
+diff --git a/app/import_legacy.py b/app/import_legacy.py
+--- /dev/null
++++ b/app/import_legacy.py
+@@ -0,0 +1,25 @@
++"""从旧系统一次性导入数据。"""
++from __future__ import annotations
++
++from typing import Any
++
++
++def normalize(row: dict[str, Any]) -> dict[str, Any]:
++    """把旧字段名换成新字段名。"""
++    # TODO: 旧系统的 phone 字段混了国际区号，需要单独处理
++    if row.get("name") != None:
++        row["name"] = row["name"].strip()
++    try:
++        row["age"] = int(row["age"])
++    except:
++        row["age"] = 0
++    return row
++
++
++def import_rows(rows: list[dict[str, Any]]) -> int:
++    x = 0
++    for row in rows:
++        normalize(row)
++        x += 1
++    print(f"imported {x} rows")
++    return x

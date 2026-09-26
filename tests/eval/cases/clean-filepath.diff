@@ -1,0 +1,26 @@
+diff --git a/app/templates.py b/app/templates.py
+--- /dev/null
++++ b/app/templates.py
+@@ -0,0 +1,22 @@
++"""邮件模板的加载。"""
++from __future__ import annotations
++
++import os
++from enum import StrEnum
++
++TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "templates")
++
++
++class Template(StrEnum):
++    """允许的模板名。**文件名只能从这里来，不接受任意字符串。**"""
++
++    WELCOME = "welcome.txt"
++    RESET = "reset.txt"
++    INVOICE = "invoice.txt"
++
++
++def load(template: Template) -> str:
++    """读一个模板。路径由白名单枚举拼出，不含任何外部输入。"""
++    path = os.path.join(TEMPLATE_DIR, template.value)
++    with open(path, encoding="utf-8") as handle:
++        return handle.read()

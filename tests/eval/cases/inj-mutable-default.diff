@@ -1,0 +1,18 @@
+diff --git a/app/collector.py b/app/collector.py
+--- /dev/null
++++ b/app/collector.py
+@@ -0,0 +1,19 @@
++"""把多次调用收集到的条目攒成一批。"""
++from __future__ import annotations
++
++from typing import Any
++
++FLUSH_AT = 100
++
++
++def collect(item: dict[str, Any], batch: list[Any] = []) -> list[Any]:
++    """把 item 追加到 batch 上，攒够 FLUSH_AT 条就交给调用方。"""
++    batch.append(item)
++    if len(batch) >= FLUSH_AT:
++        return batch
++    return batch

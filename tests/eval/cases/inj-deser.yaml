@@ -1,0 +1,13 @@
+id: inj-deser
+group: injected
+origin: handcrafted
+note: 客户端载荷直接 pickle.loads；yaml.load 未指定 Loader。
+expected:
+  - file: app/session.py
+    line: 16
+    category: deserialization
+    severity: critical
+  - file: app/session.py
+    line: 20
+    category: deserialization
+    severity: high

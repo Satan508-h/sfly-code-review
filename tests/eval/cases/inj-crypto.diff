@@ -1,0 +1,20 @@
+diff --git a/app/signing.py b/app/signing.py
+--- /dev/null
++++ b/app/signing.py
+@@ -0,0 +1,22 @@
++"""回调请求的签名校验。"""
++from __future__ import annotations
++
++import hashlib
++
++import httpx
++
++TIMEOUT_S = 10.0
++
++
++def digest(payload: bytes) -> str:
++    return hashlib.md5(payload).hexdigest()
++
++
++def notify(url: str, payload: bytes) -> httpx.Response:
++    return httpx.post(url, content=payload, verify=False, timeout=TIMEOUT_S)

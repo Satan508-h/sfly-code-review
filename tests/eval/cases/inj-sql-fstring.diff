@@ -1,0 +1,22 @@
+diff --git a/app/reports.py b/app/reports.py
+--- /dev/null
++++ b/app/reports.py
+@@ -0,0 +1,22 @@
++"""按用户导出报表。"""
++from __future__ import annotations
++
++from db import get_connection
++
++COLUMNS = ("id", "title", "amount")
++
++
++def rows_for_user(user_id: str) -> list[tuple]:
++    """取出这个用户的全部报表行。"""
++    conn = get_connection()
++    cursor = conn.cursor()
++    cursor.execute(f"SELECT id, title, amount FROM reports WHERE owner = '{user_id}'")
++    return cursor.fetchall()
++
++
++def total_amount(user_id: str) -> float:
++    return sum(row[2] for row in rows_for_user(user_id))

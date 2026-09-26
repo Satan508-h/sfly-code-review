@@ -1,0 +1,9 @@
+id: inj-ssrf
+group: injected
+origin: handcrafted
+note: 目标 URL 由调用方给定，可指向内网元数据服务。
+expected:
+  - file: app/preview.py
+    line: 12
+    category: ssrf
+    severity: high

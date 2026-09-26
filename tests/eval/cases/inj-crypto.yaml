@@ -1,0 +1,13 @@
+id: inj-crypto
+group: injected
+origin: handcrafted
+note: 用 MD5 做签名摘要；TLS 校验被关掉。
+expected:
+  - file: app/signing.py
+    line: 12
+    category: crypto
+    severity: medium
+  - file: app/signing.py
+    line: 16
+    category: crypto
+    severity: high

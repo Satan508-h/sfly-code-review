@@ -1,0 +1,30 @@
+diff --git a/app/orders.py b/app/orders.py
+--- /dev/null
++++ b/app/orders.py
+@@ -0,0 +1,24 @@
++"""按页读取订单。"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from db import Session
++
++DEFAULT_PAGE_SIZE = 20
++MAX_PAGE_SIZE = 100
++
++
++@dataclass(frozen=True, slots=True)
++class Page:
++    offset: int
++    limit: int
++
++
++def page_of_orders(session: Session, page: Page) -> list[dict]:
++    """取一页订单。上限由调用方给的 Page 决定，不会一次拉全表。"""
++    rows = (
++        session.query("SELECT id, total FROM orders ORDER BY id")
++        .offset(page.offset)
++        .limit(page.limit)
++        .all()
++    )
++    return [dict(row) for row in rows]

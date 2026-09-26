@@ -1,0 +1,6 @@
+id: clean-filepath
+group: clean
+origin: handcrafted
+note: 正常的路径拼接：文件名来自白名单枚举，不含任何外部输入。测的是扫描器会不会把「os.path.join」一律当成路径穿越。
+expected:
+  []

@@ -1,0 +1,23 @@
+diff --git a/app/render.py b/app/render.py
+--- /dev/null
++++ b/app/render.py
+@@ -0,0 +1,23 @@
++"""把事件列表拼成一段可读的文本。"""
++from __future__ import annotations
++
++MAX_EVENTS = 500
++
++
++def describe(events: list[dict]) -> str:
++    """逐条追加，生成最终说明。"""
++    summary = ""
++    for event in events[:MAX_EVENTS]:
++        summary += f"{event['kind']}: {event['detail']}\n"
++    return summary
++
++
++def keywords(rows: list[list[str]]) -> list[str]:
++    out: list[str] = []
++    for index in range(len(rows)):
++        out.append(rows[index][0])
++    return out

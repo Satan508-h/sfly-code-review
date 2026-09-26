@@ -1,0 +1,9 @@
+id: inj-mutable-default
+group: injected
+origin: handcrafted
+note: 可变对象当默认参数，多次调用之间会共享同一个列表。
+expected:
+  - file: app/collector.py
+    line: 9
+    category: error_handling
+    severity: medium

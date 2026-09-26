@@ -49,6 +49,28 @@ async def _review(name: str, spec_name: str, **kwargs: object) -> list[dict[str,
     return list(json.loads(await _raw(name, spec_name, **kwargs))["findings"])
 
 
+def _patches_from(path: str, lines: list[str]) -> list[FilePatch]:
+    """把几行代码拼成一份最小 diff（新增文件）。
+
+    比往 ``fixtures/`` 里塞一个文件轻 —— 那些 fixture 是给人读的示例，
+    而这里要表达的是「某一行的写法」，塞进去反而让人以为它是一个用例。
+    """
+    body = "".join(f"+{line}\n" for line in lines)
+    text = f"diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{len(lines)} @@\n{body}"
+    return parse_unified_diff(text).patches
+
+
+async def _categories(patches: list[FilePatch], spec_name: str) -> set[str]:
+    """这份补丁会被报出哪些类目。"""
+    spec = spec_for(spec_name)
+    llm = MockLLM(worker_types=(spec.worker_type,))
+    response = await llm.complete(
+        system=build_system_prompt(spec.persona),
+        user=build_user_prompt(patches=patches, rules=[]),
+    )
+    return {str(f["category"]) for f in json.loads(response.text)["findings"]}
+
+
 # --------------------------------------------------------------------------- #
 # 确定性
 # --------------------------------------------------------------------------- #
@@ -193,6 +215,67 @@ async def test_n_plus_one_uses_the_loop_from_context_lines() -> None:
     assert len(n_plus_one) == 1
     assert n_plus_one[0]["file"] == "app/report.py"
     assert n_plus_one[0]["line"] == 10
+
+
+@pytest.mark.unit
+async def test_a_fluent_chain_split_across_lines_is_still_an_unbounded_query() -> None:
+    """链式调用换行写时也必须能被认出来。
+
+    ``unbounded_query`` 的 ``\\b`` 原本写在分组外面，于是它要求「匹配起点前
+    是词边界」—— 而起点是 ``.``，点号前面是空白时**没有边界**。后两个分支
+    （``.all()`` / ``.scalars()``）因此永远匹配不到，唯一能匹配的是 ``SELECT *``。
+
+    结果是**最地道的那种写法恰好是唯一看不见的**：同一句挤在一行里
+    （``q.all()``，字母与点之间有边界）认得出，换行写（``    .all()``）认不出。
+    M9 写评测集时撞上的：一个 ``.limit(20).all()`` 链式分页被判成「干净代码」。
+
+    这条测试盯的是**两个分支都活着**，所以两种写法各断言一次。
+    """
+    inline = _patches_from(
+        "app/a.py",
+        [
+            '    rows = session.query("SELECT id FROM t").all()',
+            "    return rows",
+        ],
+    )
+    chained = _patches_from(
+        "app/b.py",
+        [
+            "    rows = (",
+            '        session.query("SELECT id FROM t")',
+            "        .all()",
+            "    )",
+            "    return rows",
+        ],
+    )
+
+    for patches in (inline, chained):
+        categories = await _categories(patches, "performance")
+        assert "unbounded_query" in categories
+
+
+@pytest.mark.unit
+async def test_a_screaming_snake_constant_is_still_a_hardcoded_credential() -> None:
+    """``DB_PASSWORD = "..."`` 必须被认出来。
+
+    凭据检测原本用 ``\\b`` 打头，而**下划线是词字符** —— 于是它要求「``password``
+    前面是词边界」时，``DB_PASSWORD`` 里那个下划线不算边界，整条规则对
+    **全大写常量**完全失效。而那正是模块级常量最常见的写法，
+    也就是硬编码凭据最常见的落点：一个写满凭据的文件被判成干净。
+
+    同一类错误在 ``unbounded_query`` 上也有一份（``\\b`` 写在分组外面），
+    两条都是写评测集时才暴露出来的 —— 单纯的「能报出问题」的测试不会碰到它们，
+    因为它们测的恰好是**规则认不出来的写法**。
+    """
+    patches = _patches_from(
+        "app/settings.py",
+        [
+            'DB_PASSWORD = "Pr0d-Passw0rd-2024"',
+            'BILLING_API_KEY = "sk_live_9f4c2a7d8e1b6305"',
+        ],
+    )
+    categories = await _categories(patches, "security")
+    assert "secrets" in categories
 
 
 # --------------------------------------------------------------------------- #

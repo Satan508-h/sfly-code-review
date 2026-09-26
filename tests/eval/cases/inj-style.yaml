@@ -1,0 +1,25 @@
+id: inj-style
+group: injected
+origin: handcrafted
+note: 一次提交里同时留下：待办标记、== 比较 None、裸 except、单字母变量、print 残留。
+expected:
+  - file: app/import_legacy.py
+    line: 9
+    category: docs
+    severity: info
+  - file: app/import_legacy.py
+    line: 10
+    category: complexity_readability
+    severity: low
+  - file: app/import_legacy.py
+    line: 14
+    category: error_handling
+    severity: medium
+  - file: app/import_legacy.py
+    line: 20
+    category: naming
+    severity: low
+  - file: app/import_legacy.py
+    line: 24
+    category: dead_code
+    severity: low

@@ -1,0 +1,23 @@
+diff --git a/app/retry.py b/app/retry.py
+--- /dev/null
++++ b/app/retry.py
+@@ -0,0 +1,22 @@
++"""异步任务的重试包装。"""
++from __future__ import annotations
++
++import time
++
++MAX_ATTEMPTS = 5
++BASE_DELAY_S = 0.5
++
++
++async def with_backoff(call, *args, **kwargs):
++    """失败就退避重试，直到用尽次数。"""
++    last_error: Exception | None = None
++    for attempt in range(MAX_ATTEMPTS):
++        try:
++            return await call(*args, **kwargs)
++        except Exception as exc:
++            last_error = exc
++            time.sleep(BASE_DELAY_S * (2**attempt))
++    raise last_error

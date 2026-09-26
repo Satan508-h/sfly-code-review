@@ -1,0 +1,6 @@
+id: clean-paging-helper
+group: clean
+origin: handcrafted
+note: 纯函数：分页参数解析与收敛，全部带类型标注，异常收得干净。
+expected:
+  []

@@ -1,0 +1,17 @@
+diff --git a/app/tokens.py b/app/tokens.py
+--- /dev/null
++++ b/app/tokens.py
+@@ -0,0 +1,19 @@
++"""密码重置令牌。"""
++from __future__ import annotations
++
++import random
++import string
++
++TOKEN_LEN = 32
++ALPHABET = string.ascii_letters + string.digits
++
++
++def reset_token() -> str:
++    """生成一次性重置令牌。"""
++    return "".join(random.choice(ALPHABET) for _ in range(TOKEN_LEN))

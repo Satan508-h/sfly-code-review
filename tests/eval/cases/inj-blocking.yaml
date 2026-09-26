@@ -1,0 +1,9 @@
+id: inj-blocking
+group: injected
+origin: handcrafted
+note: 异步函数里用 time.sleep 退避，会卡住整个事件循环。
+expected:
+  - file: app/retry.py
+    line: 18
+    category: blocking_io
+    severity: high

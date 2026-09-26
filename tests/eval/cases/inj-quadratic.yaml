@@ -1,0 +1,13 @@
+id: inj-quadratic
+group: injected
+origin: handcrafted
+note: 循环里做字符串累加；循环条件里每轮重算长度。
+expected:
+  - file: app/render.py
+    line: 11
+    category: quadratic
+    severity: medium
+  - file: app/render.py
+    line: 17
+    category: repeated_work
+    severity: low

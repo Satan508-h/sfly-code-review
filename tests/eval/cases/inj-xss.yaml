@@ -1,0 +1,9 @@
+id: inj-xss
+group: injected
+origin: handcrafted
+note: 评论正文用 innerHTML 插入，未转义的输入可以执行脚本。
+expected:
+  - file: static/comment.js
+    line: 7
+    category: xss
+    severity: high

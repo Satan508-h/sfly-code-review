@@ -1,0 +1,30 @@
+diff --git a/app/validation.py b/app/validation.py
+--- /dev/null
++++ b/app/validation.py
+@@ -0,0 +1,27 @@
++"""注册表单的字段校验。"""
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++
++EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
++MIN_PASSWORD_LEN = 12
++
++
++@dataclass(frozen=True, slots=True)
++class Problem:
++    field: str
++    reason: str
++
++
++def check_email(email: str) -> Problem | None:
++    if not EMAIL_RE.match(email):
++        return Problem("email", "不是一个合法的邮箱地址")
++    return None
++
++
++def check_password(password: str) -> Problem | None:
++    if len(password) < MIN_PASSWORD_LEN:
++        return Problem("password", f"至少需要 {MIN_PASSWORD_LEN} 个字符")
++    return None

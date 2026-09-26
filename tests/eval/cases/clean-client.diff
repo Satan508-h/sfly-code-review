@@ -1,0 +1,29 @@
+diff --git a/app/upstream.py b/app/upstream.py
+--- /dev/null
++++ b/app/upstream.py
+@@ -0,0 +1,26 @@
++"""上游库存服务的客户端。"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++import httpx
++
++from app.settings import get_settings
++
++TIMEOUT_S = 3.0
++
++
++@dataclass(frozen=True, slots=True)
++class Stock:
++    sku: str
++    available: int
++
++
++def fetch_stock(sku: str) -> Stock:
++    """查一个 SKU 的可用量。地址来自配置，不是调用方给的。"""
++    settings = get_settings()
++    response = httpx.get(f"{settings.inventory_base_url}/stock/{sku}", timeout=TIMEOUT_S)
++    response.raise_for_status()
++    data = response.json()
++    return Stock(sku=sku, available=int(data["available"]))

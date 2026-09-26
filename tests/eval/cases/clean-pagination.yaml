@@ -1,0 +1,6 @@
+id: clean-pagination
+group: clean
+origin: handcrafted
+note: 正常的分页查询：上限由 Page 决定，链式 .limit().all()。测的是扫描器会不会把「.all()」一律当成无上限查询。
+expected:
+  []

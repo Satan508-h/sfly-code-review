@@ -1,0 +1,18 @@
+diff --git a/app/files.py b/app/files.py
+--- /dev/null
++++ b/app/files.py
+@@ -0,0 +1,20 @@
++"""上传附件的读取。"""
++from __future__ import annotations
++
++ATTACHMENT_DIR = "/srv/attachments"
++MAX_BYTES = 5 * 1024 * 1024
++
++
++def read_attachment(name: str) -> bytes:
++    """用户提交的文件名 -> 文件内容。"""
++    with open(f"{ATTACHMENT_DIR}/{name}", "rb") as handle:
++        data = handle.read(MAX_BYTES + 1)
++    if len(data) > MAX_BYTES:
++        raise ValueError("attachment too large")
++    return data

@@ -1,0 +1,6 @@
+id: clean-validation
+group: clean
+origin: handcrafted
+note: 表单校验：正则预编译、错误用返回值而不是异常传递。
+expected:
+  []
