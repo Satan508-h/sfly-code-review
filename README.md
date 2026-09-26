@@ -301,8 +301,11 @@ python tasks.py eval --real       # 真实模型（要 LLM_API_KEY，会花钱�
 python tasks.py set-llm-key       # 把剪贴板里的 key 写进 .env（不回显）
 ```
 
-报告**提交进仓库**，文件名带 git sha：`reports/eval-<sha>.md`（指标 + 阈值扫描）
-和 `reports/eval-<sha>-ablation.md`（消融 + 单 Agent 基线）。
+报告**提交进仓库**，文件名带 git sha **和层名**：
+`reports/eval-<sha>-offline.md` / `-real-<provider>.md`（指标 + 阈值扫描），
+以及 `...-ablation-<层>.md`（消融 + 单 Agent 基线）。
+层名必须在文件名里：两层跑的是同一批用例、同一个 sha，只按 sha 命名的话
+后跑的那次会覆盖先跑的 —— 而离线层那份是**可复现**的那一份，最不该丢。
 
 #### 评测集 30 条，三组量的是三种不同的东西
 
@@ -325,7 +328,7 @@ python tasks.py set-llm-key       # 把剪贴板里的 key 写进 .env（不回�
 > 纯新增的修复反转过来是纯删除，而被删的行没有可锚的位置（审查报出的行号
 > 必须落在新增行上）。这类提交做不成用例，不是「差点意思」，是根本没法用。
 
-#### 离线层的数字（`reports/eval-379b920.md`）
+#### 离线层的数字
 
 | 组 | 用例 | 期望 | 发布 | 严格精确率 | 严格召回率 |
 |---|---:|---:|---:|---:|---:|
@@ -1051,7 +1054,7 @@ DeepSeek 走 OpenAI 兼容接口，所以换成 OpenAI、vLLM 或本地模型只
 | 断点恢复 | `docker restart sfly-orchestrator-1` | 从 Postgres 的 checkpoint 续跑 |
 | Redis 重启不丢任务 | `docker restart sfly-redis` | 扫描器按 `attempt+1` 重派，消息排空 |
 | Postgres 不可达不丢结果 | `docker pause sfly-postgres` | 消息堆在 PEL 里；`unpause` 后排空（证明「先落库再 ack」的顺序，集成测试里有一条专门钉它） |
-| 质量可被度量 | `python tasks.py eval` | `reports/eval-<sha>.md`：精确率 / 召回率 / 误报率 / 单次成本 |
+| 质量可被度量 | `python tasks.py eval` | `reports/eval-<sha>-offline.md`：精确率 / 召回率 / 误报率 / 单次成本 |
 
 ---
 
@@ -1327,8 +1330,9 @@ python tasks.py eval --real --budget 5  # 真实层（DeepSeek，有硬上限）
 
 | 文件 | 内容 |
 |---|---|
-| `reports/eval-<sha>.md` | 指标、**置信度阈值扫描**、逐用例明细 |
-| `reports/eval-<sha>-ablation.md` | 1/2/3 Worker 消融 + 单 Agent 基线 |
+| `reports/eval-<sha>-offline.md` | 离线层：指标、**置信度阈值扫描**、逐用例明细 |
+| `reports/eval-<sha>-real-<provider>.md` | 真实层：同一批用例，真实模型 |
+| `reports/eval-<sha>-ablation-<层>.md` | 1/2/3 Worker 消融 + 单 Agent 基线 |
 
 **两层量的是不同的东西，不能混着引用：**
 

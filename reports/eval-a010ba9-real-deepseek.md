@@ -1,0 +1,143 @@
+# sfly 评测报告（真实层 · deepseek）· a010ba9
+
+- 代码版本：`a010ba9`（**生成时工作区有未提交改动**，这份数字不一定精确对应上面那个 commit）
+- 用例：30 个（rebuilt 10，injected 15，clean 5）
+- LLM：**deepseek**（真实调用）· 花费 $0.1547 / 上限 $2.00
+- 命令：`python tasks.py eval --real`
+
+**这份报告量的是模型在真实调用下的审查能力**，同时也覆盖了聚合层。数字会随模型版本、温度、以及 provider 侧的改动漂移 —— 所以它比离线层更接近真实，但**不可复现**，这是它的固有代价。
+
+## 总览
+
+| 指标 | 严格档 | 宽松档 |
+|---|---|---|
+| 真阳性 | 28 | 28 |
+| 假阳性 | 21 | 21 |
+| 漏报 | 5 | 5 |
+| **精确率** | **57.1%** | 57.1% |
+| **召回率** | **84.8%** | 84.8% |
+| F1 | 0.683 | 0.683 |
+| 严重度判对 | 19 | — |
+
+> 严格档 = 文件 + 类目 + 行号（±3 行内）全对；宽松档 = 文件 + 类目对，不看行号。
+> 差距说明的是「定位准不准」，而不是「有没有找到」。
+>
+> **上面这个总数只能当索引看** —— 三组量的是不同的东西，混在一起的数字取决于用例配比。分组数字在下一节。
+
+## 分组指标（**这才是有意义的那些数**）
+
+| 组 | 用例 | 期望 | 发布 | 严格精确率 | 严格召回率 | 被砍的真阳性 |
+|---|---:|---:|---:|---:|---:|---:|
+| `clean` | 5 | 0 | 1 | 0.0% | 0.0% | 0 |
+| `injected` | 15 | 23 | 35 | 51.4% | 78.3% | 2 |
+| `rebuilt` | 10 | 10 | 13 | 76.9% | 100.0% | 1 |
+
+读法（每一组的数字说明什么，差别很大）：
+
+* `injected` —— **离线层真正量的就是这一组**。用例是照着扫描器认得出的写法准备的，所以这里量的是**聚合层**（去重、置信度闸、冲突消解）对精确率和召回率的影响。
+* `rebuilt` —— 真实 CVE 修复回退出来的代码。**Mock 基本认不出它们**，因为它们是真代码，不是为正则准备的。这一组的低分说明的是**扫描器弱**，不是聚合层差；它的意义只有真实层才发挥得出来。
+* `clean` —— 误报。见下一节。
+
+## 误报与召回损失
+
+- 干净组：5 个用例，共发布 **1** 条发现 → 每个干净 PR 平均 0.20 条
+- 被置信度闸砍掉、但确实命中 ground truth：**3** 条（这就是那道闸的召回代价；它只入库不发布，所以不在上面几个数里）
+- 冲突裁决：0 次
+
+## 置信度闸的阈值扫描
+
+置信度门槛是**唯一一个纯策略数字**（其余都是量出来的），所以它不该靠猜。
+下表把同一批发现按不同阈值重切一遍 —— 不需要重跑审查，因为阈值只影响发布、不影响模型。
+
+| 阈值 | 发布条数 | 严格精确率 | 严格召回率 | F1 | 干净组每条 |
+|---:|---:|---:|---:|---:|---:|
+| 0.20 | 81 | 37.0% | 90.9% | 0.526 | 2.00 |
+| 0.25 | 75 | 40.0% | 90.9% | 0.556 | 1.60 |
+| 0.30 | 65 | 43.1% | 84.8% | 0.571 | 1.00 |
+| 0.35 **←当前** | 49 | 57.1% | 84.8% | 0.683 | 0.20 |
+| 0.40 | 42 | 59.5% | 75.8% | 0.667 | 0.00 |
+| 0.50 | 27 | 88.9% | 72.7% | 0.800 | 0.00 |
+| 0.60 | 22 | 95.5% | 63.6% | 0.764 | 0.00 |
+| 0.70 | 17 | 100.0% | 51.5% | 0.680 | 0.00 |
+
+> 读法：阈值调低会同时拉高召回和误报。**没有免费的档位** ——选哪一档取决于「漏掉一个真问题」和「多报一个假问题」哪个更贵，而那是产品决策，不是技术决策。
+
+## 成本与延迟
+
+| 项 | 值 |
+|---|---|
+| 用例数 | 30 |
+| Worker 数 | 3 |
+| 总成本 | $0.1547 |
+| 每 PR 成本 | $0.0052 |
+| 输入 / 输出 token | 157485 / 127478 |
+| 缓存命中率 | 88.9% |
+| 延迟 p50 / p95 | 18419 ms / 36610 ms |
+
+## 逐用例
+
+| 用例 | 组 | 期望 | 发布 | 被砍 | 严格命中 | 假阳 | 冲突 | 降级 | 耗时 |
+|---|---|---:|---:|---:|---:|---:|---:|---|---:|
+| `clean-client` | clean | 0 | 0 | 4 | 0 | 0 | 0 |  | 24902 ms |
+| `clean-filepath` | clean | 0 | 0 | 0 | 0 | 0 | 0 |  | 5638 ms |
+| `clean-pagination` | clean | 0 | 1 | 4 | 0 | 1 | 0 |  | 36610 ms |
+| `clean-paging-helper` | clean | 0 | 0 | 1 | 0 | 0 | 0 |  | 10242 ms |
+| `clean-validation` | clean | 0 | 0 | 1 | 0 | 0 | 0 |  | 16775 ms |
+| `inj-blocking` | injected | 1 | 2 | 1 | 1 | 1 | 0 |  | 16985 ms |
+| `inj-cmdi` | injected | 1 | 2 | 2 | 1 | 1 | 0 |  | 22763 ms |
+| `inj-crypto` | injected | 2 | 4 | 2 | 2 | 2 | 0 |  | 26418 ms |
+| `inj-deser` | injected | 2 | 3 | 0 | 2 | 1 | 0 |  | 15321 ms |
+| `inj-mutable-default` | injected | 1 | 3 | 1 | 0 | 3 | 0 |  | 20945 ms |
+| `inj-pathtraversal` | injected | 1 | 1 | 1 | 1 | 0 | 0 |  | 14014 ms |
+| `inj-quadratic` | injected | 2 | 0 | 3 | 0 | 0 | 0 |  | 21299 ms |
+| `inj-random` | injected | 1 | 2 | 0 | 1 | 1 | 0 |  | 9250 ms |
+| `inj-secrets` | injected | 2 | 4 | 1 | 2 | 2 | 0 |  | 16689 ms |
+| `inj-sql-format` | injected | 1 | 3 | 1 | 1 | 2 | 0 |  | 13950 ms |
+| `inj-sql-fstring` | injected | 1 | 3 | 4 | 1 | 2 | 0 |  | 26780 ms |
+| `inj-ssrf` | injected | 1 | 3 | 3 | 1 | 2 | 0 |  | 27050 ms |
+| `inj-style` | injected | 5 | 3 | 1 | 3 | 0 | 0 |  | 23245 ms |
+| `inj-unbounded` | injected | 1 | 1 | 1 | 1 | 0 | 0 |  | 18419 ms |
+| `inj-xss` | injected | 1 | 1 | 1 | 1 | 0 | 0 |  | 12153 ms |
+| `rebuilt-djangocms-editmode-xss` | rebuilt | 1 | 1 | 1 | 1 | 0 | 0 |  | 18036 ms |
+| `rebuilt-geopandas-sqli` | rebuilt | 1 | 1 | 0 | 1 | 0 | 0 |  | 12184 ms |
+| `rebuilt-gradio-open-redirect` | rebuilt | 1 | 1 | 1 | 1 | 0 | 0 |  | 38108 ms |
+| `rebuilt-langgraph-limit-sqli` | rebuilt | 1 | 3 | 2 | 1 | 2 | 0 |  | 21342 ms |
+| `rebuilt-mistune-admonition-xss` | rebuilt | 1 | 2 | 0 | 1 | 1 | 0 |  | 25459 ms |
+| `rebuilt-mistune-toc-xss` | rebuilt | 1 | 1 | 0 | 1 | 0 | 0 |  | 28366 ms |
+| `rebuilt-mlflow-mlserver-cmdi` | rebuilt | 1 | 1 | 0 | 1 | 0 | 0 |  | 18605 ms |
+| `rebuilt-nltk-entity-expansion` | rebuilt | 1 | 1 | 0 | 1 | 0 | 0 |  | 17313 ms |
+| `rebuilt-nltk-panlex-sqlite` | rebuilt | 1 | 1 | 0 | 1 | 0 | 0 |  | 15776 ms |
+| `rebuilt-unstructured-ssrf` | rebuilt | 1 | 1 | 1 | 1 | 0 | 0 |  | 24165 ms |
+
+## 用例说明
+
+- `clean-client`（clean）：上游客户端：地址来自配置、超时显式给出、状态码显式检查。
+- `clean-filepath`（clean）：正常的路径拼接：文件名来自白名单枚举，不含任何外部输入。测的是扫描器会不会把「os.path.join」一律当成路径穿越。
+- `clean-pagination`（clean）：正常的分页查询：上限由 Page 决定，链式 .limit().all()。测的是扫描器会不会把「.all()」一律当成无上限查询。
+- `clean-paging-helper`（clean）：纯函数：分页参数解析与收敛，全部带类型标注，异常收得干净。
+- `clean-validation`（clean）：表单校验：正则预编译、错误用返回值而不是异常传递。
+- `inj-blocking`（injected）：异步函数里用 time.sleep 退避，会卡住整个事件循环。
+- `inj-cmdi`（injected）：把库名插进 shell 命令，分号与反引号会被解释。
+- `inj-crypto`（injected）：用 MD5 做签名摘要；TLS 校验被关掉。
+- `inj-deser`（injected）：客户端载荷直接 pickle.loads；yaml.load 未指定 Loader。
+- `inj-mutable-default`（injected）：可变对象当默认参数，多次调用之间会共享同一个列表。
+- `inj-pathtraversal`（injected）：文件名直接拼进路径，../ 可以逃出附件目录。
+- `inj-quadratic`（injected）：循环里做字符串累加；循环条件里每轮重算长度。
+- `inj-random`（injected）：用非密码学随机数生成密码重置令牌。
+- `inj-secrets`（injected）：生产用的 API key 与数据库密码硬编码在源码里。
+- `inj-sql-format`（injected）：用 .format() 把关键词插进 LIKE 子句，等价于字符串拼接。
+- `inj-sql-fstring`（injected）：f-string 拼接 SQL，用户输入可直接改写查询语义。
+- `inj-ssrf`（injected）：目标 URL 由调用方给定，可指向内网元数据服务。
+- `inj-style`（injected）：一次提交里同时留下：待办标记、== 比较 None、裸 except、单字母变量、print 残留。
+- `inj-unbounded`（injected）：无上限查询：SELECT * 不加 limit，表一大就 OOM。
+- `inj-xss`（injected）：评论正文用 innerHTML 插入，未转义的输入可以执行脚本。
+- `rebuilt-djangocms-editmode-xss`（rebuilt，来源 `django-cms/django-cms@b56a5688`）：回退 CVE-2026-75526 的修复：异常消息又直接拼进 HTML 标题
+- `rebuilt-geopandas-sqli`（rebuilt，来源 `geopandas/geopandas@6aa8ef14`）：回退 CVE-2025-69662 的修复：Find_SRID 的三个参数又被 f-string 拼进 SQL
+- `rebuilt-gradio-open-redirect`（rebuilt，来源 `gradio-app/gradio@dfee0da0`）：回退 CVE-2026-28415 的修复：OAuth 回调又直接跳转到调用方给的地址
+- `rebuilt-langgraph-limit-sqli`（rebuilt，来源 `langchain-ai/langgraph@29724291`）：回退 CVE-2025-67644 的修复：LIMIT 又被 f-string 拼进查询
+- `rebuilt-mistune-admonition-xss`（rebuilt，来源 `lepture/mistune@a3cb6e56`）：回退 CVE-2026-59926 的修复：admonition 的 class 选项又未转义地拼进 HTML
+- `rebuilt-mistune-toc-xss`（rebuilt，来源 `lepture/mistune@04880a0`）：回退 CVE-2026-44898 的修复：目录锚点的 id 又未转义地拼进 href
+- `rebuilt-mlflow-mlserver-cmdi`（rebuilt，来源 `mlflow/mlflow@202fac4c`）：回退 CVE-2026-0596 的修复：模型 URI 又未加引号地拼进 shell 命令
+- `rebuilt-nltk-entity-expansion`（rebuilt，来源 `nltk/nltk@e91789c9`）：回退 CVE-2026-78681 的修复：XML 又用默认解析器解析，实体声明会展开
+- `rebuilt-nltk-panlex-sqlite`（rebuilt，来源 `nltk/nltk@bc007200`）：回退 CVE-2026-79674 的修复：SQLite 库文件又直接从调用方给的 root 下打开
+- `rebuilt-unstructured-ssrf`（rebuilt，来源 `Unstructured-IO/unstructured@445c9573`）：回退 CVE-2026-71428 的修复：调用方给的 URL 又直接交给 requests.get

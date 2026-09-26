@@ -76,7 +76,9 @@ tests/           contracts/（两后端共用的契约，被 unit 与 integratio
                  **住在 tests/ 而不是 infra/**：它的消费者只有测试和手工演示，
                  放进 infra/ 会被读成部署的一部分。`python tests/github_stub.py --port 8099`
                  就能让容器指着它跑，看真实的退避重试。
-reports/         评测报告，提交进仓库（`eval-<sha>.md` + `eval-<sha>-ablation.md`）
+reports/         评测报告，提交进仓库。**层名在文件名里**：
+                 `eval-<sha>-offline.md` / `-real-<provider>.md`，消融同理。
+                 两层同 sha，只按 sha 命名会让后跑的覆盖先跑的
 ```
 
 **`tests/contracts/` 是「两种拓扑」这个卖点的证据本身**：`queue_contract.py`
@@ -552,7 +554,7 @@ python tasks.py test-int   # 集成测试（需 Docker 里的 Redis + Postgres�
                            # Postgres 用 <库名>_test 且每次会话删掉重建）
 python tasks.py test-e2e   # 端到端（需真实密钥，会花钱，有 $2 上限）
 python tasks.py eval       # 评测集：30 个用例，**离线层**（Mock，$0，秒级）
-                           # → reports/eval-<sha>.md + eval-<sha>-ablation.md
+                           # → reports/eval-<sha>-{offline,real-*}[-ablation].md
 python tasks.py eval --real --budget 5   # 真实层（DeepSeek）。**会花钱**
                            # 没有 LLM_API_KEY 会在开跑前就退出，不会跑一半
 python tasks.py set-llm-key  # 把剪贴板里的 key 写进 .env（不回显内容与长度）
