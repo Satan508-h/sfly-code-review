@@ -31,6 +31,7 @@ from sfly_shared.contracts import (
     WorkerType,
     normalize_path,
 )
+from sfly_shared.errors import classify
 from sfly_shared.logging import bind_task, get_logger
 from sfly_workers.specs import WorkerSpec
 
@@ -236,6 +237,29 @@ class WorkerRunner:
             dropped_findings=dropped,
             attempt=attempt,
         )
+
+
+def failed_result(
+    task_id: str,
+    worker_type: WorkerType,
+    exc: BaseException,
+    *,
+    attempt: int = 1,
+) -> WorkerResult:
+    """把一次传输层故障翻译成一条 ``failed`` 结果。
+
+    **这是「失败也是结果」这条约定的落点**（CLAUDE.md 约定 #2）：不补这一条，
+    ``wait`` 节点的屏障永远闭合不了，整个 run 挂到超时 —— 而日志里只会留下
+    一条「Worker 报错」。
+
+    生产链路（``pool.py`` 的消费循环）和评测都调**这一个**函数。两处各写一遍
+    的话，评测测的就不是生产的那条路 —— 而它看起来完全一样（都是一条 failed
+    结果），所以那种分叉不会有任何信号。
+
+    ``CancelledError`` 由调用方拦在外面：它是停机信号，把它翻译成一条 failed
+    结果会让停机变成一次「失败的审查」。
+    """
+    return WorkerResult.failed(task_id, worker_type, str(exc), classify(exc), attempt=attempt)
 
 
 def _elapsed_ms(started: float) -> int:

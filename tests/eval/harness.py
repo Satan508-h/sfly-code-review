@@ -67,10 +67,12 @@ from sfly_shared.contracts import (
 from sfly_shared.diff import parse_unified_diff
 from sfly_shared.ids import new_task_id
 from sfly_shared.logging import get_logger
-from sfly_workers.runner import WorkerRunner
+from sfly_workers.runner import WorkerRunner, failed_result
 from sfly_workers.specs import SPECS, WorkerSpec, spec_for
 
 CASES_DIR = Path(__file__).parent / "cases"
+
+log = get_logger(__name__)
 
 #: 严格档的行号容忍度。**与 ``cluster.MAX_LINE_DRIFT`` 取同一个数** ——
 #: 系统认为「三行以内是同一处」，评测就该按同一个尺子量，
@@ -213,11 +215,29 @@ async def review_case(
             core_ids=spec.core_rule_ids,
             top_k=spec.top_k_rules,
         )
-        result = await WorkerRunner(spec, provider, s).review(
-            task_id=task_id,
-            patches=patches,
-            rules=rules,
-        )
+        try:
+            result = await WorkerRunner(spec, provider, s).review(
+                task_id=task_id,
+                patches=patches,
+                rules=rules,
+            )
+        except Exception as exc:
+            # **一次传输故障不该毁掉整轮评测。** 真实层上整轮要跑半小时、
+            # 要花钱，而一次 provider 超时（实测撞到过一次 120 秒不返回）
+            # 会把已经跑完的全部丢掉 —— 那既贵又什么都没学到。
+            #
+            # 走的是生产那条路：``failed_result`` 是「失败也是结果」
+            # （CLAUDE.md 约定 #2）的落点，消费循环用的是同一个函数。
+            # 于是这一条在报告里表现为**降级的 run**（``missing_workers``
+            # 里有它），而不是「模型没发现」——
+            # 这两件事在指标上看起来一模一样，所以报告里单独有一列标出来。
+            log.warning(
+                "eval.worker_failed",
+                case=case.id,
+                worker=worker_type.value,
+                error=str(exc)[:200],
+            )
+            result = failed_result(task_id, worker_type, exc)
         results.append(result)
 
     wall_ms = int((time.perf_counter() - started) * 1000)
@@ -266,11 +286,15 @@ async def review_case_single_agent(
 
     started = time.perf_counter()
     provider = llm or build_llm(s, worker_types=None)  # None = 三条 lane 都报
-    result = await WorkerRunner(spec, provider, s).review(
-        task_id=task_id,
-        patches=patches,
-        rules=rules,
-    )
+    try:
+        result = await WorkerRunner(spec, provider, s).review(
+            task_id=task_id,
+            patches=patches,
+            rules=rules,
+        )
+    except Exception as exc:
+        log.warning("eval.baseline_failed", case=case.id, error=str(exc)[:200])
+        result = failed_result(task_id, spec.worker_type, exc)
     wall_ms = int((time.perf_counter() - started) * 1000)
     return _finish_run(
         case, [result], tuple(WorkerType), wall_ms, parsed.total_files, len(patches), truncated
@@ -477,6 +501,10 @@ class Metrics:
     clean_findings: int = 0
     #: 被置信度闸砍掉、但其实命中了 ground truth 的条数 —— 召回损失归因
     suppressed_hits: int = 0
+    #: **有 Worker 没产出可用结果的用例数**（超时、报错）。
+    #: 单独记是因为它在指标上和「模型没发现」长得一模一样 ——
+    #: 不标出来的话，一次 provider 超时会被读成一次漏报。
+    degraded_cases: int = 0
 
     cost_usd: float = 0.0
     tokens_in: int = 0
@@ -571,6 +599,8 @@ def score(runs: Sequence[CaseRun]) -> Metrics:
         m.tokens_out += run.tokens_out
         m.cached_tokens += run.cached_tokens
         m.latencies.append(run.wall_ms)
+        if run.report.degraded:
+            m.degraded_cases += 1
         if run.case.group == "clean":
             m.clean_cases += 1
             m.clean_findings += len(published)
@@ -842,8 +872,8 @@ def render_report(
         "",
         "## 逐用例",
         "",
-        "| 用例 | 组 | 期望 | 发布 | 被砍 | 严格命中 | 假阳 | 冲突 | 耗时 |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| 用例 | 组 | 期望 | 发布 | 被砍 | 严格命中 | 假阳 | 冲突 | 降级 | 耗时 |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---|---:|",
     ]
     for run in runs:
         per = score([run])
@@ -851,7 +881,9 @@ def render_report(
             f"| `{run.case.id}` | {run.case.group} | {len(run.case.expected)} | "
             f"{len(run.report.findings)} | {len(run.report.suppressed)} | "
             f"{per.strict.tp} | {per.strict.fp} | "
-            f"{len(run.report.conflicts)} | {run.wall_ms} ms |"
+            f"{len(run.report.conflicts)} | "
+            f"{'⚠️ ' + ','.join(w.value for w in run.report.missing_workers) if run.report.degraded else ''} | "
+            f"{run.wall_ms} ms |"
         )
 
     lines += ["", "## 用例说明", ""]

@@ -217,7 +217,15 @@ def test_the_offline_numbers_are_reproducible() -> None:
     这是「确定性」这个设计目标唯一能被机器检查的形式。Mock LLM 是可复现的、
     聚合层是纯函数 —— 那么整条链路就应该是可复现的。挂掉说明有东西引入了
     非确定性（字典序、时间、随机数），而那种 bug 平时完全看不见。
+
+    **只在离线层跑。** 真实层上这条测试有两重错：它会把整批用例**再跑一遍**
+    （半小时、真金白银），而且模型本来就不保证可复现 —— 拿一条注定会挂的
+    断言去花掉一半预算，是把「严谨」用错了地方。真实层的不可复现是它的固有
+    代价，写在报告的元信息里，而不是当成一次失败。
     """
+    if Settings().llm_provider != "mock":
+        pytest.skip(f"真实层（{Settings().llm_provider}）不保证可复现，且重跑要再花一次钱")
+
     cases = load_cases()
     first = score(run_all(cases))
     second = score(run_all(cases))

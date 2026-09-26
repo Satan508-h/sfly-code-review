@@ -38,9 +38,8 @@ from sfly_shared.contracts import (
     TaskMessage,
     WorkerResult,
 )
-from sfly_shared.errors import classify
 from sfly_shared.logging import bind_task, get_logger
-from sfly_workers.runner import WorkerRunner
+from sfly_workers.runner import WorkerRunner, failed_result
 from sfly_workers.specs import SPECS, WorkerSpec
 
 log = get_logger(__name__)
@@ -100,9 +99,7 @@ async def process_one(
         # 注意这里只接 ``Exception``：CancelledError 必须继续往上走（停机信号），
         # 把它翻译成一条 failed 结果会让停机变成一次「失败的审查」。
         log.exception("worker.review_crashed", task_id=task.task_id, worker_type=worker_type.value)
-        result = WorkerResult.failed(
-            task.task_id, worker_type, str(exc), classify(exc), attempt=handle.attempt
-        )
+        result = failed_result(task.task_id, worker_type, exc, attempt=handle.attempt)
 
     await store.save_result(result)  # 1. 先落库
     await _record_result_event(store, result)
