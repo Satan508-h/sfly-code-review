@@ -56,6 +56,7 @@ packages/
   agent-core/    sfly_agent — LLM 抽象与结构化输出（含 pricing.py）、RAG、
                  state.py 图状态、risk.py 文件风险排序、labels.py 显示层标签、
                  aggregate/ 主 Agent 的聚合（全确定性、零 LLM 调用）、GitHub 客户端
+                 aggregate/ 的顺序是**裁冲突 → 聚类 → 置信度分档**，不能换（见下）
 web/             Vue 3 + Element Plus + Vite SPA（Pinia / vue-router）
                  lib/ 全是纯函数（格式化、分组、事件摘要）—— 前端值得测的就是这些
                  testing/mount.ts 是**唯一**的挂载入口，它让 Vue 警告判失败
@@ -63,14 +64,19 @@ web/             Vue 3 + Element Plus + Vite SPA（Pinia / vue-router）
 infra/           postgres init.sql、redis.conf、nginx 配置
 fixtures/        diff 样例、webhook payload、大 PR fixture
 scripts/         replay_webhook.py、measure_overhead.py、seed_db.py、demo_reclaim.py、
-                 record_pr_fixture.py（录真实 PR 成载荷）、replay_bootstrap.py（重投验闸）
+                 record_pr_fixture.py（录真实 PR 成载荷）、replay_bootstrap.py（重投验闸）、
+                 rebuild_case.py（**回退真实 CVE 修复**造评测用例，见下）
 tests/           contracts/（两后端共用的契约，被 unit 与 integration 同时导入）
-                 unit（无 Docker 无密钥）/ integration（需 Docker 里的 Redis）/ e2e / eval
+                 unit（无 Docker 无密钥）/ integration（需 Docker 里的 Redis）/ e2e
+                 eval/ 评测集与骨架。cases/ 是数据（30 条 yaml + diff），
+                 harness.py 复用**生产路径**（select_files → select_rules →
+                 WorkerRunner → aggregate_run），不重写任何审查逻辑。
+                 两层的区别与各自的读数见 harness.py 的模块文档。
                  github_stub.py —— GitHub API 的桩（限流 / 422 / 分页）。
                  **住在 tests/ 而不是 infra/**：它的消费者只有测试和手工演示，
                  放进 infra/ 会被读成部署的一部分。`python tests/github_stub.py --port 8099`
                  就能让容器指着它跑，看真实的退避重试。
-reports/         评测报告，提交进仓库
+reports/         评测报告，提交进仓库（`eval-<sha>.md` + `eval-<sha>-ablation.md`）
 ```
 
 **`tests/contracts/` 是「两种拓扑」这个卖点的证据本身**：`queue_contract.py`
@@ -461,6 +467,65 @@ ModuleNotFoundError」，而 pydantic 是 `sfly-shared` 的依赖，跟着成员
 `PostgresPool.ping()` / `RedisStreamsQueue.ping()` 因此都新开一条一次性连接，
 外面套 `asyncio.wait_for`，超时取消的是一条马上要销毁的连接，不牵连池子。
 
+**评测有两层，读数完全不同 —— 引用任何数字之前先问「这是哪一层」。**
+离线层用 Mock（确定性正则扫描器），量的是**聚合层**：聚类、去重、置信度闸、
+冲突消解。它**不量模型的审查能力**，因为这一层里没有模型。真实层量模型，
+但不可复现。所以：
+
+* 「精确率 90.5%」这句话单独说是**错的** —— 必须带「离线层 / 注入组 / 聚合层」。
+  干净组的误报率主要由扫描器一次只看一行的粗糙程度决定，**不能当系统的精确率**。
+* `rebuilt` 组在离线层基本认不出来（那是真代码，不是为正则准备的），
+  它的低分说明扫描器弱，不是聚合层差 —— 所以报告按组分开列。
+* 两层混在一个数里，得到的是一个**取决于用例配比**的数字，面试官一问就散。
+
+**`grounded` 的参照物是规则库，不是「这一轮检索到的规则」。**
+两者的名字很像，集合差十几倍（`top_k` 是 8，规则库 29 条）。
+拿后者当判据时，模型引用一条真实存在、只是没被检索到的规则会被当成幻觉清掉，
+于是少掉 `+0.10` 的加成、掉到 `SUPPRESS_THRESHOLD` 以下被砍 —— **而它哪里都不会
+显示出来**。M9 实测：注入组召回率 78.3% → 82.6%，重建组从一条真实 CVE 里找回了
+一条 SSRF。教训是通用的：**当一个判据的文档和代码用词不同（「规则库」vs「检索到
+的规则」），照代码读会觉得一切合理** —— 所以要读文档，并且让签名说人话
+（参数名从 `rules` 改成 `library_ids`）。
+
+**测「能发现问题」的测试，永远碰不到「规则认不出的写法」。**
+M9 写评测集时撞出来两条正则对最地道的写法完全失效，两条都是 `\b` 用错位置：
+
+* `unbounded_query` 把 `\b` 写在分组**外面** → 它要求「匹配起点前是词边界」，
+  而起点是 `.`，链式调用换行写时点号前面是空白、没有边界，于是两个分支
+  （`.all()` / `.scalars()`）永远匹配不到。同一句挤在一行里认得出，换行写认不出。
+* `secrets` 的 `\b` 让 `DB_PASSWORD` / `BILLING_API_KEY` 匹配不到 ——
+  **下划线是词字符**，所以边界不在那儿。而全大写常量正是硬编码凭据最常见的落点：
+  一个写满凭据的文件被判成干净。
+
+两条都有回归测试，而且都**测的是「换行写」「全大写」这些写法**，不是「能不能报」。
+写规则时照着这条问一句：我这条规则，最地道的那种写法它认得出吗？
+
+**冲突必须在聚类之前裁，败方要在聚类之前移除。**
+两处都不能换，两处都会静默出错：聚类按代表选举取「严重度更高的那条」，
+会顺手抹平「两个 Worker 对严重度有分歧」这件事（一条 CRITICAL 和一条 MEDIUM
+合成 CRITICAL，谁也不会问它俩当时是不是吵过）；而一条被裁决掉的声称**不是印证**，
+留着它会混进胜者的 `corroboration_count`，把一次分歧算成一次互相支持。
+聚类那边也为冲突让了路：**类目不同的两条永不合并** —— 同一位置上的不同类目是
+两件事（注入和命名可以同时成立），合并掉它就是丢掉一条真实发现。
+
+**聚类是近似重复过滤器，不是语义去重器 —— 这是量出来的，不是猜的。**
+在 19 对人工标注的措辞上，该合并的一档 0.289–0.917、不该合并的一档 0.000–0.870，
+**完全重叠，没有阈值能分开**：中文同义改写可以几乎不共享汉字，而模板化的不同问题
+会共享大量汉字。所以「跨 Worker 印证」比设想的稀薄得多。那条表征测试断言的是
+**缺陷的存在** —— 它将来被解决时会挂，而挂掉正是在提醒文档该改。
+
+**评测集存在的**主要**理由是那张阈值扫描表，不是那几个分数。**
+置信度门槛是系统里唯一一个纯策略数字（其余都是量出来的）。扫描用报告里已有的
+数据重切一遍，**不需要重跑审查**（阈值只影响发布，不影响模型）——
+这一点很关键：真实层跑一轮要花钱，而调一个阈值不该再付一次。
+`tests/unit/agent/test_cluster.py` 里的标注措辞对是同一类东西：
+它是聚类那一层唯一的 ground truth，所以宁可少而准。
+
+**重建组的用例只接受「替换了代码」的修复。**
+回退一个纯新增的修复（只加了一段校验）会得到纯删除的 diff，而被删的行
+**没有可锚的位置** —— 审查报出的行号必须落在新增行上。这类提交做不成用例，
+不是「差点意思」，是根本没法用。`scripts/rebuild_case.py` 会直接拒绝它。
+
 ---
 
 ## 常用命令
@@ -486,7 +551,11 @@ python tasks.py test       # 单测（无 Docker、无密钥；Linux/CI 约 2s�
 python tasks.py test-int   # 集成测试（需 Docker 里的 Redis + Postgres；Redis 用 db 15，
                            # Postgres 用 <库名>_test 且每次会话删掉重建）
 python tasks.py test-e2e   # 端到端（需真实密钥，会花钱，有 $2 上限）
-python tasks.py eval       # 评测集 → reports/eval-<sha>.md
+python tasks.py eval       # 评测集：30 个用例，**离线层**（Mock，$0，秒级）
+                           # → reports/eval-<sha>.md + eval-<sha>-ablation.md
+python tasks.py eval --real --budget 5   # 真实层（DeepSeek）。**会花钱**
+                           # 没有 LLM_API_KEY 会在开跑前就退出，不会跑一半
+python tasks.py set-llm-key  # 把剪贴板里的 key 写进 .env（不回显内容与长度）
 python tasks.py demo-reclaim  # 队列容错演示：副本猝死 → 回收 → attempt=2（只要 Redis）
 python tasks.py stub-github   # 起 GitHub 桩（限流/422/分页），手工看退避重发
                               # **必须走 tasks.py**：那个脚本 import 了 apps/api 的
@@ -574,7 +643,9 @@ python tasks.py demo --follow --drop-after 3   # 断开重连，SSE 无缺口
 - [x] M6 — FastAPI 网关（HMAC 验签 + 两层去重）+ runs 接口 + SSE 带 Last-Event-ID 补齐
 - [x] M7 — GitHub 客户端 + publish 节点（真实靶场 PR 上发过评论；两道防重复闸实测过）
 - [x] M8 — Vue SPA（列表 / 详情三标签 / 实时时间线 / 系统状态；66 条前端测试 + CI 的 web job）
-- [ ] M9 — 聚合硬化 + 评测集
+- [~] M9 — 聚合硬化（聚类 / 冲突 / 置信度）+ 30 条评测集 + 消融与基线。
+      离线层已出数（`reports/eval-*.md`）；**真实层那一次要 `LLM_API_KEY`**，
+      没跑之前不要引用「模型上的精确率/召回率」
 - [ ] M10 — 精简模式 + Render / Vercel 部署
 - [ ] M11 — 可选：pgvector、LLM 冲突消解 A/B
 
