@@ -1,6 +1,6 @@
-# sfly 评测报告（离线层 · Mock LLM）· 5b3ac66
+# sfly 评测报告（离线层 · Mock LLM）· 66c36cf
 
-- 代码版本：`5b3ac66`（**生成时工作区有未提交改动**，这份数字不一定精确对应上面那个 commit）
+- 代码版本：`66c36cf`（**生成时工作区有未提交改动**，这份数字不一定精确对应上面那个 commit）
 - 用例：30 个（rebuilt 10，injected 15，clean 5）
 - LLM：**Mock**（确定性正则扫描器，不产生任何模型调用，成本恒为 $0）
 - 命令：`python tasks.py eval`
@@ -72,7 +72,7 @@
 | 每 PR 成本 | $0.0000 |
 | 输入 / 输出 token | 80361 / 3059 |
 | 缓存命中率 | 0.0% |
-| 延迟 p50 / p95 | 1 ms / 1 ms |
+| 延迟 p50 / p95 | 0 ms / 1 ms |
 
 ## 逐用例
 
@@ -85,14 +85,14 @@
 | `clean-validation` | clean | 0 | 0 | 0 | 0 | 0 | 0 |  | 1 ms |
 | `inj-blocking` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 1 ms |
 | `inj-cmdi` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 0 ms |
-| `inj-crypto` | injected | 2 | 3 | 0 | 2 | 1 | 0 |  | 1 ms |
+| `inj-crypto` | injected | 2 | 3 | 0 | 2 | 1 | 0 |  | 0 ms |
 | `inj-deser` | injected | 2 | 2 | 0 | 2 | 0 | 0 |  | 1 ms |
-| `inj-mutable-default` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 1 ms |
-| `inj-pathtraversal` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 1 ms |
+| `inj-mutable-default` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 0 ms |
+| `inj-pathtraversal` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 0 ms |
 | `inj-quadratic` | injected | 2 | 1 | 1 | 1 | 0 | 0 |  | 1 ms |
-| `inj-random` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 1 ms |
+| `inj-random` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 0 ms |
 | `inj-secrets` | injected | 2 | 2 | 0 | 1 | 1 | 0 |  | 1 ms |
-| `inj-sql-format` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 0 ms |
+| `inj-sql-format` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 1 ms |
 | `inj-sql-fstring` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 1 ms |
 | `inj-ssrf` | injected | 1 | 1 | 0 | 1 | 0 | 0 |  | 1 ms |
 | `inj-style` | injected | 5 | 3 | 2 | 3 | 0 | 0 |  | 1 ms |

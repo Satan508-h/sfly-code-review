@@ -683,8 +683,8 @@ def render_ablation(variants: Sequence[Variant]) -> list[str]:
     lines = [
         "## 消融与基线",
         "",
-        "| 配置 | LLM 调用 | 发布 | 命中真问题 | 严格召回率 | 精确率 | 成本 | 相对上一档 |",
-        "|---|---:|---:|---:|---:|---:|---:|---|",
+        "| 配置 | LLM 调用 | 发布 | 命中真问题 | 严格召回率 | 精确率 | 降级用例 | 成本 | 相对上一档 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for index, variant in enumerate(variants):
         m = variant.metrics
@@ -700,10 +700,15 @@ def render_ablation(variants: Sequence[Variant]) -> list[str]:
                 delta = f"**+0 条，多花 ${spent:.4f}**"
             else:
                 delta = "+0 条，$0"
+        # **降级用例数必须在这一行里。** 一次 provider 超时会让某个 Worker
+        # 交不出结果，那一档的召回率于是偏低 —— 而它和「那个 Worker 没找到」
+        # 在指标上完全一样。真实层实测撞到过一次（2 Worker 阶段 performance
+        # 超时），当时这一列还不存在。
+        degraded = f"⚠️ {m.degraded_cases}" if m.degraded_cases else "0"
         lines.append(
             f"| {variant.label} | {variant.calls} | {m.published} | {m.strict.tp} | "
             f"{m.strict.recall * 100:.1f}% | {m.strict.precision * 100:.1f}% | "
-            f"${m.cost_usd:.4f} | {delta} |"
+            f"{degraded} | ${m.cost_usd:.4f} | {delta} |"
         )
 
     lines += [
