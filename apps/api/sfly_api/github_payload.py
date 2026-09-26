@@ -33,8 +33,12 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from sfly_shared.contracts import BootstrapMessage, FilePatch, idempotency_key_for
-from sfly_shared.diff import parse_unified_diff
+from sfly_shared.contracts import BootstrapMessage, idempotency_key_for
+
+# 文件 → 补丁的转换住在 shared：它有两个消费者（网关读录制载荷、编排器读
+# 自己从 GitHub 拉回来的响应），而它们**必须用同一份实现** —— 分叉的后果是
+# 「回放时能审、真上线审不了」。见那个模块的文档。
+from sfly_shared.github_files import patches_from_files as patches_from_files
 
 #: 触发审查的 PR 动作。
 #:
@@ -48,14 +52,6 @@ REVIEW_ACTIONS: frozenset[str] = frozenset({"opened", "synchronize", "reopened",
 
 #: 我们唯一处理的事件类型。
 PULL_REQUEST_EVENT = "pull_request"
-
-#: 新文件 / 删除文件在 git diff 头里的模式行。**用它而不是自己设
-#: ``is_new_file``**：解析器认这三行，让标志从解析结果里出来，
-#: 「哪些文件算新文件」这件事就只有一个判断处。
-_MODE_BY_STATUS: dict[str, str] = {
-    "added": "new file mode 100644",
-    "removed": "deleted file mode 100644",
-}
 
 
 class PayloadError(ValueError):
@@ -91,70 +87,6 @@ def _require_text(payload: Mapping[str, Any], *path: str) -> str:
     if not value:
         raise PayloadError(f"载荷里缺少 {'.'.join(path)}")
     return value
-
-
-# --------------------------------------------------------------------------- #
-# 文件 → 补丁
-# --------------------------------------------------------------------------- #
-
-
-def _file_block(entry: Mapping[str, Any]) -> str:
-    """把一条 API 记录还原成一段标准 git diff。
-
-    重命名的处理值得说明：GitHub 给的是 ``filename``（新名）+
-    ``previous_filename``（旧名），而真正的 git 会写
-    ``diff --git a/旧名 b/新名``。这里两个位置都写新名 ——
-    **因为我们取路径的地方是 ``+++`` 行，它给的是新名**，也就是评论要锚定的
-    那个路径。写旧名反而会让解析器拿旧名去发布评论，而 GitHub 会拒绝它。
-    """
-    path = _text(entry, "filename")
-    status = _text(entry, "status") or "modified"
-    old = "/dev/null" if status == "added" else f"a/{path}"
-    new = "/dev/null" if status == "removed" else f"b/{path}"
-
-    lines = [f"diff --git a/{path} b/{path}"]
-    if mode := _MODE_BY_STATUS.get(status):
-        lines.append(mode)
-    lines.append(f"--- {old}")
-    lines.append(f"+++ {new}")
-    lines.append(str(entry.get("patch") or ""))
-    return "\n".join(lines)
-
-
-def patches_from_files(
-    files: Sequence[Any],
-    *,
-    max_patch_chars: int,
-) -> tuple[list[FilePatch], dict[str, str]]:
-    """把 ``/pulls/{n}/files`` 的条目转成 ``FilePatch``。
-
-    返回 ``(补丁, 跳过的文件及原因)``。跳过原因要一路带到日志和 UI ——
-    「这个 PR 审了 3 个文件」和「这个 PR 有 5 个文件，2 个没法审」是两件事。
-    """
-    blocks: list[str] = []
-    skipped: dict[str, str] = {}
-
-    for entry in files:
-        if not isinstance(entry, Mapping):
-            continue
-        path = _text(entry, "filename")
-        if not path:
-            continue
-        if not str(entry.get("patch") or "").strip():
-            # GitHub 对二进制文件、以及改动过大的文件**直接不返回 patch 字段**。
-            # 它和「文件被删了」不是一回事：那里是有 hunk 的。
-            skipped[path] = "GitHub 未提供补丁（二进制文件，或改动过大被省略）"
-            continue
-        blocks.append(_file_block(entry))
-
-    if not blocks:
-        return [], skipped
-
-    parsed = parse_unified_diff("\n".join(blocks), max_patch_chars=max_patch_chars)
-    # 解析器自己的跳过原因（二进制标记、没有 hunk）合并进来。两边的键都是路径，
-    # 不会互相覆盖 —— 能走到解析器的文件，上面已经确认有 patch 了。
-    skipped.update(parsed.skipped)
-    return parsed.patches, skipped
 
 
 # --------------------------------------------------------------------------- #

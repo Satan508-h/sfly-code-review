@@ -90,6 +90,21 @@ class Sweeper:
 
     async def sweep_once(self) -> list[str]:
         """扫一轮，返回被唤醒的 ``task_id`` 列表。"""
+        # **先回收，再扫描。**
+        #
+        # 这是 ``queued`` 那个状态**唯一**的恢复路径，而它以前是断的：
+        # ``reclaim`` 只有 Worker 池在调（回收 ``review_tasks``），
+        # 于是「一条消费失败的 bootstrap 留在 PEL 里」没有任何东西来捞 ——
+        # 而超时扫描器够不着它（``due_runs`` 的判据是 ``deadline_at``，
+        # 而 ``queued`` 的 run 还没有 deadline，那一行是 ``plan`` 写的）。
+        # 症状是**这个 run 再也不动了**：没有报错、没有日志、UI 上一直「排队中」。
+        #
+        # 两边实现的 ``_target_groups(None)`` 早就写好了要覆盖
+        # ``review_bootstrap``（那段文档就在讲这件事），契约测试也断言了 ——
+        # 缺的只是这个调用者。M10 把 ``plan`` 的拉代码接上之后它才真的会发作：
+        # 在那之前 ``plan`` 几乎不抛异常，这条路径走不到。
+        await self._reclaim()
+
         now = datetime.now(UTC)
         due = await self._store.due_runs(now)
         woken: list[str] = []
@@ -118,3 +133,28 @@ class Sweeper:
         if due:
             log.info("sweeper.tick", due=len(due), woken=len(woken))
         return woken
+
+    async def _reclaim(self) -> None:
+        """把空闲超时的消息放回「可投递」—— **含未被 ack 的 bootstrap**。
+
+        ``None`` 是「全部消费者组」（``review_bootstrap`` / ``review_tasks``
+        各 lane / ``review_results``），理由见 :meth:`sweep_once`。
+        **不用 worker_type 是因为这里不是 Worker** —— 编排器要捞的是自己那两条流。
+
+        失败不向上抛：回收需要 Redis，而扫描需要 Postgres，两者是独立的依赖。
+        让回收的失败把这一轮扫描也带走，等于让 Redis 的抖动顺带停掉超时兜底，
+        而后者正是「Redis 挂了」时唯一还能救 run 的东西。
+        """
+        try:
+            count = await self._ctx.queue.reclaim(None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("sweeper.reclaim_failed")
+            return
+        if count:
+            log.warning(
+                "sweeper.reclaimed",
+                count=count,
+                hint="有消息空闲超过 CLAIM_IDLE_MS 没被确认 —— 多半来自一个崩掉的消费者",
+            )

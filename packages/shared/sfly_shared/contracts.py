@@ -761,6 +761,11 @@ class RunEvent(_Contract):
         "run.status",
         "node.started",
         "node.finished",
+        # 去 GitHub 拉这个 PR 的文件失败了（限流、网络、没配 token）。
+        # **它不是「没有可审的文件」** —— 那条路走 ``skipped``，而这条会重试，
+        # 重试用完则整个 run 判 failed。分开是因为两者的含义正好相反：
+        # 一个是「看过了，没问题」，一个是「根本没看到」。
+        "plan.fetch_failed",
         "worker.dispatched",
         "worker.result",
         "worker.failed",

@@ -30,7 +30,8 @@ from sfly_agent.rag.retriever import select_rules
 from sfly_agent.risk import rank_files, select_files
 from sfly_agent.state import ReviewState
 from sfly_orchestrator.context import NodeContext
-from sfly_shared.contracts import BootstrapMessage, RunStatus, WorkerType
+from sfly_shared.contracts import BootstrapMessage, FilePatch, RunStatus, WorkerType
+from sfly_shared.github_files import patches_from_files
 from sfly_shared.logging import get_logger
 from sfly_workers.specs import spec_for
 
@@ -41,7 +42,8 @@ async def plan(state: ReviewState, ctx: NodeContext) -> dict[str, Any]:
     msg = BootstrapMessage.model_validate(state["bootstrap"])
     task_id = state["task_id"]
 
-    selected, truncated = select_files(msg.file_patches, ctx.settings.pr_max_files)
+    patches = await _patches_to_review(msg, ctx, task_id)
+    selected, truncated = select_files(patches, ctx.settings.pr_max_files)
     if not selected:
         await ctx.store.set_status(task_id, RunStatus.SKIPPED)
         await ctx.emit(
@@ -52,7 +54,7 @@ async def plan(state: ReviewState, ctx: NodeContext) -> dict[str, Any]:
         log.warning(
             "node.plan_nothing_to_review",
             task_id=task_id,
-            incoming_files=len(msg.file_patches),
+            incoming_files=len(patches),
             hint="全是二进制/纯删除/空 diff —— 标 skipped 而不是产出一份「0 条发现」的报告",
         )
         # 空 dict 也能走，但状态里要留下 planned_workers=[]：
@@ -67,7 +69,7 @@ async def plan(state: ReviewState, ctx: NodeContext) -> dict[str, Any]:
     await ctx.store.set_plan(
         task_id,
         workers,
-        files_total=len(msg.file_patches),
+        files_total=len(patches),
         files_reviewed=len(selected),
         diff_truncated=truncated,
         deadline_at=deadline,
@@ -78,7 +80,7 @@ async def plan(state: ReviewState, ctx: NodeContext) -> dict[str, Any]:
         {
             "node": "plan",
             "planned_workers": [w.value for w in workers],
-            "files_total": len(msg.file_patches),
+            "files_total": len(patches),
             "files_reviewed": len(selected),
             "diff_truncated": truncated,
             "deadline_at": deadline.isoformat(),
@@ -103,12 +105,80 @@ async def plan(state: ReviewState, ctx: NodeContext) -> dict[str, Any]:
         "file_patches": [p.model_dump(mode="json") for p in selected],
         "language": language,
         "rules": rules,
-        "files_total": len(msg.file_patches),
+        "files_total": len(patches),
         "files_reviewed": len(selected),
         "diff_truncated": truncated,
         "deadline_at": deadline.isoformat(),
         "planned_workers": [w.value for w in workers],
     }
+
+
+async def _patches_to_review(
+    msg: BootstrapMessage,
+    ctx: NodeContext,
+    task_id: str,
+) -> list[FilePatch]:
+    """这次要审的补丁。**载荷里没有就自己去 GitHub 拉。**
+
+    GitHub 的 ``pull_request`` 事件**不带任何代码** —— 它只有元数据
+    （标题、作者、head_sha、仓库 id）。所以线上那条路上 ``msg.file_patches``
+    **永远是空的**，文件得自己调一次
+    ``GET /repos/{owner}/{repo}/pulls/{n}/files``。
+
+    本地一直没暴露这件事，是因为 fixture 是**录出来的**：录制脚本把那次 API
+    的响应一起塞进了载荷（见 ``scripts/record_pr_fixture.py``），于是回放时
+    看着像一切正常。线上收到的是真载荷，里面没有 ``files`` 这个键 ——
+    少了这一步，开一个 PR 的结局是 webhook 返回 200、run 被标成 ``skipped``、
+    PR 上什么都不会出现。
+
+    ### 拉不到就**抛**，绝不允许走到「没有可审的文件」
+
+    ``skipped`` 的含义是「这个 PR 确实没有可审的东西」（全是二进制 / 纯删除 /
+    空 diff）。把一次拉取失败也归到那里，等于把「我们根本没看到代码」说成
+    「代码没有问题」—— 一份看起来完全正常的空报告。这是本项目最贵的一类
+    bug，所以两者的处置必须分开。
+
+    抛出去的后果是对的：``GraphRunner`` 会重试到 ``MAX_ATTEMPTS``（限流、
+    网络抖动都会自愈），次数用完了才把 run 标成 ``failed`` —— 一个终态。
+    抛之前先写一条事件，因为那条 run 在 UI 上只有状态没有原因，而原因在这里。
+    """
+    if msg.file_patches:
+        return list(msg.file_patches)
+
+    if ctx.github is None:
+        # 没配 token。**这不是「没有文件」** —— 是「我们没法去看」。
+        reason = "载荷里没有文件，而且没配 GITHUB_TOKEN，拉不到代码"
+        await ctx.emit(task_id, "plan.fetch_failed", {"reason": reason, "pr": _pr(msg)})
+        raise RuntimeError(reason)
+
+    try:
+        files = await ctx.github.pull_files(msg.repo_id, msg.pr_number)
+    except Exception as exc:
+        # 先把原因写进时间线，再让异常往上走 —— 重试的决策属于消费循环，
+        # 不属于这里（见模块文档）。
+        await ctx.emit(
+            task_id,
+            "plan.fetch_failed",
+            {"reason": f"拉取文件失败：{type(exc).__name__}", "error": str(exc)[:300], "pr": _pr(msg)},
+        )
+        raise
+
+    patches, skipped = patches_from_files(files, max_patch_chars=ctx.settings.per_file_patch_chars)
+    log.info(
+        "node.plan_fetched",
+        task_id=task_id,
+        pr=_pr(msg),
+        files=len(patches),
+        skipped=len(skipped),
+        # 跳过原因要能看见：「审了 3 个文件」和「有 5 个文件、2 个没法审」
+        # 是两件事，而后者只在日志里说得出为什么。
+        skip_reasons=dict(list(skipped.items())[:5]),
+    )
+    return patches
+
+
+def _pr(msg: BootstrapMessage) -> str:
+    return f"{msg.repo_id}#{msg.pr_number}"
 
 
 def planned_workers(msg: BootstrapMessage) -> list[WorkerType]:

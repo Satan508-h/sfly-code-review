@@ -14,6 +14,14 @@
 
 ## 当前状态
 
+**M10 进行中**：**精简模式已跑通并端到端验证**（一个进程跑完整个系统，
+用的是完整模式下同一批类），部署配置与[部署手册](docs/DEPLOY.md)就绪。
+**线上那一半等三个账号**（Render / Vercel / Neon，都能用 GitHub 登录、都免费）。
+
+```bash
+python -m sfly_lite   # 本地起精简模式：API + 编排器 + 三个 Worker 在一个事件循环上
+```
+
 **M9 已完成**：聚合硬化（相似度聚类 + 冲突消解）+ **30 条评测集** + 消融与
 单 Agent 基线。**两层都跑完了**，报告提交进仓库（`reports/`）。
 
@@ -299,6 +307,171 @@ EventSource 在服务端关流后会**自动重连**（这是规范行为），�
 | 容器里 `ModuleNotFoundError: No module named 'sfly_agent'` | 网关 import 了 `sfly_agent.diff` 来解析补丁，而 api 的依赖里没有 agent-core（也不该有 —— 那是 LLM/RAG/聚合的包）。**本地永远测不出来**：开发机上的 venv 装了全部 workspace 包。修法是把 `diff.py` 搬到 `sfly_shared`（它只依赖 `contracts.FilePatch` 和标准库）—— 于是网关不再拖进 rapidfuzz / rank_bm25 / LLM 客户端 |
 | `GITHUB_WEBHOOK_SECRET=xxx docker compose up -d api` 之后仍然不验签 | **compose 只把 `env_file` / `environment:` 里的变量传进容器**，命令行前面那个环境变量只用于 compose 文件的 `${VAR}` 插值。所以那次「验证」什么也没验证 —— 是手工改 `.env` 才测出真结果的 |
 | run 的 `block_merge` 和 `totals` 一直是 null | `finalize` 只写了 `review_reports`（jsonb），没写 `review_runs` 上那两列。运行列表要显示「阻断 / 参考」和花了多少钱，而它不该为了两个值去解每一行的 jsonb。补了 `set_decision()` |
+
+### M10 已完成：精简模式 / 部署配置 / 冷启动
+
+```bash
+# 精简模式：一个进程跑完整个系统。需要一个 Postgres（本地 Docker 那个就行），
+# 不需要 Redis。**用一个独立的库**，否则完整模式的 orchestrator 容器
+# 会捞到这边建的 run（它的超时扫描器只看 deadline_at，不看是谁建的）。
+MODE=lite QUEUE_BACKEND=memory LOCK_BACKEND=memory \
+DATABASE_URL=postgresql://sfly:sfly@localhost:55432/sfly_lite \
+PORT=8010 LLM_PROVIDER=mock python -m sfly_lite
+
+# 部署：见 docs/DEPLOY.md（Neon → Render → Vercel → GitHub webhook → 验收）
+python tasks.py copy-env GITHUB_TOKEN   # 把 .env 里的值复制到剪贴板，不回显
+```
+
+#### 一个进程五个角色，用的是同一批类
+
+`apps/lite/sfly_lite/__main__.py` 里就是全部内容：
+
+```python
+GraphRunner(ctx=ctx, graph=graph)      # 同 orchestrator 容器
+Coordinator(ctx=ctx, graph=graph)      # 同 orchestrator 容器
+Sweeper(ctx=ctx, graph=graph, ...)     # 同 orchestrator 容器
+WorkerPool(queue=..., store=...)       # 同三个 worker 容器
+create_app(deps=deps)                  # 同 api 容器
+```
+
+换掉的只有 `QUEUE_BACKEND=memory` / `LOCK_BACKEND=memory`，而**全代码库只有
+`sfly_bus/factory.py` 读这两个值**（`tests/unit/bus/test_protocols.py` 用 AST 扫着）。
+Render 上构建的是**同一个 Dockerfile**，不带任何 build arg。
+
+#### 这一步真正的工作量在一处注入上
+
+`create_app()` 的 lifespan 会自己 `open_dependencies()`。在精简模式里那就是
+**第二个 `InMemoryQueue`** —— webhook 投进 API 那一个，`GraphRunner` 在另一个上等。
+两边都工作正常，所以没有任何一层会报警。
+
+实测（把 `create_app(deps=deps)` 的参数去掉，其它一律不动）：
+
+```
+-> #1  HTTP 202  accepted
+-> run: 01M3ECT8CYRCHVZ4M97WJ7JS1Z      ← 打印了一个 task_id
+
+15 秒后： GET /api/runs       -> {"runs":[],"count":0}
+         GET /api/health     -> HTTP 200（全绿）
+         GET /api/runs/{id}  -> HTTP 404
+```
+
+webhook 返回 202、健康检查全绿、**而 run 列表是空的**。唯一的可观察差异是一行
+日志：正常版打 `api.ready deps=injected`，破损版打 `api.ready mode=lite port=8011`。
+`tests/unit/lite/test_host_mode.py` 钉着它，断言的是「依赖**没有**被再开一套」
+（用一个调用即爆炸的替身），而不是「结果碰巧对」。
+
+#### 线上撞到的：报告以「未发现问题」发布出去
+
+配好真实 DeepSeek 之后跑线上那个 fixture，三个 Worker 全部 `status=ok`、
+`findings=0`、花了 $0.0158 —— 而 Mock 扫描器在同一个 diff 上找到 10 条，
+含一条硬编码凭据。根因是两层叠在一起，各自都不会报错：
+
+1. **`deepseek-flash` 是推理模型，「先想后写」**，而 `max_tokens` 同时管住
+   思维链和正文。style 那一路在一个 4 文件的 PR 上想了 28525 个字符：
+   `completion_tokens=8192` / `reasoning_tokens=8192` / `content=""`。
+   上游看到的现象只是「解析不出 JSON」。
+2. **空数组被当成了「没有问题」**。截断的响应走修复阶梯，而修复提示词里那句
+   「宁少勿多」恰好把模型推向一个空的 `findings` 数组 —— 然后它被判定为
+   「模型认为没有问题」，于是 `status=ok`、`error=None`、报告不降级。
+
+修法：`LLM_REASONING_EFFORT=none`（默认值，量出来的 —— 关掉之后三个 lane 都
+出得来，输出 token 只有约 1/3，performance 反而找得更多）；空数组只有在
+「这一轮之前从没出现过内容」时才算「没有问题」；`max_tokens` 4096 → 8192。
+
+修复后同一条链路：11 / 4 / 15 条 → 聚合后 **22 条发现**、`degraded=False`、
+`block_merge=True`、$0.0061。
+
+#### 花钱的闸卡在真正花钱的那一行
+
+`BudgetedLLM` 套在最外层（先问钱、再问这一次成不成功），每次 `complete()`
+之前查一次「今天还能花吗」，超了就换扫描器并在模型名后缀上原因
+（`mock-1 (budget: 45/45 calls today)`），一路进 `worker_results` 和报告。
+
+阈值读的是 `llm_calls` 表的 SUM，**不是进程内计数器** —— 精简模式跑在 Render
+免费档上，15 分钟没人访问就休眠、下次访问换一个进程，内存计数器每天会被重置
+几十次，而它失败的方向是多花钱。计数排除 Mock（单价为零，算进去会让
+「今天还能花几次」因为「今天已经降级过一次」而变小）。
+
+报告里新增的 `scanned_only` 和 `degraded` **是两个徽章**：那边说报告不完整，
+这边说报告完整但来源不是模型。合成一个会把「今天配额用完了」显示成「系统坏了」，
+而这一页上扫描器的 finding 和模型的 finding 长得一模一样。
+
+#### 冷启动：90 秒的超时意味着「等失败再提示」等于白屏一分钟半
+
+HTTP 客户端超时给的是 90 秒（为冷启动特意调大的），所以从访客点开链接到
+「第一个请求报错」之间有一分半。前端因此有两条时间线：2 秒没回音就先假定在
+唤醒（热后端 50 毫秒就答，不能一上来就闪），失败之后每 3 秒再探，超过 120 秒
+**不再叫「唤醒中」**（永远转圈比说「连不上」更糟）。
+
+唤醒期间**不挂载路由** —— 视图一挂载就发自己的请求，而那些请求会在同一个
+冷启动窗口里一起挂 90 秒、各报一次错。让整棵视图树等后端答应再挂载是同一件事
+只做一次，也顺带保证了「先 JSON 唤醒、再开 SSE」这条顺序。
+
+顺带一条：探到 **503 也算唤醒结束**（后端在，只是依赖挂了）。把它也当成
+「还在唤醒」会让一个数据库挂了的后端永远显示「正在唤醒」，而它一直在跑。
+
+#### 线上那条路缺了最后一环：代码得自己去拉
+
+写部署手册的验收清单时撞到的：**`GitHubClient.pull_files` 在生产路径上没有任何
+调用者**。GitHub 的 `pull_request` 事件只带元数据、不带代码，所以线上
+`msg.file_patches` 永远是空的 —— 开一个 PR 的结局是 webhook 返回 200、
+run 被标成 `skipped`、PR 上什么都不会出现。
+
+本地一直没暴露它，因为 fixture 是**录出来的**：录制脚本把
+`/pulls/{n}/files` 的响应一起塞进了载荷。好在 README 的已知限制里早就写着它。
+
+接在 `plan` 节点而不是 API：网关明确不许为了解析 diff 拖进整个 LLM 栈
+（`diff.py` 当初从 `sfly_agent` 搬到 `sfly_shared` 就是这个原因），而
+`pull_files` 和 `patches_from_files` 都在 `sfly_agent` 里。顺带把
+`patches_from_files` 也搬到了 `sfly_shared` —— **它有两个消费者，而它们必须用
+同一份实现**（分叉的后果正是「回放时能审、真上线审不了」）。
+
+**拉不到 ≠ 没有可审的文件。** 前者抛（`GraphRunner` 重试到上限，然后把 run
+标成 `failed`），后者标 `skipped`。把前者归错，等于把「我们根本没看到代码」
+说成「代码没有问题」—— 一份看起来完全正常的空报告。
+
+实测（把 GitHub 客户端指向本地那个桩，于是不走真网络、也不往真 PR 上刷评论）：
+
+```
+GET  /repos/Satan508-h/sfly-playground/pulls/1/files   ← plan 自己去拉的
+POST /repos/.../pulls/1/reviews  × 3                    ← 前两次被限流，第三次成功
+run.finished  status=published   ← 12 条事件无缺口
+```
+
+#### 接上它之后，撞出一个更早就存在的洞
+
+`plan` 现在会抛异常了，于是那条「抛出去交给重试」的路第一次真的被走到 ——
+然后发现它**走不通**：`reclaim` 只有 Worker 池在调（回收 `review_tasks`），
+**没有人回收 `review_bootstrap`**。而 `GraphRunner` 失败时不 ack（注释里写着
+「等 reclaim 重投」），扫描器又够不着 `queued`（`due_runs` 的判据是
+`deadline_at`，而那一行是 `plan` 写的）。
+
+结果是**这个 run 永远停在「排队中」**：没有报错、没有日志、UI 上一直转圈。
+两边实现的 `_target_groups(None)` 早就写好了要覆盖 `review_bootstrap`
+（那段文档就在讲这件事），契约测试也断言了 —— 缺的只是那个调用者。
+
+现在扫描器每轮**先回收再扫描**（它负责**触发**，实际重投归队列层）。修完之后
+同一个场景：
+
+```
+graph.bootstrap_failed  attempt=2
+sweeper.reclaimed       count=1
+graph.bootstrap_failed  attempt=3
+graph.run_given_up      attempts=3     →  run 状态 failed
+```
+
+三次尝试、两次回收、时间线上三次都带着原因。**有界的重试、看得见的原因、
+诚实的终态** —— 而不是一个永远转圈的页面。
+
+#### 两个「声明了但没实现」的设置被标了出来
+
+`DEMO_ACCESS_KEY` / `RATE_LIMIT_PER_IP_PER_HOUR` 当初是为「公网访客手动触发
+一次审查」设计的，而那个入口**不存在** —— 前端是只读仪表盘，全项目唯一能建
+run 的入口是 GitHub webhook（由 GitHub 调用，不是访客）。而且未验签的请求在
+写库之前就被拒（约定 #8），一次数据库写都不会产生。
+
+所以它们在 `.env.example` 里被标注成**未接线**而不是留着让人以为在保护什么：
+一个挡不住花钱的入口闸，反而会让人以为成本被管住了。
 
 ### M9 已完成：聚合硬化 / 评测集 / 消融与基线
 
@@ -1217,12 +1390,14 @@ API 不直接写 `review_tasks` —— 文件风险排序和规则检索由编�
   保持为空 —— **没有这个 id 的 run 就是没发过评论**，UI 不该显示「已评论」。
   这**不是**失败：状态仍然是 `published`、报告是完整的（正文在
   `review_reports.comment_body` 里），本地和 CI 因此不需要任何密钥就能跑通全链路。
-- **`GitHubClient.pull_files` 还没有任何运行时调用者。** GitHub 的 `pull_request`
-  事件**不带任何代码**，生产路径上必须在收到 webhook 之后立刻调一次
-  `GET /repos/{owner}/{repo}/pulls/{n}/files`，把响应塞进载荷的 `files` 字段 ——
-  **这一步现在由录制/回放脚本代劳，API 路由里还没有它**（要接它需要一个真实
-  webhook 入口，也就是 M10）。所以今天 `fixtures/webhook_pr.json` 里的 `files`
-  是一份录制结果，而不是每次投递现取的。
+- **~~`GitHubClient.pull_files` 还没有任何运行时调用者。~~（M10 已接上）**
+  这条限制曾经是真的：GitHub 的 `pull_request` 事件**不带任何代码**，而
+  `pull_files` 只有录制脚本在用 —— 于是线上收到真载荷时文件是空的，开一个 PR
+  的结局是 webhook 返回 200、run 被标成 `skipped`、PR 上什么都不会出现。
+  本地一直没暴露它，是因为 `fixtures/webhook_pr.json` 里的 `files` 是**录出来的**。
+  现在 `plan` 节点在载荷里没有文件时自己去拉（`nodes/plan.py` 的
+  `_patches_to_review`），而 `fixtures/webhook_live_pr.json` 是同一份载荷去掉
+  `files` 之后的形态 —— 也就是 GitHub 真正会发的东西，用来本地复现这条路。
   客户端本身是被真实调用过的（`record-fixture` 用它取的 `/pulls/1/files`，
   同一套分页与重试），而两条路径最终喂给**同一个** `patches_from_files` ——
   「回放能审、真上线审不了」这种分叉不会发生。

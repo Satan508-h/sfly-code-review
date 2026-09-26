@@ -53,6 +53,9 @@ export type EventKind =
   | 'run.status'
   | 'node.started'
   | 'node.finished'
+  /** 去 GitHub 拉这个 PR 的文件失败了。**不是「没有可审的文件」** ——
+   *  那条路是 `skipped`，而这条会重试，用完则整个 run 判 failed。 */
+  | 'plan.fetch_failed'
   | 'worker.dispatched'
   | 'worker.result'
   | 'worker.failed'

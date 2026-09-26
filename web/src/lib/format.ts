@@ -102,6 +102,7 @@ export const EVENT_LABEL: Record<EventKind, string> = {
   'run.status': '状态变更',
   'node.started': '节点开始',
   'node.finished': '节点完成',
+  'plan.fetch_failed': '拉取代码失败',
   'worker.dispatched': '任务派发',
   'worker.result': 'Worker 上报',
   'worker.failed': 'Worker 失败',
@@ -117,6 +118,9 @@ export const EVENT_TYPE: Record<EventKind, 'primary' | 'success' | 'warning' | '
     'run.status': 'info',
     'node.started': 'info',
     'node.finished': 'primary',
+    // 拉不到代码 —— 和「Worker 失败」同一档的严重度（这条 run 大概率走不到
+    // 审查），但**不是** danger：它多半是限流或网络，重试会自愈。
+    'plan.fetch_failed': 'warning',
     'worker.dispatched': 'info',
     'worker.result': 'primary',
     'worker.failed': 'danger',
