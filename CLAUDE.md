@@ -465,7 +465,19 @@ python tasks.py replay-bootstrap --task-id ID --simulate-crash
 python tasks.py lint       # ruff check + format --check
 python tasks.py fmt        # 自动格式化
 python tasks.py typecheck  # mypy strict
+
+python tasks.py web-install  # 装前端依赖（首次）
+python tasks.py web-dev      # 前端开发服务器（热更新）→ **5273**，不是 5173
+                             # 5173 是 compose 里 web 容器的 nginx（构建产物）。
+                             # 两者能同时绑上且都不报错，而 localhost 优先解析 ::1，
+                             # 于是打开 5173 看到的是镜像里的旧构建、改代码毫无反应。
+                             # 详见 web/vite.config.ts 的 server.port 那段。
 ```
+
+> **前端有两条验收路径，别混**：
+> `web-dev`（5273，热更新，对接 Docker 里的 api:8000）是**开发时**用的；
+> `python tasks.py up` 起的 `web` 容器（`WEB_HOST_PORT`，默认 5173）是**验收和演示**
+> 用的 —— 它跑的是 `npm run build` 的产物，改完代码要重新 `up` 才看得到。
 
 > **单测在 Windows 上比 Linux 慢一个数量级，这是平台差异不是回归。**
 > 探测类测试连的是 `127.0.0.1:1`（保证连不上）。Linux 上拒绝连接是即时的，

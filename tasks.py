@@ -568,6 +568,11 @@ def cmd_web_dev(_: argparse.Namespace) -> None:
 
     Vite 的 proxy 会把 /api 转到 localhost:8000，所以前端代码里
     始终用相对路径 /api，不用管后端在哪。
+
+    **端口是 5273，不是 5173。** 5173 被 compose 里的 web 容器占着
+    （nginx 托管构建产物）。两者能同时绑上、谁都不报错，而 `localhost`
+    优先解析到 ::1 —— 于是打开 5173 看到的是**镜像里那份旧构建**，
+    改代码没有任何反应。详见 web/vite.config.ts 里那段注解。
     """
     web = ROOT / "web"
     if not _which("npm"):
@@ -599,7 +604,8 @@ def _print_endpoints() -> None:
 
     print(
         f"""
-  前端       http://localhost:{web}
+  前端       http://localhost:{web}          （nginx 托管的构建产物，验收用这个）
+  前端(开发) http://localhost:5273         （热更新，需另开一个终端跑 python tasks.py web-dev）
   API 文档   http://localhost:{api}/api/docs
   依赖状态   http://localhost:{api}/api/health   （或：python tasks.py health）
   存活探针   http://localhost:{api}/healthz      （不探依赖，永远 200）
