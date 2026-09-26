@@ -84,6 +84,17 @@ jobs:
         # 默认 addopts 已排除 integration / e2e 标记，所以不需要额外参数
         run: uv run pytest
 
+      - name: 评测集（离线层）
+        # 30 个用例、Mock LLM、$0、秒级 —— 所以它进得了 CI。
+        # **这一步的价值不是「跑一遍报告」**（报告还是会照常写出来），
+        # 而是那几条只在这里才成立的断言：ground truth 必须落在真实的新增行上、
+        # 每条注入用例都必须真的被测到、干净代码上不许出高危。
+        # 没有它，一条谁也没测到的用例会让所有指标变好看而无人察觉。
+        run: |
+          uv run pytest -m eval -o addopts="-q" tests/eval
+          # 报告写在工作区里，检查它确实生成了（写失败是静默的）
+          test -n "$(ls reports/eval-*.md)"
+
       - name: 校验 docker-compose 可解析
         # 构建整栈太重，但配置文件语法错误应该在 CI 里就拦住 ——
         # 这类错误只会在别人 clone 下来跑 `docker compose up` 时才暴露。
