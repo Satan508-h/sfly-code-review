@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sfly_shared.contracts import WorkerType
+from sfly_shared.contracts import WorkerType, categories_for
 
 # --------------------------------------------------------------------------- #
 # 人设
@@ -104,20 +104,7 @@ SECURITY = WorkerSpec(
     worker_type=WorkerType.SECURITY,
     consumer_group="security-group",
     stream="review_tasks",
-    categories=(
-        "sqli",
-        "xss",
-        "secrets",
-        "auth",
-        "crypto",
-        "deserialization",
-        "path_traversal",
-        "ssrf",
-        "insecure_random",
-        "command_injection",
-        "xxe",
-        "open_redirect",
-    ),
+    categories=categories_for(WorkerType.SECURITY),
     core_rule_ids=("sec-sqli-001", "sec-secrets-001", "sec-authz-001"),
     persona=SECURITY_PERSONA,
 )
@@ -126,17 +113,7 @@ PERFORMANCE = WorkerSpec(
     worker_type=WorkerType.PERFORMANCE,
     consumer_group="performance-group",
     stream="review_tasks",
-    categories=(
-        "n_plus_one",
-        "unbounded_query",
-        "memory",
-        "blocking_io",
-        "quadratic",
-        "missing_index",
-        "repeated_work",
-        "unnecessary_allocation",
-        "sync_in_async",
-    ),
+    categories=categories_for(WorkerType.PERFORMANCE),
     core_rule_ids=("perf-nplus1-001", "perf-unbounded-001", "perf-blocking-001"),
     persona=PERFORMANCE_PERSONA,
 )
@@ -145,16 +122,7 @@ STYLE = WorkerSpec(
     worker_type=WorkerType.STYLE,
     consumer_group="style-group",
     stream="review_tasks",
-    categories=(
-        "naming",
-        "formatting",
-        "docs",
-        "dead_code",
-        "complexity_readability",
-        "error_handling",
-        "magic_number",
-        "duplication",
-    ),
+    categories=categories_for(WorkerType.STYLE),
     core_rule_ids=("style-naming-001", "style-deadcode-001"),
     persona=STYLE_PERSONA,
 )
@@ -164,12 +132,6 @@ SPECS: dict[WorkerType, WorkerSpec] = {
     WorkerType.SECURITY: SECURITY,
     WorkerType.PERFORMANCE: PERFORMANCE,
     WorkerType.STYLE: STYLE,
-}
-
-#: 类目 → 拥有它的 Worker。冲突消解规则的唯一数据来源，
-#: 所以它从 spec 派生而不是另写一份 —— 两处定义迟早会漂移。
-CATEGORY_OWNER: dict[str, WorkerType] = {
-    cat: spec.worker_type for spec in SPECS.values() for cat in spec.categories
 }
 
 

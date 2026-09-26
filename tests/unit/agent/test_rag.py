@@ -17,8 +17,8 @@ import pytest
 
 from sfly_agent.rag.loader import RuleCorpusError, RuleSet, corpus_stats, load_rules
 from sfly_agent.rag.retriever import select_rules
-from sfly_shared.contracts import WorkerType
-from sfly_workers.specs import CATEGORY_OWNER, SPECS, spec_for
+from sfly_shared.contracts import CATEGORY_OWNER, WorkerType
+from sfly_workers.specs import SPECS, spec_for
 
 
 @pytest.fixture(scope="module")
@@ -45,10 +45,11 @@ def test_corpus_loads_and_is_not_empty(corpus: RuleSet) -> None:
 def test_every_rule_category_has_an_owning_worker(corpus: RuleSet) -> None:
     """**跨模块的一致性检查。**
 
-    规则的 ``category`` 与 ``specs.CATEGORY_OWNER`` 是两套独立维护的数据。
-    一个不在任何 Worker 职责域里的类目，会让冲突消解的
-    ``category_authority`` 规则静默失效 —— 表现是安全 Worker 报的 SQLi
-    被风格 Worker 的低危判定拉平，而日志里看不出任何异常。
+    规则库的 ``category`` 与 ``sfly_shared.contracts.CATEGORY_OWNER``
+    是两套独立维护的数据（前者是 YAML，后者是代码）。一个不在任何 Worker
+    职责域里的类目，会让冲突消解的 ``category_authority`` 规则静默失效 ——
+    表现是安全 Worker 报的 SQLi 被风格 Worker 的低危判定拉平，
+    而日志里看不出任何异常。
     """
     orphans = sorted({r.category for r in corpus.rules if r.category not in CATEGORY_OWNER})
     assert orphans == [], f"这些类目不属于任何 Worker：{orphans}"

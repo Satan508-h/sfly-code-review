@@ -136,10 +136,70 @@ SEVERITY_PRIOR: dict[Severity, float] = {
     Severity.INFO: 0.60,
 }
 
+#: 每个 Worker 负责的类目。**类目归属是领域事实，不是某个 app 的实现细节。**
+#:
+#: 在这里而不是在 Worker 规格里，理由和上面两张表一样：消费者横跨两边 ——
+#: Worker 拿它筛规则，主 Agent 拿它做冲突消解的「职责域优先」（``category_authority``），
+#: 契约层拿它校验类目别名表有没有指到不存在的地方。而**包不能反向依赖 app**，
+#: 所以它必须在两边都能依赖的那一层。
+#: （先例是 ``diff.py``：因为网关也要用，从 ``sfly_agent`` 搬到了 ``sfly_shared``。）
+_WORKER_CATEGORIES: dict[WorkerType, tuple[str, ...]] = {
+    WorkerType.SECURITY: (
+        "sqli",
+        "xss",
+        "secrets",
+        "auth",
+        "crypto",
+        "deserialization",
+        "path_traversal",
+        "ssrf",
+        "insecure_random",
+        "command_injection",
+        "xxe",
+        "open_redirect",
+    ),
+    WorkerType.PERFORMANCE: (
+        "n_plus_one",
+        "unbounded_query",
+        "memory",
+        "blocking_io",
+        "quadratic",
+        "missing_index",
+        "repeated_work",
+        "unnecessary_allocation",
+        "sync_in_async",
+    ),
+    WorkerType.STYLE: (
+        "naming",
+        "formatting",
+        "docs",
+        "dead_code",
+        "complexity_readability",
+        "error_handling",
+        "magic_number",
+        "duplication",
+    ),
+}
+
+#: 类目 → 拥有它的 Worker。**冲突消解「职责域优先」规则的唯一数据来源。**
+#:
+#: 一个类目**只能有一个主人** —— 冲突消解的 ``category_authority`` 靠它回答
+#: 「谁在这个类目上有发言权」，两个主人会让那条规则变成随机的。
+#: 这条不变量有测试钉着（``tests/unit/contracts/test_contracts.py``）。
+CATEGORY_OWNER: dict[str, WorkerType] = {
+    category: worker for worker, categories in _WORKER_CATEGORIES.items() for category in categories
+}
+
+
+def categories_for(worker: WorkerType) -> tuple[str, ...]:
+    """某个 Worker 负责的全部类目。给 Worker 规格表用（它从这里取，不另写一份）。"""
+    return _WORKER_CATEGORIES[worker]
+
+
 #: LLM 写类目名时会用各种同义写法。**必须在契约层收敛到规范名**，否则
-#: ``CATEGORY_OWNER`` 查不到，冲突消解的「职责域优先」规则（category_authority）
-#: 会静默失效 —— 表现是安全 Worker 报的 SQLi 被风格 Worker 的 LOW 拉平，
-#: 而且日志里看不出任何异常。这是实测会踩到的坑，不是假想。
+#: ``CATEGORY_OWNER``（就在上面）查不到，冲突消解的「职责域优先」规则
+#: （category_authority）会静默失效 —— 表现是安全 Worker 报的 SQLi 被风格
+#: Worker 的 LOW 拉平，而且日志里看不出任何异常。这是实测会踩到的坑，不是假想。
 _CATEGORY_ALIASES: dict[str, str] = {
     # 安全
     "sql_injection": "sqli",
@@ -392,7 +452,7 @@ class Finding(_Contract):
     def _norm_category(cls, v: Any) -> Any:
         # 先做形态归一（"SQL Injection" / "sql-injection" → "sql_injection"），
         # 再过别名表收敛到规范名（"sql_injection" → "sqli"）。
-        # 规范名必须与 sfly_workers.specs.CATEGORY_OWNER 的键一致。
+        # 规范名必须与 CATEGORY_OWNER 的键一致（有测试钉着）。
         slug = str(v).strip().lower().replace(" ", "_").replace("-", "_")
         return _CATEGORY_ALIASES.get(slug, slug)
 

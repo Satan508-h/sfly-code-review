@@ -17,6 +17,7 @@
 """
 
 from sfly_agent.aggregate.cluster import cluster_findings, similarity, tokenize
+from sfly_agent.aggregate.conflicts import resolve_conflicts
 from sfly_agent.aggregate.fingerprint import fingerprint, line_bucket, normalize_message
 
 __all__ = [
@@ -24,6 +25,7 @@ __all__ = [
     "fingerprint",
     "line_bucket",
     "normalize_message",
+    "resolve_conflicts",
     "similarity",
     "tokenize",
 ]

@@ -15,6 +15,9 @@ import pytest
 from pydantic import BaseModel
 
 from sfly_shared.contracts import (
+    _CATEGORY_ALIASES,
+    _WORKER_CATEGORIES,
+    CATEGORY_OWNER,
     BootstrapMessage,
     ErrorClass,
     FilePatch,
@@ -30,7 +33,6 @@ from sfly_shared.contracts import (
     normalize_path,
     stable_hash,
 )
-from sfly_workers.specs import CATEGORY_OWNER
 
 
 def _finding(**over: object) -> Finding:
@@ -184,20 +186,28 @@ def test_every_canonical_category_has_an_owner() -> None:
     于是安全 Worker 报的 CRITICAL 会被别的 Worker 的 LOW 拉平 ——
     而日志里没有任何异常。跑到线上才会发现「安全发现被降级了」。
     """
-    from sfly_shared.contracts import _CATEGORY_ALIASES
-
     orphans = {k: v for k, v in _CATEGORY_ALIASES.items() if v not in CATEGORY_OWNER}
     assert not orphans, f"别名表指向不存在的类目: {orphans}"
 
 
 @pytest.mark.unit
 def test_category_owner_has_no_duplicates_across_workers() -> None:
-    """同一个类目不能同时属于两个 Worker，否则职责域规则没有确定答案。"""
+    """同一个类目不能同时属于两个 Worker，否则职责域规则没有确定答案。
+
+    **检查的是源数据 ``_WORKER_CATEGORIES``，不是 ``CATEGORY_OWNER``。**
+    两者在搬到契约层之后不再等价：``CATEGORY_OWNER`` 是从源数据推导出来的 dict，
+    而 dict 的键**天生不可能重复** —— 同一个类目写在两个 Worker 名下时，
+    推导会静默地取后一个，于是查 ``CATEGORY_OWNER`` 的测试永远绿。
+
+    这条正是「重构之后测试还在，但它已经查不到任何东西了」的样子，
+    所以它盯着源数据。
+    """
     seen: dict[str, WorkerType] = {}
-    for wt, spec in __import__("sfly_workers.specs", fromlist=["SPECS"]).SPECS.items():
-        for cat in spec.categories:
-            assert cat not in seen, f"类目 {cat!r} 同时属于 {seen[cat]} 和 {wt}"
-            seen[cat] = wt
+    for worker, categories in _WORKER_CATEGORIES.items():
+        for category in categories:
+            assert category not in seen, f"类目 {category!r} 同时属于 {seen[category]} 和 {worker}"
+            seen[category] = worker
+    assert seen == CATEGORY_OWNER, "推导出来的表与源数据不一致"
 
 
 # --------------------------------------------------------------------------- #

@@ -1,6 +1,6 @@
 """主 Agent 的聚合流水线 —— 项目真正的 IP，**全确定性、零 LLM 调用**。
 
-    results → 合并 → 置信度重算 → 分档 → ReviewReport
+    results → 裁冲突 → 合并 → 置信度重算 → 分档 → ReviewReport
 
 为什么整条链路上一个 LLM 都不调（除了 Worker 本身）：评测要可复现。
 同一批 ``WorkerResult`` 跑一百遍必须得到一模一样的报告，否则
@@ -29,11 +29,24 @@ M9 补上第二层：**相似度聚类**（并查集 + rapidfuzz 阈值）。
 它是 ``review_results.fingerprint`` 那一列的值，用于跨 run 的分析与排查。
 合并逻辑与落库标识分开，本来就是两件事。
 
-### 冲突消解不在这个文件里
+### 冲突消解**在**这个文件的上游，而且必须在聚类之前
 
-同路径 + 邻近行号 + 不同 Worker + 严重度差 ≥ 2 才是冲突（``conflicts.py``）。
-**聚类在这里特意给冲突让了路**：类目不同的两条永不合并，因为「同一处、
-不同类目」正是冲突的定义，合并掉它就等于把整节冲突消解静默吃掉。
+同路径 + 邻近行号 + **同类目** + 不同 Worker + 严重度差 ≥ 2 才是冲突
+（``conflicts.py``）。顺序是：
+
+    results → 裁冲突（去掉败方）→ 聚类去重 → 置信度分档 → ReviewReport
+
+这个顺序有两处不能换，两处都会静默出错：
+
+* **聚类在裁冲突之后。** 聚类按代表选举取「严重度更高的那条」，会把
+  「两个 Worker 对严重度有分歧」这件事抹平 —— 抹平之后没有冲突可发现，
+  看起来一切正常（一条 CRITICAL 和一条 MEDIUM 合成了 CRITICAL，
+  谁也不会问它俩当时是不是吵过）。
+* **败方在聚类之前移除。** 一条被裁决掉的声称**不是印证**；留着它
+  会混进胜者的 ``corroboration_count``，把一次分歧算成一次互相支持。
+
+聚类那边也为冲突让了路：**类目不同的两条永不合并**。同一位置上的不同类目
+是两件事（注入和命名可以同时成立），合并掉它就等于把一条真实发现静默吃掉。
 """
 
 from __future__ import annotations
@@ -43,7 +56,9 @@ from datetime import UTC, datetime
 
 from sfly_agent.aggregate.cluster import cluster_findings
 from sfly_agent.aggregate.confidence import SUPPRESS_THRESHOLD, adjusted_confidence
+from sfly_agent.aggregate.conflicts import resolve_conflicts
 from sfly_agent.aggregate.decision import decide
+from sfly_agent.aggregate.fingerprint import fingerprint
 from sfly_agent.aggregate.render import render_comment
 from sfly_shared.contracts import (
     SEVERITY_RANK,
@@ -132,11 +147,19 @@ def split_by_confidence(
 
     被砍掉的那一批**必须留下来**：评测要用它们测量「这道闸砍掉了多少召回」。
     只存发布出去的，阈值就只能盲调 —— 而盲调出来的阈值在面试里一问就穿。
+
+    **标了 ``needs_human_review`` 的一律发布，不看置信度。** 这道闸的职责是
+    去掉「大概率是假的」声称，而 ``needs_human_review`` 的含义正相反 ——
+    「两个专家吵起来了，我们裁不出来」。把它按低置信度悄悄丢掉，
+    等于**把一句「这件事我们不确定」变成了沉默**，而这正是整个项目一直在
+    防的那类失败（低置信度的分数会照常显示出来，读的人自己会打折）。
     """
     published: list[AggregatedFinding] = []
     suppressed: list[AggregatedFinding] = []
     for finding in merged:
-        if finding.adjusted_confidence < SUPPRESS_THRESHOLD:
+        if finding.needs_human_review:
+            published.append(finding)
+        elif finding.adjusted_confidence < SUPPRESS_THRESHOLD:
             suppressed.append(finding.model_copy(update={"stage": "suppressed"}))
         else:
             published.append(finding)
@@ -173,7 +196,25 @@ def aggregate_run(
     usable = {r.worker_type for r in results if r.status is not ResultStatus.FAILED}
     missing = [w for w in run.planned_workers if w not in usable]
 
-    published, suppressed = split_by_confidence(merge_findings(results))
+    # **顺序不能换：先裁冲突，再去重。**
+    # 反过来的话，聚类会按代表选举取「严重度更高的那条」，把「两个 Worker
+    # 对严重度有分歧」这件事抹平 —— 抹平之后没有冲突可发现，而且看起来
+    # 一切正常。另一面：被裁决掉的败方**不是印证**，所以它必须在聚类之前
+    # 移除，否则会混进胜者的 ``corroboration_count``，把一次分歧算成一次互相支持。
+    outcome = resolve_conflicts(results)
+    merged = merge_findings(outcome.results)
+    for finding in merged:
+        # 指纹能把「原始声称」和「合并后的代表」对上：AggregatedFinding 是
+        # Finding 的子类，文件/类目/消息/行号都没变。用指纹而不是 ``id()``，
+        # 是因为代表是 ``model_dump()`` 造出来的**新对象**。
+        key = fingerprint(finding)
+        record = outcome.winner_conflicts.get(key)
+        if record is not None:
+            finding.conflict = record
+        if key in outcome.needs_human_review:
+            finding.needs_human_review = True
+
+    published, suppressed = split_by_confidence(merged)
 
     return ReviewReport(
         task_id=run.task_id,
@@ -184,7 +225,7 @@ def aggregate_run(
         base_sha=run.base_sha,
         findings=published,
         suppressed=suppressed,
-        conflicts=[],  # M9
+        conflicts=outcome.records,
         files_total=run.files_total,
         files_reviewed=run.files_reviewed,
         diff_truncated=run.diff_truncated,
