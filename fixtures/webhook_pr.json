@@ -1,71 +1,81 @@
 {
   "action": "opened",
-  "number": 42,
+  "number": 1,
   "pull_request": {
-    "number": 42,
-    "node_id": "PR_kwDOAbcdef",
+    "number": 1,
+    "node_id": "PR_kwDOUrdTLc8AAAABFNepUQ",
     "title": "重构用户接口并加上备份入口",
     "draft": false,
     "user": {
-      "login": "contributor"
+      "login": "Satan508-h"
     },
     "head": {
-      "sha": "fb7353185e1b0000000000000000000000000000",
-      "ref": "feature/refactor"
+      "sha": "80a87fd8ff9ad2cb9e8d82e0665167a5bf85ad43",
+      "ref": "feature/admin-backup"
     },
     "base": {
-      "sha": "1111111111111111111111111111111111111111",
+      "sha": "dc5fd0ee24e641a8591b2107c12a45435c46519a",
       "ref": "main"
     }
   },
   "repository": {
-    "id": 123456,
-    "node_id": "R_kgDOAbcdef",
-    "full_name": "demo/sfly-playground",
+    "id": 1387746093,
+    "node_id": "R_kgDOUrdTLQ",
+    "full_name": "Satan508-h/sfly-playground",
     "name": "sfly-playground",
     "owner": {
-      "login": "demo"
+      "login": "Satan508-h"
     }
-  },
-  "installation": {
-    "id": 987654
   },
   "files": [
     {
-      "sha": "b316d20ddd3d57d1fc394a9c913dcf4e70fb7905",
+      "sha": "e310a866dbab5d34452271877c0e3b8222f11d09",
       "filename": "app/api.py",
       "status": "modified",
       "additions": 18,
       "deletions": 1,
       "changes": 19,
+      "blob_url": "https://github.com/Satan508-h/sfly-playground/blob/80a87fd8ff9ad2cb9e8d82e0665167a5bf85ad43/app%2Fapi.py",
+      "raw_url": "https://github.com/Satan508-h/sfly-playground/raw/80a87fd8ff9ad2cb9e8d82e0665167a5bf85ad43/app%2Fapi.py",
+      "contents_url": "https://api.github.com/repos/Satan508-h/sfly-playground/contents/app%2Fapi.py?ref=80a87fd8ff9ad2cb9e8d82e0665167a5bf85ad43",
       "patch": "@@ -1,6 +1,8 @@\n \"\"\"HTTP 接口层。\"\"\"\n import os\n+import subprocess\n \n+import requests\n from flask import Flask, request, jsonify\n \n from app.db import get_user\n@@ -20,4 +22,19 @@ def read_user(user_id):\n @app.get(\"/files\")\n def read_file():\n     name = request.args[\"name\"]\n-    return open(os.path.join(UPLOAD_DIR, name)).read()\n+    path = os.path.join(UPLOAD_DIR, name)\n+    return open(path).read()\n+\n+\n+@app.post(\"/admin/backup\")\n+def backup():\n+    target = request.json[\"target\"]\n+    subprocess.run(f\"tar -czf {target}.tgz {UPLOAD_DIR}\", shell=True)\n+    return jsonify({\"ok\": True})\n+\n+\n+@app.get(\"/preview\")\n+def preview():\n+    url = request.args[\"url\"]\n+    resp = requests.get(url, timeout=5)\n+    return jsonify({\"status\": resp.status_code, \"body\": resp.text[:500]})"
     },
     {
-      "sha": "b59a2455883efa372437c504ea9b31bfe2058b82",
+      "sha": "d93dff5c9e12f8cc811a40856ae128880a495fb5",
       "filename": "app/db.py",
       "status": "modified",
       "additions": 24,
       "deletions": 1,
       "changes": 25,
+      "blob_url": "https://github.com/Satan508-h/sfly-playground/blob/80a87fd8ff9ad2cb9e8d82e0665167a5bf85ad43/app%2Fdb.py",
+      "raw_url": "https://github.com/Satan508-h/sfly-playground/raw/80a87fd8ff9ad2cb9e8d82e0665167a5bf85ad43/app%2Fdb.py",
+      "contents_url": "https://api.github.com/repos/Satan508-h/sfly-playground/contents/app%2Fdb.py?ref=80a87fd8ff9ad2cb9e8d82e0665167a5bf85ad43",
       "patch": "@@ -1,7 +1,11 @@\n \"\"\"数据访问层。\"\"\"\n+import hashlib\n+import pickle\n+import random\n import sqlite3\n \n DB_PATH = \"app.db\"\n+API_KEY = \"sk-live-9f8a7b6c5d4e3f2a1b0c7d8e\"\n \n \n def connect():\n@@ -10,10 +14,28 @@ def connect():\n \n def get_user(user_id):\n     cur = connect().cursor()\n-    cur.execute(\"SELECT id, name, email FROM users WHERE id = ?\", (user_id,))\n+    cur.execute(f\"SELECT id, name, email FROM users WHERE id = {user_id}\")\n     return cur.fetchone()\n \n \n+def find_users(name):\n+    cur = connect().cursor()\n+    cur.execute(\"SELECT id, name FROM users WHERE name = '%s'\" % name)\n+    return cur.fetchall()\n+\n+\n+def hash_password(password):\n+    return hashlib.md5(password.encode()).hexdigest()\n+\n+\n+def load_session(blob):\n+    return pickle.loads(blob)\n+\n+\n+def make_reset_code():\n+    return random.randint(100000, 999999)\n+\n+\n def list_orders(user_id):\n     cur = connect().cursor()\n     cur.execute(\"SELECT id, total FROM orders WHERE user_id = ?\", (user_id,))\n@@ -24,3 +46,4 @@ def save_setting(key, value):\n     conn = connect()\n     conn.execute(\"INSERT INTO settings (key, value) VALUES (?, ?)\", (key, value))\n     conn.commit()\n+    print(\"saved\", key)"
     },
     {
-      "sha": "31cf8b855c6638ca8a0503166bcd6a8cb0e03927",
+      "sha": "294c1b73d67c0eef47909c60246ad83812f061d7",
       "filename": "app/report.py",
       "status": "modified",
       "additions": 25,
       "deletions": 1,
       "changes": 26,
+      "blob_url": "https://github.com/Satan508-h/sfly-playground/blob/80a87fd8ff9ad2cb9e8d82e0665167a5bf85ad43/app%2Freport.py",
+      "raw_url": "https://github.com/Satan508-h/sfly-playground/raw/80a87fd8ff9ad2cb9e8d82e0665167a5bf85ad43/app%2Freport.py",
+      "contents_url": "https://api.github.com/repos/Satan508-h/sfly-playground/contents/app%2Freport.py?ref=80a87fd8ff9ad2cb9e8d82e0665167a5bf85ad43",
       "patch": "@@ -1,16 +1,40 @@\n \"\"\"报表生成。\"\"\"\n from app.db import list_orders\n \n+FREE_SHIPPING_THRESHOLD = 9900\n+\n \n def build_report(users):\n     lines = []\n     for user in users:\n-        lines.append(f\"用户 {user['name']}\")\n+        orders = list_orders(user[\"id\"])\n+        lines.append(f\"用户 {user['name']}：{len(orders)} 单\")\n     return \"\\n\".join(lines)\n \n \n+def summarize(users):\n+    text = \"\"\n+    for user in users:\n+        text += f\"{user['name']},{user['email']};\"\n+    return text\n+\n+\n def total(orders):\n     result = 0\n     for order in orders:\n         result = result + order[\"total\"]\n     return result\n+\n+\n+def discount(order):\n+    try:\n+        return order[\"total\"] - order[\"coupon\"]\n+    except:\n+        return order[\"total\"]\n+\n+\n+def label(user):\n+    x = user.get(\"nickname\")\n+    if x == None:\n+        return user[\"name\"]\n+    return x"
     },
     {
-      "sha": "cf095710008341879f7fd9dd2ae0df2168855c29",
+      "sha": "29e6e7011a154009ca9c4a6997b603f3c5604667",
       "filename": "static/app.js",
       "status": "added",
       "additions": 4,
       "deletions": 0,
       "changes": 4,
+      "blob_url": "https://github.com/Satan508-h/sfly-playground/blob/80a87fd8ff9ad2cb9e8d82e0665167a5bf85ad43/static%2Fapp.js",
+      "raw_url": "https://github.com/Satan508-h/sfly-playground/raw/80a87fd8ff9ad2cb9e8d82e0665167a5bf85ad43/static%2Fapp.js",
+      "contents_url": "https://api.github.com/repos/Satan508-h/sfly-playground/contents/static%2Fapp.js?ref=80a87fd8ff9ad2cb9e8d82e0665167a5bf85ad43",
       "patch": "@@ -0,0 +1,4 @@\n+// 前端预览组件\n+export function renderPreview(el, content) {\n+  el.innerHTML = content\n+}"
     }
-  ]
+  ],
+  "_note": "由 scripts/record_pr_fixture.py 于 2026-09-26T03:18:05+00:00 从 Satan508-h/sfly-playground#1 录制。repository / pull_request 来自 GET /repos 与 GET /pulls/{n}（重建 webhook 的元数据），files 来自 GET /pulls/{n}/files —— 真实响应，未经改动。PR: https://github.com/Satan508-h/sfly-playground/pull/1"
 }

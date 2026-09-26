@@ -11,6 +11,7 @@
     python tasks.py tables      看数据库建了哪些表、迁移到第几版（M4 验收）
     python tasks.py demo-reclaim 队列容错演示：副本猝死 → 回收 → 重投（不需要全栈）
     python tasks.py stub-github 起一个 GitHub 桩：手工演示「被限流 → 退避 → 重发」
+    python tasks.py record-fixture 从真实 PR 录一份 webhook 载荷（换靶场 PR 时用）
     python tasks.py demo        端到端演示：同一份 webhook 投 3 次 → 1 个 run
     python tasks.py scale 3     把 worker-security 扩到 3 个副本
     python tasks.py kill-worker 杀掉一个 Worker，验证容错
@@ -402,6 +403,39 @@ def cmd_stub_github(args: argparse.Namespace) -> None:
     )
 
 
+def cmd_record_fixture(args: argparse.Namespace) -> None:
+    """从真实 PR 录一份 webhook 载荷，覆盖 ``fixtures/webhook_pr.json``。
+
+    **会覆盖文件**，所以它不给默认的 ``--repo``：把「录哪个 PR」写死在命令里，
+    下一次误跑就是拿别的 PR 的数据盖掉演示用的那份载荷。两个参数必须显式给。
+
+    录完直接可以 ``python tasks.py demo --follow`` —— 载荷里的仓库名和 PR 号
+    是真的，所以评论会真的出现在那个 PR 上。
+    """
+    script = ROOT / "scripts" / "record_pr_fixture.py"
+    _step(f"录制 {args.repo}#{args.pr} -> fixtures/webhook_pr.json")
+    run([_py(), str(script), "--repo", args.repo, "--pr", str(args.pr)])
+
+
+def cmd_replay_bootstrap(args: argparse.Namespace) -> None:
+    """重投一条已经审过的 bootstrap —— publish 防重复闸的**真实验收**。
+
+    它会真的让编排器把那个 run 重放一遍（publish 节点是重点），所以只在完整
+    模式下有意义：精简模式没有 Redis 流可以重投。
+
+    前提：那个 run 必须已经审完（``review_runs`` 里有一行），否则没有
+    「重放」可言 —— 脚本会自己检查并说明。
+    """
+    script = ROOT / "scripts" / "replay_bootstrap.py"
+    cmd = [_py(), str(script), "--task-id", args.task_id]
+    if args.simulate_crash:
+        cmd.append("--simulate-crash")
+    if args.forget_comment_id:
+        cmd.append("--forget-comment-id")
+    _step(f"重投 bootstrap {args.task_id}：预期 PR 上不多出评论")
+    run(cmd)
+
+
 def cmd_tables(_: argparse.Namespace) -> None:
     """看数据库里建了哪些表、迁移到第几个版本 —— **M4 的验收就是这条命令**。
 
@@ -687,6 +721,33 @@ def build_parser() -> argparse.ArgumentParser:
             (("--port",), {"type": int, "default": 8099}),
             (("--rate-limit-times",), {"type": int, "default": 2, "help": "前几次发布返回限流（默认 2）"}),
             (("--retry-after",), {"default": "1", "help": "retry-after 头的值（秒）"}),
+        ],
+    )
+
+    add(
+        "record-fixture",
+        cmd_record_fixture,
+        "从真实 PR 录 webhook 载荷（覆盖 fixtures/webhook_pr.json）",
+        [
+            (("--repo",), {"required": True, "metavar": "OWNER/NAME"}),
+            (("--pr",), {"required": True, "type": int, "metavar": "N"}),
+        ],
+    )
+
+    add(
+        "replay-bootstrap",
+        cmd_replay_bootstrap,
+        "重投一条已审过的 bootstrap：验证 publish 不会重复发评论",
+        [
+            (("--task-id",), {"required": True, "metavar": "ID"}),
+            (
+                ("--simulate-crash",),
+                {"action": "store_true", "help": "先改回 aggregating（不改的话终态的 run 会被直接丢弃）"},
+            ),
+            (
+                ("--forget-comment-id",),
+                {"action": "store_true", "help": "先抹掉 github_comment_id（模拟评论发了、写库失败）"},
+            ),
         ],
     )
 

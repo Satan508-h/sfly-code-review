@@ -14,10 +14,14 @@
 
 ## 当前状态
 
-**M7 进行中**（已完成前两步）：GitHub 客户端（重试策略 / 分页 / 三条降级路）
-+ `publish` 节点（三道防重复闸 + 阶梯降级），评论**真的发得出去**了 ——
-证据见下面「[M7 进行中](#m7-进行中github-客户端--publish-节点)」那一节。
-第三步（真实靶场仓库验收）还没做。
+**M7 已完成**：GitHub 客户端（重试策略 / 分页 / 三条降级路）+ `publish` 节点
+（三道防重复闸 + 阶梯降级），三步走完并且**评论已经落在真实仓库的真实 PR 上**：
+[Satan508-h/sfly-playground#1](https://github.com/Satan508-h/sfly-playground/pull/1)
+—— 一次审查 = 一条 review + 最多 25 条行内评论，全部锚定在真实变更行上
+（那个 PR 上现在有**两条**，因为演示跑了两轮不同的 `head_sha`：新提交本来就该
+换来一次新审查。**同一个 run 重放不会有第二条**，那是下面第三步验的）。
+限流退避的证据在桩上，见
+「[M7 已完成](#m7-已完成github-客户端--publish-节点)」那一节。
 
 **M6 已完成**：GitHub webhook 入口（HMAC 验签 + 两层去重）、runs 接口、
 SSE 时间线（带 `Last-Event-ID` 补齐）。验收是一条命令 —— **同一份 webhook
@@ -255,11 +259,15 @@ EventSource 在服务端关流后会**自动重连**（这是规范行为），�
 | `GITHUB_WEBHOOK_SECRET=xxx docker compose up -d api` 之后仍然不验签 | **compose 只把 `env_file` / `environment:` 里的变量传进容器**，命令行前面那个环境变量只用于 compose 文件的 `${VAR}` 插值。所以那次「验证」什么也没验证 —— 是手工改 `.env` 才测出真结果的 |
 | run 的 `block_merge` 和 `totals` 一直是 null | `finalize` 只写了 `review_reports`（jsonb），没写 `review_runs` 上那两列。运行列表要显示「阻断 / 参考」和花了多少钱，而它不该为了两个值去解每一行的 jsonb。补了 `set_decision()` |
 
-### M7 进行中：GitHub 客户端 + publish 节点
+### M7 已完成：GitHub 客户端 + publish 节点
 
-**M7 有三步，这里完成的是前两步**（客户端 + 发评论），第三步是拿真实靶场
-仓库验收。但前两步的证据已经足够硬 —— 下面这次是**真的 HTTP**，
-评论从**容器里**发出去，而且限流退避是真的等过：
+三步：客户端 → `publish` 节点 → 真实靶场验收。**三种证据各管一件事** ——
+退避重试只能用桩（真 GitHub 不会配合你限流），真实发布只能用真 PR，
+而重复评论要靠重投（那个窗口平时撞不上）。
+
+#### 第一步：对着桩看退避
+
+下面这次是**真的 HTTP**，评论从**容器里**发出去，而且限流退避是真的等过：
 
 ```bash
 python tasks.py stub-github                 # 另一个终端：前 2 次发布返回 429
@@ -290,6 +298,91 @@ POST /repos/demo/sfly-playground/pulls/42/reviews     ← 201 ✓
 数据库里那一行：`status=published`、`github_comment_id=1001`。
 `inline_sent=14` 说明 **14 条行内评论全部落在真实的变更行上** ——
 桩在这方面比真 GitHub 还严（行号对不上就拒**整个** review，连汇总正文一起）。
+
+#### 第二步：真实 PR 上的真实评论
+
+靶场是 [`Satan508-h/sfly-playground`](https://github.com/Satan508-h/sfly-playground)
+（公开仓库）：`main` 上是一个干净的小 Flask 应用，PR #1 引入了一批典型问题
+—— 硬编码密钥、两条 SQL 拼接、`shell=True`、md5 当口令散列、`pickle.loads`、
+裸 `except:`、`== None`、`innerHTML = content`。
+
+```bash
+python tasks.py record-fixture --repo Satan508-h/sfly-playground --pr 1
+python tasks.py demo --follow
+```
+
+**fixture 是录出来的，不是编的。** `record-fixture` 用**产品自己的客户端**
+（`GitHubClient.pull_files` —— 同一套分页、同一套重试）去取 `/pulls/1/files`，
+连同仓库/PR 元数据写进 `fixtures/webhook_pr.json`。录完的那份载荷里，
+仓库名和 PR 号是真的，所以 `publish` 发出去的评论落在真的 PR 上。
+
+> 顺手验了一件事：被它替换掉的那份**手写** fixture，4 段 `patch` 和真实响应
+> **逐字相同** —— 连 7 个 hunk 头和行号都一致，真实响应只多了 `blob_url` /
+> `raw_url` / `contents_url` 三个我们不读的字段。当初照着 GitHub 的响应形状
+> 手写它没写错，但这件事从此不需要靠手写。
+
+结果（`gh api repos/Satan508-h/sfly-playground/pulls/1/reviews`）：
+
+```text
+  review id 5324355208   state=COMMENTED   user=Satan508-h
+  正文第一行 <!-- sfly:run:01M3DVHP409TBPY721JN9VTA0P -->（隐藏标记）
+  行内评论 14 条，全部锚定在真实变更行上
+```
+
+> 那个 PR 上现在有**两条** review（28 条行内评论），第二条是这之后又跑了一轮
+> 留下的：`demo` 默认会给载荷换一个 `head_sha`（模拟「往 PR 推了新提交」），
+> 而新提交换来一次新审查是**对的**。两条 review 的隐藏标记不同 ——
+> 它们属于两个不同的 run。**标记相同才会被闸 2 拦住**，那正是第三步验的东西。
+
+`state=COMMENTED` 而不是 `CHANGES_REQUESTED` 是**对的**，日志写着原因：
+
+```json
+{"event": "node.publish.own_pull_request", "repo": "Satan508-h/sfly-playground", "pr": 1,
+ "note": "机器人就是 PR 作者本人，GitHub 不允许给自己的 PR 请求修改 → 发 COMMENT"}
+```
+
+也就是说：报告算出了 `block_merge=true`（发现凭据泄露），但 GitHub 拒绝让一个
+账号给自己的 PR 请求修改。这条预检（`whoami()` 先问「我是谁」再决定发什么事件）
+此前只有单测覆盖 —— 现在是被真 GitHub 的 422 逼出来的。
+
+动手之前值得知道的三件事：
+
+* **每条评论都是真的。** `demo` 每跑一次换一个 `head_sha`，也就是每跑一次
+  往那个 PR 上多一条 review。演示时这正是要看到的，平时反复跑会让 PR 变乱。
+* **但同一个提交不会审两遍**：`scripts/replay_webhook.py --verbatim`（不改
+  `head_sha`）第二次起直接回 `duplicate 同一提交已经被审过（published）`，
+  连 run 都不会新建。
+* **完全不想碰 GitHub**：把 `.env` 里的 `GITHUB_TOKEN` 留空（`publish` 走
+  dry-run，状态仍是 `published`），或者用
+  `python -m sfly_workers --spec security --diff ...` 那条不接队列、不连数据库的路。
+
+#### 第三步：两道防重复闸也拿真 GitHub 验了
+
+这两道闸的**真实触发条件是「评论发出去了、写库/写状态那一步崩了」**，
+那是个毫秒级窗口，等不到也撞不准。所以 `scripts/replay_bootstrap.py` 换个方向：
+不去撞窗口，而是**把状态摆回窗口留下的样子**，然后把同一份 bootstrap 重投一遍。
+
+```bash
+python tasks.py replay-bootstrap --task-id 01M3DVHP409TBPY721JN9VTA0P --simulate-crash
+python tasks.py replay-bootstrap --task-id 01M3DVHP409TBPY721JN9VTA0P \
+       --simulate-crash --forget-comment-id
+```
+
+```text
+  第一次：form=already        reason=数据库里已有 comment id（节点重放，不重发）
+  第二次：form=adopted:review reason=评论已经在 PR 上（上次发出去之后写库失败了）
+          comment_id 5324355208 ← 从 PR 正文的隐藏标记里认出来的
+  库里 comment id -> 5324355208 ← 写回库了（自愈）
+  PR 上：两次重投的前后，reviews 与 inline 计数**完全没变**
+```
+
+第二次顺带证明了一件事：**「发出去但没记住」是可以自愈的** —— 标记认出来之后
+`mark_published` 会把 id 补回数据库，不需要人工介入。
+
+这里还撞出一个以前没写下来的事实：`GraphRunner` 在入口就会把**终态 run 的重投
+直接丢弃**（事件 `graph.bootstrap_ignored`）。那是对的（GitHub 超时重投同一个
+webhook 是常态，不能因此再审一遍），代价是「重投」这条路根本走不到 `publish` ——
+所以要验那两道闸，必须先 `--simulate-crash`。
 
 #### 三道闸，各挡一种不同的重复评论
 
@@ -718,7 +811,9 @@ DeepSeek 走 OpenAI 兼容接口，所以换成 OpenAI、vLLM 或本地模型只
 | **断线无缺口** | `python tasks.py demo --follow --drop-after 3` | 收到 3 条后主动断开，用 `Last-Event-ID` 重连补齐剩下的 9 条；脚本会拿详情接口对一遍，缺一条就报 `[!!]` |
 | **未验签的请求写不进库** | 配好 `GITHUB_WEBHOOK_SECRET` 后用错密钥投一次 | 401，且 `GET /api/deliveries` 里**不会**多出一行 |
 | **限流了真的会退避重发** | `python tasks.py stub-github` + 把 `GITHUB_API_BASE` 指向它 + `python tasks.py demo` | 桩先回两次 429（带 `retry-after`），编排器日志里出现两条 `github.retry`，第三次成功；评论**真的发出去了**（桩的 `/__state` 里能看到） |
-| 投递账户上不会重复评论 | 同上，再投一次 | 桩里仍然只有 1 条 review：`github_comment_id` 已经是同一行的 UPDATE，重放写的是同一列 |
+| **评论真的发到真实 PR 上** | `python tasks.py record-fixture --repo <owner/name> --pr <n>` 之后 `python tasks.py demo` | 那个 PR 上出现一条 review（正文开头是 `<!-- sfly:run:<id> -->`）+ 最多 25 条行内评论，全部锚在真实变更行上 |
+| **重放到真实 PR 上也不重复评论** | `python tasks.py replay-bootstrap --task-id <id> --simulate-crash` | 事件里 `form=already`，PR 上评论条数不变（`gh api .../pulls/<n>/reviews --jq length`） |
+| **发出去但没记住，能自愈** | 同一条再加上 `--forget-comment-id` | `form=adopted:review`：靠正文里的隐藏标记从 PR 上认回自己的评论，并把 id 写回库 |
 | 投递账本 | `GET /api/deliveries` | 每条投递的结局：`accepted` / `duplicate` / `ignored` / `rejected`，以及它转给了哪个 run |
 | 断点恢复 | `docker restart sfly-orchestrator-1` | 从 Postgres 的 checkpoint 续跑 |
 | Redis 重启不丢任务 | `docker restart sfly-redis` | 扫描器按 `attempt+1` 重派，消息排空 |
@@ -826,7 +921,8 @@ packages/
 web/             Vue 3 SPA
 infra/           postgres init（只有扩展，表由应用建）、redis conf、nginx conf
 fixtures/        diff 样例、录制的 webhook 载荷（含 /pulls/{n}/files 的响应）、大 PR
-scripts/        运维与演示脚本（replay_webhook.py 是 M6 的验收工具）
+scripts/        运维与演示脚本（replay_webhook.py 是 M6 的验收工具；
+                 record_pr_fixture.py 录真实 PR、replay_bootstrap.py 重投验防重复闸）
 tests/           contracts/（两个后端共用的行为契约，被 unit 与 integration 同时继承）
                  factories.py（领域对象工厂，三层测试共用同一批形状）
                  unit / integration / e2e / eval
@@ -845,18 +941,20 @@ API 不直接写 `review_tasks` —— 文件风险排序和规则检索由编�
 写在前面而不是藏在最后：一个未被说明的限制会被当成经验不足，一个被说明的限制
 则是严谨。
 
-- **`publish` 节点现在不发任何东西。** GitHub 客户端是 M7 的交付物，所以
-  `publish.done` 事件里明写 `posted: false`，`review_runs.github_comment_id`
+- **没有配 `GITHUB_TOKEN` 时，`publish` 是 dry-run。** 一行 HTTP 都不发，
+  `publish.done` 里明写 `posted: false`、`form: dry_run`，`github_comment_id`
   保持为空 —— **没有这个 id 的 run 就是没发过评论**，UI 不该显示「已评论」。
-  报告本身是完整的（正文已经在 `review_reports.comment_body` 里），
-  M7 只负责把它投出去。
-- **webhook 载荷里的补丁是「录制」的，不是实时取的。** GitHub 的 `pull_request`
-  事件**不带任何代码**，要拿补丁得再调一次 `GET /repos/{owner}/{repo}/pulls/{n}/files`
-  —— 那是 M7 的客户端。所以 `fixtures/webhook_pr.json` 里有一个 `files` 字段，
-  内容是那次 API 调用的录制结果（GitHub 的原始响应形状），
-  `scripts/replay_webhook.py` 回放的就是它。M7 的真实客户端会把 API 响应喂给
-  **同一个转换函数**，所以这两条路径不会分叉。**推论：现在没有任何东西验证过
-  「真实 GitHub 发来的载荷长什么样」** —— 这是 M7 要回答的第一个问题。
+  这**不是**失败：状态仍然是 `published`、报告是完整的（正文在
+  `review_reports.comment_body` 里），本地和 CI 因此不需要任何密钥就能跑通全链路。
+- **`GitHubClient.pull_files` 还没有任何运行时调用者。** GitHub 的 `pull_request`
+  事件**不带任何代码**，生产路径上必须在收到 webhook 之后立刻调一次
+  `GET /repos/{owner}/{repo}/pulls/{n}/files`，把响应塞进载荷的 `files` 字段 ——
+  **这一步现在由录制/回放脚本代劳，API 路由里还没有它**（要接它需要一个真实
+  webhook 入口，也就是 M10）。所以今天 `fixtures/webhook_pr.json` 里的 `files`
+  是一份录制结果，而不是每次投递现取的。
+  客户端本身是被真实调用过的（`record-fixture` 用它取的 `/pulls/1/files`，
+  同一套分页与重试），而两条路径最终喂给**同一个** `patches_from_files` ——
+  「回放能审、真上线审不了」这种分叉不会发生。
 - **SSE 是轮询（1 秒）而不是推送。** 换来的好处是实时与补齐共用同一条
   `seq > after_seq` 查询，两者不可能不一致。真要更低延迟，`LISTEN/NOTIFY`
   只该用来**提前唤醒**这个循环，而不是取代它。
@@ -884,16 +982,24 @@ API 不直接写 `review_tasks` —— 文件风险排序和规则检索由编�
   真实规模下的表现只有 M9 的评测集能回答。
 - **GitHub 真实二级限流只能用桩模拟。** `tests/github_stub.py` 模拟
   429/403 → 退避 → 201 的序列。桩是模型，不是真相。
-- **M7 的第三步（真实靶场仓库）还没做。** 所以现在 `python tasks.py demo`
-  走完 publish 会得到 `publish_failed` + 一个 404 —— 因为
-  `fixtures/webhook_pr.json` 里的仓库（`demo/sfly-playground`）**是个编出来的
-  名字**，真实 GitHub 上不存在。这不是 bug，是「载荷还是录制的」这件事的
-  直接后果；第三步会用真实 PR 重新录一份。另外 `python tasks.py review`
-  （从 diff 直接跑）**恒为 dry-run**：那条路上的 `repo_id` 是为了让幂等键
-  成立而编的，拿它去调 GitHub 只会稳定 404。
-- **闸 1 的真实重放路径没有在端到端里走到。** 「数据库里已有 comment id 就
-  不重发」由单测覆盖，端到端只验证到「id 真的落库了」。要在真实栈上触发它，
-  得让图重放 `publish` 节点（比如发布过程中重启编排器），这个场景没有构造。
+- **`python tasks.py review`（从 diff 直接跑）恒为 dry-run。** 那条路上的
+  `repo_id` 是为了让幂等键成立而编的（`--diff` 模式不接队列、不连数据库，
+  也没有 PR 号），拿它去调 GitHub 只会稳定 404。要看真实的发布，
+  走 `record-fixture` + `demo` 那条路（见 M7 那一节）。
+- **webhook 载荷是录的，不是 GitHub 现场推来的。** `record-fixture` 取的是
+  `/repos/{o}/{r}`、`/pulls/{n}`、`/pulls/{n}/files` 三个**拉取式**接口的响应，
+  再拼成 webhook 的形状。所以我们读的那些字段路径是被验证过的（拼错了会立刻
+  体现在报告里），但**「GitHub 真正推过来的整包长什么样」仍然没有端到端验证过**
+  —— 那需要一个公网可达的地址（M10 的 Render）和一个真实的 webhook secret。
+  这是部署上线后才能回答的第一个问题。
+- **两道防重复闸的触发窗口是「制造」出来的，不是撞出来的。**
+  它们的真实触发条件是「评论发出去了、写状态那一步崩了」，那是个毫秒级窗口。
+  `replay-bootstrap --simulate-crash` 把状态摆回那个窗口留下的样子再重投 ——
+  验的是**同一段代码路径**（图唤醒 → `publish` → 闸），但不是真的在那一刻
+  杀进程。真正那个竞态（POST 已返回、状态还没落库时断电）没有被测过。
+- **靶场用的细粒度 token 有到期日（2026-12-24）。** 到期后 `publish` 会 401，
+  而 401 被归类成 `retryable=False` —— 点「重新发布」不会好，得换 token。
+  分类是刻意的（换 token 才是处置方式），代价是这份演示三个月后要重配一次。
 - **Render 冷启动无法自动化测试。** 免费版休眠后首次请求约需 60 秒（Render 唤醒
   约 60s + Neon 唤醒约 1s）。需要人工冒烟测试并记录实测耗时。
 - **Neon 免费版空闲 5 分钟挂起且无法关闭。** 连接池必须传

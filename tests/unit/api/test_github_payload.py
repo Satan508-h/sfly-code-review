@@ -88,18 +88,50 @@ def test_the_round_trip_survives_a_hunk_only_patch() -> None:
 
 
 def test_the_payload_fields_land_where_they_should() -> None:
+    """字段映射：**期望值从载荷里取，不写死字面量**。
+
+    这份 fixture 是**录出来的**（``python tasks.py record-fixture``）——
+    换一个靶场 PR 就会换掉里面每一个 id。把 ``demo/sfly-playground`` 写死在
+    这里的话，重录一次就要跟着改一遍测试，而它红的时候说的是
+    「repo_id 不等于某个字符串」，完全指不出是哪一段映射坏了。于是那条断言
+    会退化成「照着新值改掉」的噪音。
+
+    左边是解析结果、右边是原始路径，这仍然是一次真正的映射断言：
+    取错字段（比如用 ``repository.name`` 而不是 ``full_name``，
+    或者用了顶层 ``number`` 而不是 ``pull_request.number``）照样会红。
+    """
     msg, _ = _bootstrap(RECORDED)
     assert msg is not None
-    assert msg.repo_id == "demo/sfly-playground"
-    assert msg.repo_node_id == "R_kgDOAbcdef"
-    assert msg.pr_number == 42
-    assert msg.pr_author == "contributor"
-    assert msg.pr_title == "重构用户接口并加上备份入口"
-    assert msg.installation_id == 987654
-    assert msg.base_sha == "1" * 40
+    repo = RECORDED["repository"]
+    pr = RECORDED["pull_request"]
+
+    assert msg.repo_id == repo["full_name"]
+    assert msg.repo_node_id == repo["node_id"]
+    assert msg.pr_number == pr["number"]
+    assert msg.pr_author == pr["user"]["login"]
+    assert msg.pr_title == pr["title"]
+    assert msg.base_sha == pr["base"]["sha"]
     # 空表示「全部」—— GitHub 不知道我们有几种 Worker（见 plan 节点）
     assert msg.requested_workers == []
     assert msg.file_patches[0].changed_lines, "变更行集合不该是空的"
+
+
+def test_the_installation_id_is_optional() -> None:
+    """``installation`` 只在 GitHub App 的投递里有，**没有它是合法的**。
+
+    这份录制是用 user token 手工开的 PR（所以 fixture 里刻意不带这个键），
+    而 ``None`` 在这里的含义是「不是 App 安装投递」，不是「载荷缺字段」——
+    契约层把它当可空字段，不是必填。
+    """
+    recorded, _ = _bootstrap(RECORDED)
+    assert recorded is not None
+    assert "installation" not in RECORDED
+    assert recorded.installation_id is None
+
+    # 另一端：工厂造的那份**带** installation，两个分支都要钉住。
+    synthetic, _ = _bootstrap(webhook_payload())
+    assert synthetic is not None
+    assert synthetic.installation_id == 987654
 
 
 def test_the_idempotency_key_is_computed_not_taken_from_the_payload() -> None:
@@ -112,7 +144,8 @@ def test_the_idempotency_key_is_computed_not_taken_from_the_payload() -> None:
     payload["idempotency_key"] = "1111111:9:deadbeef"
     msg, _ = _bootstrap(payload)
     assert msg is not None
-    assert msg.idempotency_key == f"demo/sfly-playground:42:{msg.head_sha}"
+    expected = f"{RECORDED['repository']['full_name']}:{RECORDED['pull_request']['number']}"
+    assert msg.idempotency_key == f"{expected}:{msg.head_sha}"
 
 
 def test_a_renamed_file_keeps_the_new_path() -> None:

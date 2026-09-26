@@ -59,7 +59,8 @@ packages/
 web/             Vue 3 + Element Plus + Vite SPA
 infra/           postgres init.sql、redis.conf、nginx 配置
 fixtures/        diff 样例、webhook payload、大 PR fixture
-scripts/         replay_webhook.py、measure_overhead.py、seed_db.py、demo_reclaim.py
+scripts/         replay_webhook.py、measure_overhead.py、seed_db.py、demo_reclaim.py、
+                 record_pr_fixture.py（录真实 PR 成载荷）、replay_bootstrap.py（重投验闸）
 tests/           contracts/（两后端共用的契约，被 unit 与 integration 同时导入）
                  unit（无 Docker 无密钥）/ integration（需 Docker 里的 Redis）/ e2e / eval
                  github_stub.py —— GitHub API 的桩（限流 / 422 / 分页）。
@@ -306,6 +307,20 @@ M5 实测踩到：报告显示 `degraded=True` 而 `missing_workers=[]`，前端
 「这次不行」，不是「这样发不行」，退到最后一格也一样，那只是白费几次请求。
 降级是**可见**的（事件里的 `form` 和 `reason`），不是悄悄换个行为。
 
+**终态的 run 会把重投的 bootstrap 丢掉 —— 于是防重复闸平时根本走不到。**
+`GraphRunner.handle` 先看 `run.status`，是终态就 ack 掉、什么都不做
+（事件 `graph.bootstrap_ignored`）。这是对的：GitHub 超时重投同一个 webhook 是
+常态，不能因此把审过的 PR 再审一遍。代价是 `publish` 那两道闸**只在
+「评论发出去了、状态还没写」那个毫秒级窗口里可达**，而那个窗口撞不上。
+
+所以要验它们只能把状态**摆回**窗口留下的样子：
+`python tasks.py replay-bootstrap --task-id <id> --simulate-crash`
+（再加 `--forget-comment-id` 就是闸 2 那条路）。实测两次都命中
+（`form=already` / `form=adopted:review`），PR 上评论数不变，第二次还把
+comment id 写回了库 —— 顺带证明「发出去但没记住」能自愈。
+**别把「重投一条 bootstrap」当成能走到 publish 的手段** —— 它先被入口那道闸拦下，
+而拦下来的时候日志只有一行 `graph.bootstrap_ignored`，看起来像什么都没发生。
+
 **验签必须对原始字节做，不对重新序列化后的 JSON 做。**
 `sha256=HMAC(secret, raw_body)`。先 `json.loads` 再 `json.dumps` 回去验签，
 键顺序/空白/非 ASCII 转义都可能变，于是 HMAC 一定对不上 —— 而症状是
@@ -441,6 +456,11 @@ python tasks.py demo-reclaim  # 队列容错演示：副本猝死 → 回收 →
 python tasks.py stub-github   # 起 GitHub 桩（限流/422/分页），手工看退避重发
                               # **必须走 tasks.py**：那个脚本 import 了 apps/api 的
                               # 转换函数，用系统 python 直接跑会报 No module named 'sfly_api'
+python tasks.py record-fixture --repo O/N --pr 3   # 从真实 PR 录 webhook 载荷
+                              # **会覆盖 fixtures/webhook_pr.json**，所以不给默认仓库名
+python tasks.py replay-bootstrap --task-id ID --simulate-crash
+                              # 重投一条已审过的 bootstrap，验 publish 的防重复闸
+                              # （不加 --simulate-crash 的话，终态 run 会被直接丢弃）
 
 python tasks.py lint       # ruff check + format --check
 python tasks.py fmt        # 自动格式化
@@ -496,7 +516,7 @@ python tasks.py demo --follow --drop-after 3   # 断开重连，SSE 无缺口
 - [x] M4 — Postgres 六张表 + `PostgresRunStore` + 幂等 migrate + Worker 常驻消费循环
 - [x] M5 — LangGraph 图（`interrupt()` 挂起/恢复）+ 协调协程 + 超时扫描器 + 主 Agent 聚合
 - [x] M6 — FastAPI 网关（HMAC 验签 + 两层去重）+ runs 接口 + SSE 带 Last-Event-ID 补齐
-- [ ] M7 — GitHub 客户端 + publish 节点
+- [x] M7 — GitHub 客户端 + publish 节点（真实靶场 PR 上发过评论；两道防重复闸实测过）
 - [ ] M8 — Vue SPA
 - [ ] M9 — 聚合硬化 + 评测集
 - [ ] M10 — 精简模式 + Render / Vercel 部署

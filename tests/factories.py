@@ -70,8 +70,13 @@ def demo_patches(name: str = DEMO_DIFF, *, max_patch_chars: int = 8_000) -> list
 #: 演示用的 webhook 载荷（``scripts/replay_webhook.py`` 的默认输入）。
 DEMO_WEBHOOK = "webhook_pr.json"
 
-#: 演示用的仓库与 PR。**不是真实存在的仓库** —— 载荷里的所有身份都是编的，
-#: 免得有人以为这里真连了 GitHub。
+#: **工厂**用的仓库与 PR。这个仓库不存在 —— 它是编的，而且刻意保持编的：
+#: ``webhook_payload()`` 造出来的每一份载荷都只是内存里的对象（测试里配
+#: 桩服务器或内存队列），名字指着一个真仓库会让人以为它们之间有联系。
+#:
+#: ``fixtures/webhook_pr.json`` 里那份**不一样**：它是真实录制
+#: （``python tasks.py record-fixture``），指向真实的靶场仓库 ——
+#: 因为那份载荷会被真的发出去、评论也会真的落在那个 PR 上。
 DEMO_REPO = "demo/sfly-playground"
 DEMO_PR = 42
 
