@@ -589,6 +589,25 @@ def cmd_web_install(_: argparse.Namespace) -> None:
     run(["npm", "install"], cwd=ROOT / "web")
 
 
+def cmd_test_web(args: argparse.Namespace) -> None:
+    """前端测试：vitest + jsdom。
+
+    **不需要后端、不需要浏览器、不花钱** —— 和 `test` 一样属于「随便跑」的那一档，
+    所以它挂在 CI 的 check job 里（见 .github/workflows/ci.yml）。
+
+    虽然跑在 Node 里，但被测的是**真实组件**：`mountWithUi` 会把 Element Plus
+    装上，并且让任何 Vue 警告直接判失败。不这么做的话，一个没注册的组件会
+    渲染成未知元素、插槽文字照样进 DOM，断言全绿而页面是坏的。
+    """
+    web = ROOT / "web"
+    if not _which("npm"):
+        _die("找不到 npm。")
+    if not (web / "node_modules").exists():
+        _step("首次运行，先装前端依赖")
+        run(["npm", "install"], cwd=web)
+    run(["npm", "run", "test" if not args.watch else "test:watch"], cwd=web, check=False)
+
+
 def _print_endpoints() -> None:
     """打印访问地址。端口从 .env 读 —— 这台机器上 5432/6379 常被别的项目占用，
     写死的话提示出来的地址是错的，比不提示更误导。"""
@@ -788,7 +807,13 @@ def build_parser() -> argparse.ArgumentParser:
         ],
     )
     add("web-install", cmd_web_install, "安装前端依赖")
-    add("web-dev", cmd_web_dev, "启动前端开发服务器")
+    add("web-dev", cmd_web_dev, "启动前端开发服务器（5273，热更新）")
+    add(
+        "test-web",
+        cmd_test_web,
+        "前端测试（vitest，不需要后端）",
+        [(("--watch",), {"action": "store_true", "help": "改动即重跑"})],
+    )
 
     return p
 

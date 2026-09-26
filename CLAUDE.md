@@ -472,12 +472,21 @@ python tasks.py web-dev      # 前端开发服务器（热更新）→ **5273**�
                              # 两者能同时绑上且都不报错，而 localhost 优先解析 ::1，
                              # 于是打开 5173 看到的是镜像里的旧构建、改代码毫无反应。
                              # 详见 web/vite.config.ts 的 server.port 那段。
+python tasks.py test-web     # 前端测试（vitest + jsdom，不需要后端）
 ```
 
 > **前端有两条验收路径，别混**：
 > `web-dev`（5273，热更新，对接 Docker 里的 api:8000）是**开发时**用的；
 > `python tasks.py up` 起的 `web` 容器（`WEB_HOST_PORT`，默认 5173）是**验收和演示**
 > 用的 —— 它跑的是 `npm run build` 的产物，改完代码要重新 `up` 才看得到。
+
+> **前端的测试有两道闸，别绕过它们**：
+> 渲染测试一律用 `web/src/testing/mount.ts` 的 `mountWithUi()` —— 它（1）把
+> Element Plus 按线上那样装上，（2）**让任何 Vue 警告直接判失败**。
+> 缺了第 1 条，未注册的组件会渲染成未知元素、插槽文字照样进 DOM，于是
+> 断言全绿而页面是坏的（实测发生过：6 条测试全绿，日志里躺着
+> `Failed to resolve component: el-tooltip`）；缺了第 2 条，这类问题永远没人看见。
+> 那条闸自己也有测试（`mount.spec.ts`）—— 它失效的表现是所有渲染测试照样全绿。
 
 > **单测在 Windows 上比 Linux 慢一个数量级，这是平台差异不是回归。**
 > 探测类测试连的是 `127.0.0.1:1`（保证连不上）。Linux 上拒绝连接是即时的，

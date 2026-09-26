@@ -4,10 +4,10 @@
  *
  * 这一页要在一屏里回答四个问题，顺序就是页面从上往下的顺序：
  *
- *   1. **这是在审什么？** —— 仓库、PR、提交、谁提的
- *   2. **审完了吗、出了问题吗？** —— 状态、降级徽章、阻断标记
- *   3. **审出了什么？** —— 按文件分组的发现（下一步接）
- *   4. **它到底怎么跑的？** —— 时间线（下一步接）
+ *   1. **这是在审什么？** —— 仓库、PR、提交、时间
+ *   2. **审完了吗、出了问题吗？** —— 状态、降级徽章、阻断标记、成本
+ *   3. **审出了什么？** —— 按文件分组的发现（本步）
+ *   4. **它到底怎么跑的？** —— 时间线（下一步）
  *
  * ### 「run 不存在」要当成正常状态处理，不是错误
  *
@@ -15,11 +15,29 @@
  * 而编排器要先消费到那条 bootstrap。正常在百毫秒级，但**这就是两个进程
  * 之间的真实延迟**，不是异常。所以这一页对 404 的处置是自动重试几次，
  * 而不是弹一个红色错误框。
+ *
+ * 这段重试**曾经是死的**：`load(auto)` 里判 `if (auto && ...)`，而
+ * `onMounted(() => void load())` 从不传参数 —— 于是 `auto` 恒为 `false`，
+ * 那句 setTimeout 一次都没执行过，页面文档却写着「会自动重试」。
+ * 是渲染测试抓出来的（`RunDetailView.spec.ts` 里那条「run 不存在时……并自动重试」）。
+ * 现在改成：**404 一定安排重试**，`auto` 只决定要不要显示骨架屏。
  */
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 
-import { fetchRun, prUrl, type RunDetailResponse } from '@/api/client'
-import { fmtCost, fmtInt, fmtDuration, fmtTime, RUN_STATUS_LABEL, RUN_STATUS_TYPE, shortSha } from '@/lib/format'
+import { fetchRun, prUrl, type AggregatedFinding, type RunDetailResponse, type Severity } from '@/api/client'
+import ConfidenceBar from '@/components/ConfidenceBar.vue'
+import FindingItem from '@/components/FindingItem.vue'
+import SeverityChip from '@/components/SeverityChip.vue'
+import {
+  fmtCost,
+  fmtDuration,
+  fmtInt,
+  fmtTime,
+  RUN_STATUS_LABEL,
+  RUN_STATUS_TYPE,
+  shortSha,
+} from '@/lib/format'
+import { decisionText, groupByFile, severityCounts, sortFindings } from '@/lib/findings'
 
 const props = defineProps<{ taskId: string }>()
 
@@ -34,14 +52,69 @@ const MAX_RETRY = 8
 const RETRY_MS = 800
 
 const run = computed(() => data.value?.run ?? null)
+const report = computed(() => data.value?.report ?? null)
 
-async function load(auto = false): Promise<void> {
-  if (!auto) loading.value = true
+const tab = ref<'findings' | 'timeline' | 'analysis'>('findings')
+
+// ── 发现 ────────────────────────────────────────────────────────────────── //
+
+/** 点击严重度标签筛选。`null` = 不筛。 */
+const levelFilter = ref<Severity | null>(null)
+
+const shownFindings = computed<AggregatedFinding[]>(() => {
+  const all = report.value?.findings ?? []
+  const filtered = levelFilter.value ? all.filter((f) => f.severity === levelFilter.value) : all
+  return sortFindings(filtered)
+})
+
+const groups = computed(() => groupByFile(shownFindings.value))
+const counts = computed(() => severityCounts(report.value?.findings ?? []))
+const suppressed = computed(() => report.value?.suppressed ?? [])
+
+const totalFindings = computed(() => report.value?.findings.length ?? 0)
+
+function toggleLevel(s: Severity): void {
+  levelFilter.value = levelFilter.value === s ? null : s
+}
+
+/** 「评论原文」对话框 —— 报告里那段要发到 PR 上的 Markdown。 */
+const commentOpen = ref(false)
+
+/** 挂起的重试定时器。**必须在卸载时清掉** —— 否则组件销毁之后它还会发一次请求，
+ *  而在测试里表现为「用例已经结束，却还有未决的定时器」。 */
+let retryTimer: ReturnType<typeof setTimeout> | null = null
+
+function clearRetry(): void {
+  if (retryTimer !== null) {
+    clearTimeout(retryTimer)
+    retryTimer = null
+  }
+}
+
+/**
+ * 404 之后安排下一次重试。
+ *
+ * 次数上限是必要的：地址本来就拼错的话，无限重试会让页面看起来在「加载中」
+ * 永远不结束，而正确的结果是明确告诉人「这个 id 不存在」。
+ */
+function scheduleRetry(): void {
+  if (retries.value >= MAX_RETRY) return
+  retries.value += 1
+  clearRetry()
+  retryTimer = setTimeout(() => void load({ auto: true }), RETRY_MS)
+}
+
+async function load(opts: { auto?: boolean } = {}): Promise<void> {
+  // `auto` 只决定**要不要显示骨架屏**：自动重试时把已有内容换成骨架屏，
+  // 页面会每 800 毫秒闪一次。它不参与「要不要重试」的判断 ——
+  // 那正是这里出过的 bug。
+  if (!opts.auto) loading.value = true
   try {
     data.value = await fetchRun(props.taskId)
     error.value = null
     notFound.value = false
     retries.value = 0
+    clearRetry()
   } catch (e) {
     // axios 的错误对象里才有状态码；拿不到就按「其他错误」处理。
     const status = (e as { response?: { status?: number } }).response?.status
@@ -49,23 +122,36 @@ async function load(auto = false): Promise<void> {
       notFound.value = true
       error.value = null
       // 刚投递完的窗口期：等编排器把 run 建出来。
-      if (auto && retries.value < MAX_RETRY) {
-        retries.value += 1
-        setTimeout(() => void load(true), RETRY_MS)
-        return
-      }
+      scheduleRetry()
     } else {
       error.value = e instanceof Error ? e.message : String(e)
+      clearRetry()
     }
   } finally {
     loading.value = false
   }
 }
 
+/** 「再试一次」按钮：人点了就重置计数，否则次数用完之后那一按什么也不会发生。 */
+function retryNow(): void {
+  retries.value = 0
+  void load()
+}
+
 onMounted(() => void load())
+onUnmounted(clearRetry)
 // 同一个组件复用于不同 run 时（从详情页跳到另一个 run），必须重新拉 ——
 // 否则页面会显示上一个 run 的数据，而且**看不出哪里不对**。
-watch(() => props.taskId, () => void load())
+watch(
+  () => props.taskId,
+  () => {
+    levelFilter.value = null
+    tab.value = 'findings'
+    retries.value = 0
+    clearRetry()
+    void load()
+  },
+)
 </script>
 
 <template>
@@ -87,7 +173,7 @@ watch(() => props.taskId, () => void load())
           </p>
         </template>
         <template #extra>
-          <el-button @click="load()">再试一次</el-button>
+          <el-button @click="retryNow()">再试一次</el-button>
           <el-button type="primary" @click="$router.push('/runs')">回到运行记录</el-button>
         </template>
       </el-result>
@@ -119,6 +205,15 @@ watch(() => props.taskId, () => void load())
             降级运行 —— {{ run.missing_workers.length }} 个 Worker 未上报
           </el-tag>
           <el-tag v-if="run.block_merge" type="danger" effect="plain">建议阻止合并</el-tag>
+
+          <el-button
+            v-if="report?.comment_body"
+            class="raw-btn"
+            size="small"
+            @click="commentOpen = true"
+          >
+            评论原文
+          </el-button>
         </div>
 
         <div class="bar-meta">
@@ -195,15 +290,164 @@ watch(() => props.taskId, () => void load())
         </el-col>
       </el-row>
 
-      <!-- ── 报告与时间线（下一步接） ──────────────────────────────── -->
-      <el-card shadow="never" class="placeholder">
-        <el-empty description="报告与时间线在下一步接入">
-          <p class="dim">
-            这一步（M8-1）打通的是「列表 → 详情」的取数与错误处理。
-            下一步接按文件分组的发现列表，再下一步接 SSE 实时时间线。
-          </p>
-        </el-empty>
-      </el-card>
+      <!-- ── 标签页 ────────────────────────────────────────────────── -->
+      <el-tabs v-model="tab" class="tabs">
+        <!-- 发现 -->
+        <el-tab-pane name="findings">
+          <template #label>
+            <span>发现</span>
+            <span v-if="report" class="n">{{ totalFindings }}</span>
+          </template>
+
+          <!-- run 还没跑到 finalize：报告不存在，这不是「没问题」 -->
+          <el-card v-if="!report" shadow="never">
+            <el-result
+              icon="info"
+              :title="run.status === 'failed' ? '这次审查失败了，没有报告' : '报告还没生成'"
+            >
+              <template #sub-title>
+                <p class="dim">
+                  {{
+                    run.status === 'failed'
+                      ? 'run 在汇总之前就失败了 —— 时间线里能看到是哪一步。'
+                      : '报告由 finalize 节点生成。这个 run 还在跑，切到「时间线」看进度。'
+                  }}
+                </p>
+              </template>
+            </el-result>
+          </el-card>
+
+          <template v-else>
+            <!-- 决策行：阻断与否 + 为什么。这句话来自确定性规则引擎，不是 LLM 写的 -->
+            <el-card shadow="never" class="decision" :class="{ block: report.block_merge }">
+              <div class="dec-main">
+                <strong class="dec-title">
+                  {{ report.block_merge ? '建议阻止合并' : '不阻断合并' }}
+                </strong>
+                <span class="dec-reason">{{ decisionText(report.decision_reason) }}</span>
+                <code class="dec-slug">{{ report.decision_reason }}</code>
+              </div>
+              <p class="dec-note">
+                阻断判断由确定性规则引擎做（不是 LLM）—— 这样同一份输入永远得到同一个结论，评测才可复现。
+                <strong>永不发 APPROVE</strong>：机器人审批人类 PR 是策略漏洞。
+              </p>
+            </el-card>
+
+            <!-- 严重度分布。点一下就是筛选 -->
+            <div class="dist">
+              <button
+                v-for="c in counts"
+                :key="c.severity"
+                class="dist-item"
+                :class="{ off: c.count === 0, active: levelFilter === c.severity }"
+                :disabled="c.count === 0"
+                @click="toggleLevel(c.severity)"
+              >
+                <SeverityChip :severity="c.severity" :count="c.count" />
+              </button>
+              <span v-if="levelFilter" class="clear" @click="levelFilter = null">清除筛选</span>
+              <span v-if="suppressed.length" class="suppressed-hint">
+                另有 {{ suppressed.length }} 条因置信度不足被拦下（未发布）
+              </span>
+            </div>
+
+            <!-- 没发现任何问题。这是**正常结果**，不是错误 —— clean.diff 就是为了
+                 验证这一点存在的：多数学生只测「能不能发现问题」，不测误报。 -->
+            <el-card v-if="totalFindings === 0" shadow="never">
+              <el-result icon="success" title="这次审查没有发现问题">
+                <template #sub-title>
+                  <p class="dim">
+                    干净的结果同样是有价值的证据 —— 评测集里专门有一组「无问题 diff」
+                    用来测误报率，因为只统计命中的精确率是没有意义的。
+                  </p>
+                </template>
+              </el-result>
+            </el-card>
+
+            <el-empty v-else-if="shownFindings.length === 0" description="当前筛选下没有发现" />
+
+            <!-- 按文件分组 -->
+            <el-card
+              v-for="g in groups"
+              v-else
+              :key="g.file"
+              shadow="never"
+              class="group"
+              :class="`sev-${g.worst}`"
+            >
+              <template #header>
+                <div class="group-head">
+                  <code class="file">{{ g.file }}</code>
+                  <span class="group-count">{{ g.findings.length }} 条</span>
+                  <SeverityChip :severity="g.worst" class="group-sev" />
+                </div>
+              </template>
+              <FindingItem v-for="f in g.findings" :key="`${f.file}:${f.line}:${f.category}`" :finding="f" />
+            </el-card>
+
+            <!-- 被置信度闸拦下的。**入库但不发布** —— 留着是为了测量这道闸
+                 砍掉了多少真实问题，否则阈值只能盲调。 -->
+            <el-collapse v-if="suppressed.length" class="suppressed">
+              <el-collapse-item :name="1">
+                <template #title>
+                  <span class="sup-title">被置信度闸拦下的 {{ suppressed.length }} 条</span>
+                  <span class="sup-sub">入库但不发布 —— 为什么留着它们是有意的</span>
+                </template>
+                <p class="sup-note">
+                  置信度低于 0.35 的发现会写进 <code>findings</code> 表但**不进 PR 评论**：
+                  它们是评测集测量「这道闸砍掉了多少真实问题」的唯一数据来源。
+                  只记录发出去的那些，阈值就永远只能靠感觉调。
+                </p>
+                <div class="sup-list">
+                  <div v-for="f in suppressed" :key="`${f.file}:${f.line}`" class="sup-row">
+                    <SeverityChip :severity="f.severity" />
+                    <code class="sup-where">{{ f.file }}:{{ f.line }}</code>
+                    <span class="sup-msg">{{ f.message }}</span>
+                    <ConfidenceBar :finding="f" />
+                  </div>
+                </div>
+              </el-collapse-item>
+            </el-collapse>
+          </template>
+        </el-tab-pane>
+
+        <!-- 时间线（下一步接） -->
+        <el-tab-pane name="timeline">
+          <template #label>
+            <span>时间线</span>
+            <span v-if="data" class="n">{{ data.events.length }}</span>
+          </template>
+          <el-card shadow="never">
+            <el-empty description="实时时间线在下一步接入">
+              <p class="dim">
+                这一步（M8-2）做的是「审出了什么」。下一步接 SSE 事件流：
+                七个节点的进度 + 逐条事件，断线重连按 <code>seq</code> 补齐缺口。
+              </p>
+            </el-empty>
+          </el-card>
+        </el-tab-pane>
+
+        <!-- 冲突与成本（第 4 步） -->
+        <el-tab-pane name="analysis">
+          <template #label><span>冲突与成本</span></template>
+          <el-card shadow="never">
+            <el-empty description="冲突面板与成本明细在第 4 步接入">
+              <p class="dim">
+                <strong>说明一件事</strong>：冲突面板现在必然是空的，而且不是因为这次没冲突 ——
+                聚类与冲突消解是 M9 还没做的部分（见
+                <code>aggregate/__init__.py</code>）。同样受影响的还有「跨 Worker 印证」：
+                现在每条发现的来源都只有一个 Worker。界面会在那一刻说明这一点，
+                而不是摆一个空白框让人以为坏了。
+              </p>
+            </el-empty>
+          </el-card>
+        </el-tab-pane>
+      </el-tabs>
+
+      <!-- 评论原文 -->
+      <el-dialog v-model="commentOpen" title="要发到 PR 上的原文" width="760px">
+        <pre class="comment-body">{{ report?.comment_body }}</pre>
+      </el-dialog>
     </template>
   </div>
 </template>
@@ -217,6 +461,9 @@ watch(() => props.taskId, () => void load())
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+.raw-btn {
+  margin-left: auto;
 }
 .pr-link {
   font-size: 15px;
@@ -270,9 +517,172 @@ watch(() => props.taskId, () => void load())
   line-height: 1.4;
 }
 
-.placeholder {
-  margin-top: 12px;
+.tabs {
+  margin-top: 16px;
 }
+.n {
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--sfly-border);
+  color: var(--sfly-text-dim);
+  font-size: 11px;
+}
+
+/* 决策 */
+.decision :deep(.el-card__body) {
+  padding: 12px 16px;
+}
+.decision {
+  border-left: 3px solid #16a34a;
+}
+.decision.block {
+  border-left-color: var(--sfly-critical);
+}
+.dec-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.dec-title {
+  font-size: 14px;
+}
+.decision.block .dec-title {
+  color: var(--sfly-critical);
+}
+.dec-reason {
+  font-size: 13px;
+  color: var(--sfly-text);
+}
+.dec-slug {
+  margin-left: auto;
+  color: var(--sfly-text-dim);
+  font-size: 11px;
+}
+.dec-note {
+  margin: 8px 0 0;
+  color: var(--sfly-text-dim);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* 分布 */
+.dist {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 12px 0;
+  flex-wrap: wrap;
+}
+.dist-item {
+  border: none;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+  border-radius: 999px;
+}
+.dist-item.active :deep(.chip) {
+  box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 30%, transparent);
+}
+.dist-item.off {
+  cursor: default;
+  opacity: 0.45;
+}
+.clear {
+  margin-left: 4px;
+  font-size: 12px;
+  color: #2563eb;
+  cursor: pointer;
+}
+.suppressed-hint {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--sfly-text-dim);
+}
+
+/* 分组 */
+.group {
+  margin-bottom: 12px;
+}
+.group :deep(.el-card__header) {
+  padding: 10px 14px;
+  background: var(--sfly-bg);
+}
+.group :deep(.el-card__body) {
+  padding: 0;
+}
+.group-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.file {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--sfly-text);
+}
+.group-count {
+  color: var(--sfly-text-dim);
+  font-size: 12px;
+}
+.group-sev {
+  margin-left: auto;
+}
+
+.suppressed {
+  margin-top: 4px;
+}
+.sup-title {
+  font-weight: 600;
+  font-size: 13px;
+}
+.sup-sub {
+  margin-left: 10px;
+  color: var(--sfly-text-dim);
+  font-size: 12px;
+}
+.sup-note {
+  margin: 0 0 10px;
+  color: var(--sfly-text-dim);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.sup-list {
+  display: flex;
+  flex-direction: column;
+}
+.sup-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-top: 1px solid var(--sfly-border);
+  font-size: 13px;
+}
+.sup-where {
+  color: var(--sfly-text-dim);
+  font-size: 11px;
+}
+.sup-msg {
+  flex: 1 1 auto;
+}
+
+.comment-body {
+  margin: 0;
+  padding: 14px;
+  background: var(--sfly-bg);
+  border: 1px solid var(--sfly-border);
+  border-radius: 6px;
+  font-family: var(--sfly-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
 .taskid {
   color: var(--sfly-text-dim);
 }

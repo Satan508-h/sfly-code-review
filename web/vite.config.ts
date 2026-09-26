@@ -1,7 +1,11 @@
 import { fileURLToPath, URL } from 'node:url'
 
 import vue from '@vitejs/plugin-vue'
-import { defineConfig } from 'vite'
+// 从 `vitest/config` 导入而不是 `vite` —— 它只是 vite 那个 defineConfig 的
+// 超集（多一个 `test` 字段的类型），`vite build` 读同一份配置照样工作。
+// 拆成 vitest.config.ts 的话，别名要维护两份，而**别名不一致的症状是
+// 测试里 import 不到、构建却完全正常**。
+import { defineConfig } from 'vitest/config'
 
 // 前端代码里**始终**用相对路径 `/api` 访问后端，两种模式的差异全在这里处理：
 //
@@ -69,5 +73,24 @@ export default defineConfig({
         },
       },
     },
+  },
+
+  // ------------------------------------------------------------------------- //
+  // 测试
+  // ------------------------------------------------------------------------- //
+  // 前端真正值得测的是**纯逻辑与渲染出来的内容**（排序、分组、置信度怎么显示），
+  // 而不是把组件的 DOM 结构钉死 —— 后者改一次样式就要改一次断言，最后所有人
+  // 都学会了「测试红了就改期望值」，那等于没有测试。
+  //
+  // 所以这里没有装 @vue/test-utils 的快照插件，也没有覆盖率门槛。断言写的都是
+  // 「页面上出现了什么字」，那种断言只有真的做错了才会红。
+  test: {
+    // jsdom 而不是 happy-dom：Element Plus 的组件会摸 document 上不少 API，
+    // jsdom 的覆盖更全，而这里的测试量级（毫秒级）完全不在乎那点性能差。
+    environment: 'jsdom',
+    // 不注入全局的 describe/it/expect —— 显式 `import { it } from 'vitest'`
+    // 能让 IDE 和 vue-tsc 都认得出这些符号，而全局变量需要用 types 声明，
+    // 声明漏了的表现是「类型检查报找不到 describe」。
+    globals: false,
   },
 })
