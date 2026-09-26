@@ -94,8 +94,24 @@ def frame(event: RunEvent) -> dict[str, str]:
     ``data`` 用单行 JSON（``model_dump_json`` 不换行）。SSE 允许多行 data，
     但每一行都要自己带 ``data:`` 前缀，手写时极易漏 —— 漏了的话那一行会被
     当成新字段名，客户端解析出一个残缺的对象。
+
+    ### 刻意**不**发 ``event:`` 字段
+
+    这里曾经写着 ``{"event": event.kind, ...}``，它有一个**静默到看不出问题**
+    的后果：SSE 规范里，带 ``event:`` 字段的帧**不会触发 ``onmessage``** ——
+    只会触发 ``addEventListener("<那个名字>")``。
+
+    于是「连接成功、然后一条事件都收不到」，而两侧看起来都是好的：服务端
+    在正常发帧，客户端的 ``onopen`` 正常触发。实测就是这么发现它的：
+    本文档下面那段示例客户端（``routes/events.py`` 里那段 ``es.onmessage = ...``）
+    照着写根本收不到东西。
+
+    为什么不反过来让客户端按类型注册监听器：那要求客户端**枚举所有事件类型**，
+    而服务端将来新增一个类型时，客户端会**悄悄不订阅它** —— 又一次同样的失败。
+    事件的类型已经作为 ``kind`` 在 ``data`` 的 JSON 里了，**一个事实一个来源**：
+    全走默认的 ``message``，客户端拿到 JSON 自己看 ``kind``。
     """
-    return {"event": event.kind, "id": str(event.seq), "data": event.model_dump_json()}
+    return {"id": str(event.seq), "data": event.model_dump_json()}
 
 
 async def event_stream(

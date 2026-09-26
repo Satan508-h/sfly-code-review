@@ -11,10 +11,10 @@
  * 在管。测试的边界要划在能被一次读懂的范围内。
  */
 import { flushPromises } from '@vue/test-utils'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { RunDetailResponse } from '@/api/client'
-import { aggregatedFinding, reviewReport, runRow } from '@/testing/factories'
+import type { RunDetailResponse, RunEvent } from '@/api/client'
+import { aggregatedFinding, completeRunEvents, reviewReport, runEvent, runRow } from '@/testing/factories'
 import { mountWithUi } from '@/testing/mount'
 
 import RunDetailView from './RunDetailView.vue'
@@ -40,7 +40,48 @@ async function render(response: RunDetailResponse, taskId = '01M3DVHP409TBPY721J
 
 beforeEach(() => {
   fetchRunMock.mockReset()
+  FakeEventSource.reset()
+  ;(globalThis as { EventSource?: unknown }).EventSource = FakeEventSource
 })
+
+afterEach(() => {
+  delete (globalThis as { EventSource?: unknown }).EventSource
+})
+
+/**
+ * 把浏览器那个全局的 `EventSource` 换成假的。
+ *
+ * `openRunStream` 是**在调用那一刻**去读 `globalThis.EventSource` 的，
+ * 所以这里装上就能接住——不用给组件开洞传参。
+ */
+class FakeEventSource {
+  static instances: FakeEventSource[] = []
+  static reset(): void {
+    FakeEventSource.instances = []
+  }
+  static last(): FakeEventSource {
+    const es = FakeEventSource.instances.at(-1)
+    if (!es) throw new Error('没有创建过 EventSource —— 详情页没有接流')
+    return es
+  }
+
+  onopen: ((ev: Event) => void) | null = null
+  onerror: ((ev: Event) => void) | null = null
+  onmessage: ((ev: MessageEvent<string>) => void) | null = null
+  closed = false
+  readonly url: string
+
+  constructor(url: string) {
+    this.url = url
+    FakeEventSource.instances.push(this)
+  }
+  close(): void {
+    this.closed = true
+  }
+  emit(event: RunEvent): void {
+    this.onmessage?.({ data: JSON.stringify(event) } as MessageEvent<string>)
+  }
+}
 
 describe('RunDetailView', () => {
   it('正常的一份报告：决策、分布、按文件分组都出来', async () => {
@@ -116,6 +157,58 @@ describe('RunDetailView', () => {
     })
     expect(wrapper.text()).toContain('降级运行')
     expect(wrapper.text()).toContain('1 个 Worker 未上报')
+  })
+
+  // ── 实时时间线（SSE）的接法 ─────────────────────────────────────────── //
+
+  it('正在跑的 run：从首屏最大的 seq 接着开流，新事件进时间线', async () => {
+    const history = completeRunEvents().slice(0, 3) // 建 run / 规划 / 派发
+    const cursor = history.at(-1)!.seq
+
+    const wrapper = await render({ run: runRow({ status: 'waiting' }), report: null, events: history })
+
+    // 首屏那批已经在页面上（不是开流之后才有的）
+    expect(wrapper.text()).toContain('Satan508-h/sfly-playground#1')
+    // **游标 = 首屏最大的 seq** —— 少了它会把已经显示过的事件再收一遍
+    expect(FakeEventSource.last().url).toContain(`after=${cursor}`)
+
+    FakeEventSource.last().emit(
+      runEvent({
+        seq: cursor + 1,
+        kind: 'aggregate.done',
+        payload: { findings: 3, conflicts: 0, suppressed: 0 },
+      }),
+    )
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('3 条发现')
+  })
+
+  it('收到 run.finished：收流，并重新拉一次把刚生成的报告补上', async () => {
+    const history = completeRunEvents().slice(0, 3)
+    const wrapper = await render({ run: runRow({ status: 'waiting' }), report: null, events: history })
+
+    fetchRunMock.mockResolvedValue({
+      run: runRow({ status: 'published' }),
+      report: reviewReport(),
+      events: completeRunEvents(),
+    })
+    FakeEventSource.last().emit(runEvent({ seq: 999, kind: 'run.finished', payload: { status: 'published' } }))
+    await flushPromises()
+
+    expect(FakeEventSource.last().closed).toBe(true)
+    // 报告是 finalize 之后才落库的 —— 不重拉的话，「边跑边看」的人会一直
+    // 盯着「报告还没生成」
+    expect(fetchRunMock.mock.calls.length).toBeGreaterThan(1)
+    expect(wrapper.text()).toContain('建议阻止合并')
+  })
+
+  it('已经跑完、事件也齐了的 run：根本不开流（否则会每 5 秒重连一次）', async () => {
+    await render({ run: runRow({ status: 'published' }), report: reviewReport(), events: completeRunEvents() })
+
+    // EventSource 在服务端关流后会自动重连，而服务端对终态 run 只会
+    // 再宽限 5 秒就关 —— 每连一次都是白连，而且永远不停
+    expect(FakeEventSource.instances).toHaveLength(0)
   })
 
   it('run 不存在时给出「还没到」而不是错误，并自动重试', async () => {

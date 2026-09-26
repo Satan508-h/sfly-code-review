@@ -122,8 +122,14 @@ export const EVENT_TYPE: Record<EventKind, 'primary' | 'success' | 'warning' | '
   'run.finished': 'success',
 }
 
-/** 流水线节点的展示顺序。计划里那七个，`ingest` 不单独记事件（它和 run.created 同拍）。 */
-export const NODES = ['plan', 'dispatch', 'wait', 'aggregate', 'finalize', 'publish'] as const
+/**
+ * 流水线节点的展示顺序 —— **和 README / 系统状态页上那张图是同一张**。
+ *
+ * 七个都要留着，包括 `ingest`：它虽然不单独发 `node.started`/`node.finished`
+ * （建 run 就是它干的，所以证据是 `run.created`），但把它从进度条上抹掉的话，
+ * 页面上的图就和文档里的图对不上了 —— 而那种不一致没人会报错。
+ */
+export const NODES = ['ingest', 'plan', 'dispatch', 'wait', 'aggregate', 'finalize', 'publish'] as const
 
 export const NODE_LABEL: Record<string, string> = {
   ingest: '解析载荷',

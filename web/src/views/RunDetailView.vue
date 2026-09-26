@@ -6,8 +6,8 @@
  *
  *   1. **这是在审什么？** —— 仓库、PR、提交、时间
  *   2. **审完了吗、出了问题吗？** —— 状态、降级徽章、阻断标记、成本
- *   3. **审出了什么？** —— 按文件分组的发现（本步）
- *   4. **它到底怎么跑的？** —— 时间线（下一步）
+ *   3. **审出了什么？** —— 按文件分组的发现
+ *   4. **它到底怎么跑的？** —— 事件时间线（SSE 实时）
  *
  * ### 「run 不存在」要当成正常状态处理，不是错误
  *
@@ -21,18 +21,35 @@
  * 那句 setTimeout 一次都没执行过，页面文档却写着「会自动重试」。
  * 是渲染测试抓出来的（`RunDetailView.spec.ts` 里那条「run 不存在时……并自动重试」）。
  * 现在改成：**404 一定安排重试**，`auto` 只决定要不要显示骨架屏。
+ *
+ * ### 时间线为什么「终态也可能开流」
+ *
+ * 首屏是全量的（`GET /api/runs/{id}` 一次给全），之后才接 SSE。一个已经跑完的
+ * run 通常不需要开流 —— 但有一个真实的窗口：`publish` **先写状态、后写事件**，
+ * 所以在那两步之间抓到详情页的话，run 读作已完成而最后那条 `run.finished`
+ * 还没落库。所以判据不是「run 到终态了吗」，而是「终态**且**事件齐了吗」。
  */
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 
-import { fetchRun, prUrl, type AggregatedFinding, type RunDetailResponse, type Severity } from '@/api/client'
+import {
+  fetchRun,
+  prUrl,
+  type AggregatedFinding,
+  type RunDetailResponse,
+  type RunEvent,
+  type Severity,
+} from '@/api/client'
+import { openRunStream, type RunStream } from '@/api/sse'
 import ConfidenceBar from '@/components/ConfidenceBar.vue'
 import FindingItem from '@/components/FindingItem.vue'
+import RunTimeline from '@/components/RunTimeline.vue'
 import SeverityChip from '@/components/SeverityChip.vue'
 import {
   fmtCost,
   fmtDuration,
   fmtInt,
   fmtTime,
+  isTerminal,
   RUN_STATUS_LABEL,
   RUN_STATUS_TYPE,
   shortSha,
@@ -55,6 +72,76 @@ const run = computed(() => data.value?.run ?? null)
 const report = computed(() => data.value?.report ?? null)
 
 const tab = ref<'findings' | 'timeline' | 'analysis'>('findings')
+
+// ── 时间线 ──────────────────────────────────────────────────────────────── //
+
+/** 首屏那批 + 流里新来的，按 seq 合并。走 SSE 时它就是页面上那条时间线。 */
+const events = ref<RunEvent[]>([])
+const streamState = ref<'connecting' | 'live' | 'closed' | 'unsupported'>('connecting')
+
+let stream: RunStream | null = null
+/** 收流用的计时器（见下面 `openStream` 的说明）。 */
+let streamTimer: ReturnType<typeof setTimeout> | null = null
+
+function closeStream(): void {
+  stream?.close()
+  stream = null
+  if (streamTimer !== null) {
+    clearTimeout(streamTimer)
+    streamTimer = null
+  }
+}
+
+/** 合并一条新事件。**按 seq 去重** —— 首屏那批和流之间允许重叠。 */
+function pushEvent(event: RunEvent): void {
+  if (events.value.some((e) => e.seq === event.seq)) return
+  events.value = [...events.value, event].sort((a, b) => a.seq - b.seq)
+}
+
+/**
+ * 接上事件流。
+ *
+ * `alreadyTerminal` 时开的是**有限时长**的流：只为了把可能还差的那条
+ * `run.finished` 等回来，等不到也得收 —— 否则服务端宽限期一过就关流，
+ * 而 EventSource 会**自动重连**，于是变成每 5 秒连一次的无限循环
+ * （服务端不会再有新事件，也就永远不会主动说不连了）。
+ */
+function openStream(cursor: number, alreadyTerminal: boolean): void {
+  closeStream()
+  if (typeof (globalThis as { EventSource?: unknown }).EventSource === 'undefined') {
+    streamState.value = 'unsupported'
+    return
+  }
+
+  streamState.value = 'connecting'
+  stream = openRunStream(props.taskId, cursor, {
+    onEvent: (event) => pushEvent(event),
+    onOpen: () => {
+      streamState.value = 'live'
+    },
+    onError: () => {
+      // 浏览器会自动重连并带上 Last-Event-ID，服务端负责补齐缺口 ——
+      // 所以这里只改状态，不自己写重连。
+      if (stream?.live) streamState.value = 'connecting'
+    },
+    onDone: (reason) => {
+      streamState.value = 'closed'
+      closeStream()
+      // 收到 run.finished 意味着报告刚刚才落库。**重新拉一次**，
+      // 否则「一边跑一边看」的人会一直看着「报告还没生成」。
+      if (reason === 'finished') void load({ auto: true })
+    },
+  })
+
+  if (alreadyTerminal) {
+    streamTimer = setTimeout(() => {
+      streamState.value = 'closed'
+      closeStream()
+    }, 15_000)
+  }
+}
+
+// ── 发现 ────────────────────────────────────────────────────────────────── //
 
 // ── 发现 ────────────────────────────────────────────────────────────────── //
 
@@ -115,6 +202,24 @@ async function load(opts: { auto?: boolean } = {}): Promise<void> {
     notFound.value = false
     retries.value = 0
     clearRetry()
+
+    // 首屏事件是全量的，所以时间线**先有内容再有连接** —— 不会出现
+    // 「报告已经显示了、时间线还在转圈」那个中间态。
+    events.value = [...data.value.events].sort((a, b) => a.seq - b.seq)
+    const cursor = events.value.reduce((max, e) => Math.max(max, e.seq), 0)
+    const terminal = isTerminal(data.value.run.status)
+    const hasFinished = events.value.some((e) => e.kind === 'run.finished')
+    if (terminal && hasFinished) {
+      // 跑完了、事件也齐了 —— 没有可等的
+      closeStream()
+      streamState.value = 'closed'
+    } else {
+      openStream(cursor, terminal)
+    }
+
+    // 正在跑的 run 默认落在时间线上：那一刻「发现」页只会说「报告还没生成」，
+    // 而人点进来想看的是「它跑到哪了」。
+    if (!terminal && data.value.report === null) tab.value = 'timeline'
   } catch (e) {
     // axios 的错误对象里才有状态码；拿不到就按「其他错误」处理。
     const status = (e as { response?: { status?: number } }).response?.status
@@ -139,9 +244,13 @@ function retryNow(): void {
 }
 
 onMounted(() => void load())
-onUnmounted(clearRetry)
+onUnmounted(() => {
+  clearRetry()
+  closeStream()
+})
 // 同一个组件复用于不同 run 时（从详情页跳到另一个 run），必须重新拉 ——
 // 否则页面会显示上一个 run 的数据，而且**看不出哪里不对**。
+// 流也必须重开：不关的话旧 run 的事件会混进新 run 的时间线。
 watch(
   () => props.taskId,
   () => {
@@ -149,6 +258,9 @@ watch(
     tab.value = 'findings'
     retries.value = 0
     clearRetry()
+    closeStream()
+    events.value = []
+    data.value = null
     void load()
   },
 )
@@ -411,20 +523,13 @@ watch(
           </template>
         </el-tab-pane>
 
-        <!-- 时间线（下一步接） -->
+        <!-- 时间线 -->
         <el-tab-pane name="timeline">
           <template #label>
             <span>时间线</span>
-            <span v-if="data" class="n">{{ data.events.length }}</span>
+            <span v-if="events.length" class="n">{{ events.length }}</span>
           </template>
-          <el-card shadow="never">
-            <el-empty description="实时时间线在下一步接入">
-              <p class="dim">
-                这一步（M8-2）做的是「审出了什么」。下一步接 SSE 事件流：
-                七个节点的进度 + 逐条事件，断线重连按 <code>seq</code> 补齐缺口。
-              </p>
-            </el-empty>
-          </el-card>
+          <RunTimeline :events="events" :status="run.status" :stream="streamState" />
         </el-tab-pane>
 
         <!-- 冲突与成本（第 4 步） -->

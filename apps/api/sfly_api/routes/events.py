@@ -8,6 +8,11 @@
     // 浏览器自动重连时**会带上 Last-Event-ID: <它收到的最后一个 id>**，
     // 服务端从表里补齐缺口 —— 前端不用自己写重连逻辑。
 
+上面那个 `onmessage` 能收到**全部**事件，因为帧里不带 `event:` 字段 ——
+带的话它只会触发 `addEventListener("<名字>")`，`onmessage` 一条都收不到，
+而那是「连接成功、然后永远静默」这种最难查的表现。理由写在 `sse.frame()`
+的文档里，`tests/unit/api/test_sse.py` 里有一条测试钉着它。
+
 两点必须知道：
 
 * **收到 ``run.finished`` 要自己 ``es.close()``。** EventSource 在服务端关流后

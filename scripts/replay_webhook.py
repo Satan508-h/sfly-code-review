@@ -319,7 +319,7 @@ def _short(value: Any) -> str:
     return text if len(text) <= _MAX_VALUE_CHARS else text[: _MAX_VALUE_CHARS - 1] + "…"
 
 
-def _print_event(seq: int, kind: str, raw: str) -> None:
+def _print_event(seq: int, sse_name: str, raw: str) -> None:
     """打一行时间线。
 
     取的是事件**自己的 payload**（``RunEvent.payload``），不是整条 RunEvent ——
@@ -327,15 +327,22 @@ def _print_event(seq: int, kind: str, raw: str) -> None:
     重复打 12 遍，而真正想看的信息（``node=plan``、``worker_type=security``）
     被挤到看不见的地方。``None`` 的字段也丢掉：``error_class=None`` 只说明
     「这个字段存在」，那件事读一次就知道了。
+
+    ``sse_name`` 是 SSE 帧的名字，**正常情况下永远是 ``"message"``** ——
+    服务端刻意不发 ``event:`` 字段（理由见 ``sfly_api/sse.py`` 的 ``frame()``）。
+    事件类型从 JSON 的 ``kind`` 取，那里才是唯一来源。
     """
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:  # pragma: no cover
         payload = {}
-    inner = payload.get("payload") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):  # pragma: no cover —— 坏帧不该让演示崩掉
+        payload = {}
+    kind = str(payload.get("kind") or sse_name)
+    inner = payload.get("payload")
     parts = [
         f"{k}={_short(v)}"
-        for k, v in (inner or {}).items()
+        for k, v in (inner if isinstance(inner, dict) else {}).items()
         if not isinstance(v, (dict, list)) and v is not None
     ]
     print(f"  #{seq:<4} {kind:<18} {' '.join(parts[:4])}")

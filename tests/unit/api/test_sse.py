@@ -8,6 +8,10 @@
 2. ``id`` 必须是 ``seq`` —— 它是重连时 ``Last-Event-ID`` 的来源，
    用别的东西当 id，重连会从错误的位置继续，而那种错误只在断线时才出现。
 3. 游标解析的三种输入（头、查询参数、垃圾）都要有明确的行为。
+4. 帧里**不能带 ``event:`` 字段** —— 带的话所有事件都跑到
+   ``addEventListener("<名字>")`` 上去了，而 ``onmessage``（也就是本文档
+   上面那段示例客户端用的那个）**一条都收不到**。症状是「连接成功、
+   然后永远静默」，两侧看起来都正常。
 
 轮询间隔与宽限期在测试里被调小（改的是**模块属性**，函数里读的正是它）——
 否则每条测试都要等 5 秒，而它验证的东西和「等多久」毫无关系。
@@ -97,11 +101,25 @@ def test_a_frame_uses_the_seq_as_its_id() -> None:
     """``id`` = ``seq``。见模块文档第 2 条。"""
     f = frame(event(17, "worker.result", worker_type="security"))
     assert f["id"] == "17"
-    assert f["event"] == "worker.result"
     # data 是整条 RunEvent（含它自己的 payload 字段），不是只把 payload 展开 ——
     # 客户端拿到的是完整的事件对象，和 ``GET /api/runs/{id}`` 里那个形状一致。
     assert _data(f)["payload"]["worker_type"] == "security"
     assert _data(f)["seq"] == 17
+    assert _data(f)["kind"] == "worker.result"
+
+
+def test_a_frame_has_no_named_event() -> None:
+    """**帧里不能有 ``event`` 字段。** 见模块文档第 4 条。
+
+    这条测试是「钉住一个**不存在**的东西」，看起来有点怪 —— 但它挡住的失败
+    非常具体：一加上 ``event``，所有事件都会绕过 ``onmessage``，
+    于是照着 ``routes/events.py`` 里那段示例写的客户端（包括这个项目自己的
+    前端）会**连接成功然后一条事件都收不到**。实测就是这么撞上的。
+    """
+    f = frame(event(1, "run.created", files=2))
+    assert "event" not in f
+    # 事件的类型仍然在，只是只有**一个**来源：data 里的 kind
+    assert _data(f)["kind"] == "run.created"
 
 
 def test_the_data_is_a_single_line() -> None:
@@ -178,7 +196,7 @@ async def test_an_event_written_after_the_terminal_status_is_still_delivered() -
     store.on_poll = _finish
     frames = await asyncio.wait_for(_collect(store), timeout=3)
     assert [f["id"] for f in frames] == ["1", "2"]
-    assert frames[-1]["event"] == "run.finished"
+    assert _data(frames[-1])["kind"] == "run.finished"
 
 
 async def test_a_running_run_keeps_the_stream_open_and_delivers_what_arrives_later() -> None:
