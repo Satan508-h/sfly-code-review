@@ -56,7 +56,10 @@ packages/
   agent-core/    sfly_agent — LLM 抽象与结构化输出（含 pricing.py）、RAG、
                  state.py 图状态、risk.py 文件风险排序、labels.py 显示层标签、
                  aggregate/ 主 Agent 的聚合（全确定性、零 LLM 调用）、GitHub 客户端
-web/             Vue 3 + Element Plus + Vite SPA
+web/             Vue 3 + Element Plus + Vite SPA（Pinia / vue-router）
+                 lib/ 全是纯函数（格式化、分组、事件摘要）—— 前端值得测的就是这些
+                 testing/mount.ts 是**唯一**的挂载入口，它让 Vue 警告判失败
+                 eslint.config.js 只管对错、.prettierrc 只管格式（和 ruff 的分工一致）
 infra/           postgres init.sql、redis.conf、nginx 配置
 fixtures/        diff 样例、webhook payload、大 PR fixture
 scripts/         replay_webhook.py、measure_overhead.py、seed_db.py、demo_reclaim.py、
@@ -555,7 +558,7 @@ python tasks.py demo --follow --drop-after 3   # 断开重连，SSE 无缺口
 - [x] M5 — LangGraph 图（`interrupt()` 挂起/恢复）+ 协调协程 + 超时扫描器 + 主 Agent 聚合
 - [x] M6 — FastAPI 网关（HMAC 验签 + 两层去重）+ runs 接口 + SSE 带 Last-Event-ID 补齐
 - [x] M7 — GitHub 客户端 + publish 节点（真实靶场 PR 上发过评论；两道防重复闸实测过）
-- [ ] M8 — Vue SPA
+- [x] M8 — Vue SPA（列表 / 详情三标签 / 实时时间线 / 系统状态；66 条前端测试 + CI 的 web job）
 - [ ] M9 — 聚合硬化 + 评测集
 - [ ] M10 — 精简模式 + Render / Vercel 部署
 - [ ] M11 — 可选：pgvector、LLM 冲突消解 A/B

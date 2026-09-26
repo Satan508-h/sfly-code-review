@@ -1,0 +1,7 @@
+# 构建产物与依赖
+dist/
+node_modules/
+# lock 文件由 npm 维护，格式化它只会制造无意义的 diff
+package-lock.json
+# TS 的增量构建缓存
+*.tsbuildinfo

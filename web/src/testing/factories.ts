@@ -13,7 +13,27 @@
  * 造的是合成载荷（只进内存和桩），真实的那个在 `fixtures/webhook_pr.json`。
  */
 
-import type { AggregatedFinding, ReviewReport, RunEvent, RunRow } from '@/api/client'
+import type {
+  AggregatedFinding,
+  ConflictRecord,
+  ReviewReport,
+  RunEvent,
+  RunRow,
+} from '@/api/client'
+
+export function conflictRecord(over: Partial<ConflictRecord> = {}): ConflictRecord {
+  return {
+    file: 'app/api.py',
+    line: 32,
+    winner_worker: 'security',
+    loser_worker: 'style',
+    winner_severity: 'critical',
+    loser_severity: 'low',
+    resolution_rule: 'category_authority',
+    rationale: '命令注入属于 security 的职责域，直接胜出',
+    ...over,
+  }
+}
 
 /** 一条时间线事件。默认是「一条普通的 Worker 上报」，测试只覆盖自己关心的字段。 */
 export function runEvent(over: Partial<RunEvent> = {}): RunEvent {
@@ -133,7 +153,13 @@ export function completeRunEvents(): RunEvent[] {
     runEvent({
       seq: 181,
       kind: 'worker.result',
-      payload: { status: 'ok', findings: 2, latency_ms: 1, error_class: null, worker_type: 'performance' },
+      payload: {
+        status: 'ok',
+        findings: 2,
+        latency_ms: 1,
+        error_class: null,
+        worker_type: 'performance',
+      },
     }),
     runEvent({
       seq: 184,

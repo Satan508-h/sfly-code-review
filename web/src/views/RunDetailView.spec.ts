@@ -14,7 +14,13 @@ import { flushPromises } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { RunDetailResponse, RunEvent } from '@/api/client'
-import { aggregatedFinding, completeRunEvents, reviewReport, runEvent, runRow } from '@/testing/factories'
+import {
+  aggregatedFinding,
+  completeRunEvents,
+  reviewReport,
+  runEvent,
+  runRow,
+} from '@/testing/factories'
 import { mountWithUi } from '@/testing/mount'
 
 import RunDetailView from './RunDetailView.vue'
@@ -91,7 +97,12 @@ describe('RunDetailView', () => {
         decision_reason: 'secrets_found',
         findings: [
           aggregatedFinding({ file: 'app/api.py', line: 32, severity: 'critical' }),
-          aggregatedFinding({ file: 'app/db.py', line: 18, severity: 'medium', message: 'SQL 拼接' }),
+          aggregatedFinding({
+            file: 'app/db.py',
+            line: 18,
+            severity: 'medium',
+            message: 'SQL 拼接',
+          }),
         ],
       }),
       events: [],
@@ -123,7 +134,11 @@ describe('RunDetailView', () => {
   it('一条问题都没有时给出空状态（那是正常结果，不是错误）', async () => {
     const wrapper = await render({
       run: runRow(),
-      report: reviewReport({ findings: [], block_merge: false, decision_reason: 'below_threshold' }),
+      report: reviewReport({
+        findings: [],
+        block_merge: false,
+        decision_reason: 'below_threshold',
+      }),
       events: [],
     })
 
@@ -137,7 +152,11 @@ describe('RunDetailView', () => {
       run: runRow(),
       report: reviewReport({
         suppressed: [
-          aggregatedFinding({ message: '可疑但不确定的一条', stage: 'suppressed', adjusted_confidence: 0.2 }),
+          aggregatedFinding({
+            message: '可疑但不确定的一条',
+            stage: 'suppressed',
+            adjusted_confidence: 0.2,
+          }),
         ],
       }),
       events: [],
@@ -165,7 +184,11 @@ describe('RunDetailView', () => {
     const history = completeRunEvents().slice(0, 3) // 建 run / 规划 / 派发
     const cursor = history.at(-1)!.seq
 
-    const wrapper = await render({ run: runRow({ status: 'waiting' }), report: null, events: history })
+    const wrapper = await render({
+      run: runRow({ status: 'waiting' }),
+      report: null,
+      events: history,
+    })
 
     // 首屏那批已经在页面上（不是开流之后才有的）
     expect(wrapper.text()).toContain('Satan508-h/sfly-playground#1')
@@ -186,14 +209,20 @@ describe('RunDetailView', () => {
 
   it('收到 run.finished：收流，并重新拉一次把刚生成的报告补上', async () => {
     const history = completeRunEvents().slice(0, 3)
-    const wrapper = await render({ run: runRow({ status: 'waiting' }), report: null, events: history })
+    const wrapper = await render({
+      run: runRow({ status: 'waiting' }),
+      report: null,
+      events: history,
+    })
 
     fetchRunMock.mockResolvedValue({
       run: runRow({ status: 'published' }),
       report: reviewReport(),
       events: completeRunEvents(),
     })
-    FakeEventSource.last().emit(runEvent({ seq: 999, kind: 'run.finished', payload: { status: 'published' } }))
+    FakeEventSource.last().emit(
+      runEvent({ seq: 999, kind: 'run.finished', payload: { status: 'published' } }),
+    )
     await flushPromises()
 
     expect(FakeEventSource.last().closed).toBe(true)
@@ -204,7 +233,11 @@ describe('RunDetailView', () => {
   })
 
   it('已经跑完、事件也齐了的 run：根本不开流（否则会每 5 秒重连一次）', async () => {
-    await render({ run: runRow({ status: 'published' }), report: reviewReport(), events: completeRunEvents() })
+    await render({
+      run: runRow({ status: 'published' }),
+      report: reviewReport(),
+      events: completeRunEvents(),
+    })
 
     // EventSource 在服务端关流后会自动重连，而服务端对终态 run 只会
     // 再宽限 5 秒就关 —— 每连一次都是白连，而且永远不停

@@ -589,6 +589,35 @@ def cmd_web_install(_: argparse.Namespace) -> None:
     run(["npm", "install"], cwd=ROOT / "web")
 
 
+def cmd_lint_web(_: argparse.Namespace) -> None:
+    """前端 lint + 格式检查（ESLint + Prettier）。
+
+    和 Python 那边的分工完全对称：``eslint`` 管**对错**、``prettier`` 管**格式**。
+    这是**刻意**的 —— 一旦 lint 里混进几十条格式规则，报出来的东西就不再是
+    「这里可能错了」，而所有人都会学会一眼扫过就算，那道闸也就等于没有。
+    """
+    web = ROOT / "web"
+    if not _which("npm"):
+        _die("找不到 npm。")
+    if not (web / "node_modules").exists():
+        _step("首次运行，先装前端依赖")
+        run(["npm", "install"], cwd=web)
+    run(["npm", "run", "lint"], cwd=web)
+    run(["npm", "run", "format:check"], cwd=web)
+    _ok("前端 lint 通过")
+
+
+def cmd_fmt_web(_: argparse.Namespace) -> None:
+    """自动格式化前端代码（Prettier）。"""
+    web = ROOT / "web"
+    if not _which("npm"):
+        _die("找不到 npm。")
+    if not (web / "node_modules").exists():
+        _step("首次运行，先装前端依赖")
+        run(["npm", "install"], cwd=web)
+    run(["npm", "run", "format"], cwd=web)
+
+
 def cmd_test_web(args: argparse.Namespace) -> None:
     """前端测试：vitest + jsdom。
 
@@ -808,6 +837,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add("web-install", cmd_web_install, "安装前端依赖")
     add("web-dev", cmd_web_dev, "启动前端开发服务器（5273，热更新）")
+    add("lint-web", cmd_lint_web, "前端 lint + 格式检查（ESLint + Prettier）")
+    add("fmt-web", cmd_fmt_web, "自动格式化前端代码（Prettier）")
     add(
         "test-web",
         cmd_test_web,

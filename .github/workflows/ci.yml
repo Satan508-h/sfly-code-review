@@ -146,3 +146,53 @@ jobs:
           REDIS_URL: redis://localhost:6379/0
           DATABASE_URL: postgresql://sfly:sfly@localhost:5432/sfly
         run: uv run pytest -m integration -o addopts="-q --strict-markers -ra"
+
+  web:
+    # 前端：lint + 类型 + 测试 + 构建。
+    #
+    # 为什么值得单独一个 job 而不是塞进 check：那一步是**纯 Python 环境**
+    # （uv sync），装 Node 会让它从「十几秒的门槛」变成「几分钟」，而门槛
+    # 存在的意义正是**快**——一个慢到让人跳过的检查等于没有检查。
+    #
+    # 四步的顺序是有讲究的，从快到慢：类型检查（几秒）→ lint（几秒）→
+    # 测试（几秒）→ 构建（十几秒）。前一步红掉后面就不跑，反馈最快。
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        working-directory: web
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          # 缓存键跟着 lock 文件走 —— 不写这个的话每次 CI 都要从零装
+          # 三百多个包，而那一步失败的样子和「依赖真的坏了」一模一样。
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 按 lock 文件装依赖
+        # `npm ci` 而不是 `npm install`：lock 与 package.json 不一致时直接失败，
+        # 而不是静默重新解析。和 Python 那边的 `uv sync --frozen` 是同一个纪律。
+        run: npm ci --no-audit --no-fund
+
+      - name: 类型检查（vue-tsc 严格模式，含模板）
+        run: npm run typecheck
+
+      - name: Lint（ESLint + Prettier）
+        run: |
+          npm run lint
+          npm run format:check
+
+      - name: 前端测试（vitest + jsdom）
+        # 不需要后端、不需要浏览器、不花钱 —— 和 unit 那一档一样属于「随便跑」
+        run: npm test
+
+      - name: 构建
+        # 只跑 build 不跑 typecheck：上面已经查过类型了，`npm run build` 里
+        # 那条 `vue-tsc -b` 是给本地和镜像用的。
+        run: npx vite build

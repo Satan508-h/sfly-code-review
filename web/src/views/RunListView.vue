@@ -151,14 +151,7 @@ onUnmounted(() => store.stop())
 
     <el-empty v-else-if="rows.length === 0" description="当前筛选条件下没有记录" />
 
-    <el-table
-      v-else
-      :data="rows"
-      class="table"
-      size="small"
-      row-key="task_id"
-      @row-click="open"
-    >
+    <el-table v-else :data="rows" class="table" size="small" row-key="task_id" @row-click="open">
       <el-table-column label="状态" width="112">
         <template #default="{ row }">
           <el-tag :type="RUN_STATUS_TYPE[(row as RunRow).status]" size="small" effect="light">
@@ -169,13 +162,7 @@ onUnmounted(() => store.stop())
 
       <el-table-column label="仓库 / PR" min-width="230">
         <template #default="{ row }">
-          <a
-            class="repo"
-            :href="prUrl(row as RunRow)"
-            target="_blank"
-            rel="noopener"
-            @click.stop
-          >
+          <a class="repo" :href="prUrl(row as RunRow)" target="_blank" rel="noopener" @click.stop>
             {{ (row as RunRow).repo_id }} <span class="pr">#{{ (row as RunRow).pr_number }}</span>
           </a>
           <div class="sub">
@@ -194,7 +181,10 @@ onUnmounted(() => store.stop())
           </span>
           <!-- 大 PR 会被裁到前 N 个文件。这件事必须显示出来，否则「只审了 40 个」
                会被读成「只改了 40 个」 -->
-          <el-tooltip v-if="(row as RunRow).diff_truncated" content="diff 过大，只审了风险最高的前几个文件">
+          <el-tooltip
+            v-if="(row as RunRow).diff_truncated"
+            content="diff 过大，只审了风险最高的前几个文件"
+          >
             <span class="warn">裁剪</span>
           </el-tooltip>
         </template>

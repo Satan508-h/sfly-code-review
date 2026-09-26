@@ -47,13 +47,12 @@ const hint = computed(() => ruleHint(f.value.rule_id))
     <!-- 证据：那段代码本身。**逐字来自 diff**，不是模型转述的 -->
     <pre v-if="f.evidence" class="evidence">{{ f.evidence }}</pre>
 
-    <p v-if="f.suggestion" class="suggestion">
-      <span class="lead">建议</span>{{ f.suggestion }}
-    </p>
+    <p v-if="f.suggestion" class="suggestion"><span class="lead">建议</span>{{ f.suggestion }}</p>
 
     <footer class="meta">
       <span v-if="showFile" class="where">
-        <code>{{ f.file }}</code>:{{ f.line }}
+        <code>{{ f.file }}</code
+        >:{{ f.line }}
       </span>
       <span v-else class="where">行 {{ f.line }}{{ f.end_line ? `–${f.end_line}` : '' }}</span>
 
@@ -71,11 +70,7 @@ const hint = computed(() => ruleHint(f.value.rule_id))
       </el-tooltip>
 
       <span class="sources">
-        <el-tooltip
-          v-for="w in f.sources"
-          :key="w"
-          :content="`${WORKER_LABEL[w]} Worker 上报的`"
-        >
+        <el-tooltip v-for="w in f.sources" :key="w" :content="`${WORKER_LABEL[w]} Worker 上报的`">
           <span class="wdot" :style="{ background: `var(${WORKER_VAR[w]})` }" />
         </el-tooltip>
       </span>

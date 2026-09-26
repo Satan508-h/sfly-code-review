@@ -68,7 +68,9 @@ export function groupByFile(list: readonly AggregatedFinding[]): FileGroup[] {
 }
 
 /** 各严重度的条数，**固定顺序**（从重到轻）—— 返回值直接拿去做分布条，不需要再排。 */
-export function severityCounts(list: readonly AggregatedFinding[]): { severity: Severity; count: number }[] {
+export function severityCounts(
+  list: readonly AggregatedFinding[],
+): { severity: Severity; count: number }[] {
   return SEVERITY_ORDER.map((severity) => ({
     severity,
     count: list.filter((f) => f.severity === severity).length,

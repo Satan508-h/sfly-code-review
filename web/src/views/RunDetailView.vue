@@ -41,6 +41,8 @@ import {
 } from '@/api/client'
 import { openRunStream, type RunStream } from '@/api/sse'
 import ConfidenceBar from '@/components/ConfidenceBar.vue'
+import ConflictsPanel from '@/components/ConflictsPanel.vue'
+import CostPanel from '@/components/CostPanel.vue'
 import FindingItem from '@/components/FindingItem.vue'
 import RunTimeline from '@/components/RunTimeline.vue'
 import SeverityChip from '@/components/SeverityChip.vue'
@@ -329,9 +331,13 @@ watch(
         </div>
 
         <div class="bar-meta">
-          <span>提交 <code>{{ shortSha(run.head_sha) }}</code></span>
+          <span
+            >提交 <code>{{ shortSha(run.head_sha) }}</code></span
+          >
           <span class="sep">·</span>
-          <span>基线 <code>{{ shortSha(run.base_sha) }}</code></span>
+          <span
+            >基线 <code>{{ shortSha(run.base_sha) }}</code></span
+          >
           <span class="sep">·</span>
           <span>{{ fmtTime(run.created_at) }}</span>
           <template v-if="run.published_at">
@@ -440,7 +446,8 @@ watch(
                 <code class="dec-slug">{{ report.decision_reason }}</code>
               </div>
               <p class="dec-note">
-                阻断判断由确定性规则引擎做（不是 LLM）—— 这样同一份输入永远得到同一个结论，评测才可复现。
+                阻断判断由确定性规则引擎做（不是 LLM）——
+                这样同一份输入永远得到同一个结论，评测才可复现。
                 <strong>永不发 APPROVE</strong>：机器人审批人类 PR 是策略漏洞。
               </p>
             </el-card>
@@ -494,7 +501,11 @@ watch(
                   <SeverityChip :severity="g.worst" class="group-sev" />
                 </div>
               </template>
-              <FindingItem v-for="f in g.findings" :key="`${f.file}:${f.line}:${f.category}`" :finding="f" />
+              <FindingItem
+                v-for="f in g.findings"
+                :key="`${f.file}:${f.line}:${f.category}`"
+                :finding="f"
+              />
             </el-card>
 
             <!-- 被置信度闸拦下的。**入库但不发布** —— 留着是为了测量这道闸
@@ -532,19 +543,37 @@ watch(
           <RunTimeline :events="events" :status="run.status" :stream="streamState" />
         </el-tab-pane>
 
-        <!-- 冲突与成本（第 4 步） -->
+        <!-- 冲突与成本 -->
         <el-tab-pane name="analysis">
-          <template #label><span>冲突与成本</span></template>
-          <el-card shadow="never">
-            <el-empty description="冲突面板与成本明细在第 4 步接入">
-              <p class="dim">
-                <strong>说明一件事</strong>：冲突面板现在必然是空的，而且不是因为这次没冲突 ——
-                聚类与冲突消解是 M9 还没做的部分（见
-                <code>aggregate/__init__.py</code>）。同样受影响的还有「跨 Worker 印证」：
-                现在每条发现的来源都只有一个 Worker。界面会在那一刻说明这一点，
-                而不是摆一个空白框让人以为坏了。
-              </p>
-            </el-empty>
+          <template #label>
+            <span>冲突与成本</span>
+            <span v-if="report?.conflicts.length" class="n">{{ report.conflicts.length }}</span>
+          </template>
+
+          <el-card shadow="never" class="block">
+            <template #header>
+              <span class="block-title">冲突消解</span>
+              <span class="block-hint">确定性规则引擎 · 不用 LLM 裁判</span>
+            </template>
+            <ConflictsPanel :conflicts="report?.conflicts ?? []" />
+          </el-card>
+
+          <el-card shadow="never" class="block">
+            <template #header>
+              <span class="block-title">成本与规模</span>
+              <span class="block-hint">单次审查的实际开销 —— 面试里几乎一定会被问的那个数</span>
+            </template>
+            <CostPanel
+              v-if="run.totals"
+              :totals="run.totals"
+              :files-total="run.files_total"
+              :files-reviewed="run.files_reviewed"
+              :diff-truncated="run.diff_truncated"
+              :findings="report?.findings.length"
+              :suppressed="report?.suppressed.length"
+              :report="report"
+            />
+            <el-empty v-else description="这个 run 还没有成本数据" />
           </el-card>
         </el-tab-pane>
       </el-tabs>
@@ -632,6 +661,22 @@ watch(
   background: var(--sfly-border);
   color: var(--sfly-text-dim);
   font-size: 11px;
+}
+
+.block {
+  margin-bottom: 12px;
+}
+.block :deep(.el-card__header) {
+  padding: 10px 16px;
+  background: var(--sfly-bg);
+}
+.block-title {
+  font-weight: 600;
+}
+.block-hint {
+  margin-left: 10px;
+  color: var(--sfly-text-dim);
+  font-size: 12px;
 }
 
 /* 决策 */

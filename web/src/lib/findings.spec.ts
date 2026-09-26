@@ -27,7 +27,10 @@ describe('sortFindings', () => {
   it('不改动传入的数组', () => {
     // 直接 `list.sort()` 是原地排序，会悄悄改掉调用方的数组 ——
     // 而调用方往往是 computed 的源数据，于是「排序」变成了「改数据」。
-    const list = [aggregatedFinding({ severity: 'low' }), aggregatedFinding({ severity: 'critical' })]
+    const list = [
+      aggregatedFinding({ severity: 'low' }),
+      aggregatedFinding({ severity: 'critical' }),
+    ]
     sortFindings(list)
     expect(list[0]?.severity).toBe('low')
   })

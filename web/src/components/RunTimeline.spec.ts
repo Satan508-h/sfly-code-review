@@ -23,7 +23,15 @@ describe('RunTimeline', () => {
   it('七个节点都显示出来，完成的是绿勾', () => {
     const wrapper = render()
     const text = wrapper.text()
-    for (const label of ['解析载荷', '规划', '派发', '等待屏障', '主 Agent 聚合', '生成报告', '回写评论']) {
+    for (const label of [
+      '解析载荷',
+      '规划',
+      '派发',
+      '等待屏障',
+      '主 Agent 聚合',
+      '生成报告',
+      '回写评论',
+    ]) {
       expect(text).toContain(label)
     }
     expect(wrapper.findAll('.node.done')).toHaveLength(7)
@@ -59,7 +67,10 @@ describe('RunTimeline', () => {
     const all = wrapper.findAll('.row').length
     expect(all).toBe(EVENTS.length)
 
-    await wrapper.findAll('button').find((b) => b.text().includes('只看关键节点'))!.trigger('click')
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text().includes('只看关键节点'))!
+      .trigger('click')
 
     // worker.dispatched / worker.result / node.finished 里的逐条细节被滤掉
     expect(wrapper.findAll('.row').length).toBeLessThan(all)

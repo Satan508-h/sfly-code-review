@@ -70,7 +70,10 @@ export const RUN_STATUS_LABEL: Record<RunStatus, string> = {
   skipped: '跳过',
 }
 
-export const RUN_STATUS_TYPE: Record<RunStatus, 'success' | 'warning' | 'danger' | 'info' | 'primary'> = {
+export const RUN_STATUS_TYPE: Record<
+  RunStatus,
+  'success' | 'warning' | 'danger' | 'info' | 'primary'
+> = {
   queued: 'info',
   dispatched: 'primary',
   waiting: 'primary',
@@ -108,19 +111,20 @@ export const EVENT_LABEL: Record<EventKind, string> = {
   'run.finished': 'run 结束',
 }
 
-export const EVENT_TYPE: Record<EventKind, 'primary' | 'success' | 'warning' | 'danger' | 'info'> = {
-  'run.created': 'info',
-  'run.status': 'info',
-  'node.started': 'info',
-  'node.finished': 'primary',
-  'worker.dispatched': 'info',
-  'worker.result': 'primary',
-  'worker.failed': 'danger',
-  'aggregate.done': 'primary',
-  'publish.done': 'success',
-  'publish.failed': 'warning',
-  'run.finished': 'success',
-}
+export const EVENT_TYPE: Record<EventKind, 'primary' | 'success' | 'warning' | 'danger' | 'info'> =
+  {
+    'run.created': 'info',
+    'run.status': 'info',
+    'node.started': 'info',
+    'node.finished': 'primary',
+    'worker.dispatched': 'info',
+    'worker.result': 'primary',
+    'worker.failed': 'danger',
+    'aggregate.done': 'primary',
+    'publish.done': 'success',
+    'publish.failed': 'warning',
+    'run.finished': 'success',
+  }
 
 /**
  * 流水线节点的展示顺序 —— **和 README / 系统状态页上那张图是同一张**。
@@ -129,7 +133,15 @@ export const EVENT_TYPE: Record<EventKind, 'primary' | 'success' | 'warning' | '
  * （建 run 就是它干的，所以证据是 `run.created`），但把它从进度条上抹掉的话，
  * 页面上的图就和文档里的图对不上了 —— 而那种不一致没人会报错。
  */
-export const NODES = ['ingest', 'plan', 'dispatch', 'wait', 'aggregate', 'finalize', 'publish'] as const
+export const NODES = [
+  'ingest',
+  'plan',
+  'dispatch',
+  'wait',
+  'aggregate',
+  'finalize',
+  'publish',
+] as const
 
 export const NODE_LABEL: Record<string, string> = {
   ingest: '解析载荷',
@@ -204,13 +216,19 @@ export function fmtInt(n: number | null | undefined): string {
 /**
  * 成本。
  *
- * **不足 1 分钱时不要显示 `$0.0000`** —— 那看起来像「没算」，而不是「很便宜」。
- * Mock LLM 下成本恒为 0，界面要说清楚这是没花钱而不是没测出来。
+ * 三档精度，每一档都是被具体的数字逼出来的：
+ *
+ * * **恰好 0** → `$0`。Mock LLM 下就是这个值，配上一句「没花钱，不是没算」
+ *   （那句话说在组件里，不在这里）。
+ * * **不足 1 美元** → 四位小数。一次 PR 审查的成本在**分级**量级（几厘到几分钱），
+ *   两位小数会把它压成 `$0.03` —— 有效数字砍掉一半，而「每 PR 成本」正是
+ *   这个项目要拿出来讲的数字。写这条时的实测值就是 `$0.0342`。
+ * * **一美元以上** → 两位小数。到那个量级，分位的精度已经没有意义了。
  */
 export function fmtCost(usd: number | null | undefined): string {
   if (usd == null) return '—'
   if (usd === 0) return '$0'
-  if (usd < 0.01) return `$${usd.toFixed(4)}`
+  if (usd < 1) return `$${usd.toFixed(4)}`
   return `$${usd.toFixed(2)}`
 }
 

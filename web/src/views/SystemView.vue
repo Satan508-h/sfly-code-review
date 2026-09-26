@@ -115,9 +115,7 @@ onMounted(() => {
     <header class="head">
       <div>
         <h2>系统状态</h2>
-        <p class="hint">
-          依赖探测是**每次请求实时做的**，不是启动时缓存的结果
-        </p>
+        <p class="hint">依赖探测是**每次请求实时做的**，不是启动时缓存的结果</p>
       </div>
       <el-button :loading="store.loading" @click="store.load()">重新探测</el-button>
     </header>
@@ -133,8 +131,8 @@ onMounted(() => {
       <template #default>
         <p style="margin: 4px 0 0">{{ store.error }}</p>
         <p style="margin: 4px 0 0; color: var(--sfly-text-dim)">
-          先执行 <code>python tasks.py up</code>，等健康检查通过后重试。
-          Render 免费版冷启动需要约 60 秒。
+          先执行 <code>python tasks.py up</code>，等健康检查通过后重试。 Render 免费版冷启动需要约
+          60 秒。
         </p>
       </template>
     </el-alert>
@@ -177,7 +175,11 @@ onMounted(() => {
             <div class="stat-label">等待策略</div>
             <div class="stat-value mono">{{ store.health.config.wait_strategy }}</div>
             <div class="stat-sub">
-              {{ store.health.config.wait_strategy === 'interrupt' ? '图暂停，可断点恢复' : '轮询兜底' }}
+              {{
+                store.health.config.wait_strategy === 'interrupt'
+                  ? '图暂停，可断点恢复'
+                  : '轮询兜底'
+              }}
             </div>
           </el-card>
         </el-col>

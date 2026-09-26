@@ -14,6 +14,22 @@
 
 ## 当前状态
 
+**M8 已完成**：Vue 3 仪表盘。三个页面 —— 运行记录、运行详情（发现 / 实时时间线 /
+冲突与成本）、系统状态。**66 条前端测试**（不需要后端与浏览器）、ESLint + Prettier、
+CI 里多一个 `web` job。
+
+```bash
+python tasks.py up          # 起全栈 → 前端 http://localhost:5173
+python tasks.py demo        # 投一次审查，几秒后列表顶上会自己多出一行
+python tasks.py web-dev     # 前端热更新（5273）
+python tasks.py test-web    # 前端测试
+```
+
+这一层挖出的四个问题写在
+「[M8 已完成](#m8-已完成vue-仪表盘)」那一节 —— 其中两个（**后端发的 SSE 帧
+让 `onmessage` 一条都收不到**、**详情页的 404 自动重试从来没执行过**）
+在页面上完全看不出来。
+
 **M7 已完成**：GitHub 客户端（重试策略 / 分页 / 三条降级路）+ `publish` 节点
 （三道防重复闸 + 阶梯降级），三步走完并且**评论已经落在真实仓库的真实 PR 上**：
 [Satan508-h/sfly-playground#1](https://github.com/Satan508-h/sfly-playground/pull/1)
@@ -259,11 +275,89 @@ EventSource 在服务端关流后会**自动重连**（这是规范行为），�
 | `GITHUB_WEBHOOK_SECRET=xxx docker compose up -d api` 之后仍然不验签 | **compose 只把 `env_file` / `environment:` 里的变量传进容器**，命令行前面那个环境变量只用于 compose 文件的 `${VAR}` 插值。所以那次「验证」什么也没验证 —— 是手工改 `.env` 才测出真结果的 |
 | run 的 `block_merge` 和 `totals` 一直是 null | `finalize` 只写了 `review_reports`（jsonb），没写 `review_runs` 上那两列。运行列表要显示「阻断 / 参考」和花了多少钱，而它不该为了两个值去解每一行的 jsonb。补了 `set_decision()` |
 
-### M7 已完成：GitHub 客户端 + publish 节点
+### M8 已完成：Vue 仪表盘
 
-三步：客户端 → `publish` 节点 → 真实靶场验收。**三种证据各管一件事** ——
-退避重试只能用桩（真 GitHub 不会配合你限流），真实发布只能用真 PR，
-而重复评论要靠重投（那个窗口平时撞不上）。
+三个页面：**运行记录**（列表 + 5 秒轮询）、**运行详情**（发现 / 时间线 / 冲突与成本
+三个标签 + 实时 SSE）、**系统状态**（依赖探测 + 两种拓扑对照 + 配置回显）。
+
+```bash
+python tasks.py web-dev     # 开发热更新 → http://localhost:5273
+python tasks.py up          # 验收/演示  → http://localhost:5173（nginx 托管构建产物）
+python tasks.py test-web    # 66 条前端测试，不需要后端、不需要浏览器
+```
+
+界面本身不在这里展开（截图见上），值得写下来的是**做这一层时暴露出来的四个问题**，
+因为其中两个在页面上完全看不出来。
+
+#### 一个后端 bug：它和自己的文档互相矛盾
+
+`sse.frame()` 一直在发 `{"event": kind, "id": seq, "data": ...}`。而 SSE 规范里
+**带 `event:` 字段的帧不会派发到 `message` 类型** —— 只会触发
+`addEventListener("run.created")` 这类具名监听。
+
+后果：用 `es.onmessage` 的客户端**连接成功、然后一条事件都收不到**，而 `onopen`
+正常触发、服务端正常发帧、控制台一句话都没有。而 `routes/events.py` 文档里
+那段示例客户端用的**正是** `es.onmessage` —— 也就是说照着这个项目自己的文档写
+客户端，同样收不到。文档和实现里必有一个是错的。
+
+改的是实现：事件的类型已经在 `data` 的 JSON 里作为 `kind` 存在，再发一份
+`event:` 是同一个事实的两个来源；而反过来的修法（客户端枚举所有事件类型注册
+监听器）会让服务端新增一种事件时**客户端悄悄不订阅它** —— 同一类静默失败。
+现在全走默认的 `message`，`kind` 从 JSON 里读，
+`tests/unit/api/test_sse.py::test_a_frame_has_no_named_event` 钉着这条。
+
+判据是拿**真的** `EventSource` 验的（Node 24 内置的 undici 实现，遵守规范），
+而不是我们自己的假实现：`onmessage` 收到 37 条事件、含 `run.finished`；
+直连 `:8000` 与经 Vite 代理 `:5273` 两条路都验过。顺带现场看到服务端宽限期结束后
+undici **自动重连了一次** —— 这正是「收到 `run.finished` 必须自己 `close()`」
+那条纪律的由来（不收就是无限重连，而服务端没有任何办法说「别连了」）。
+
+#### 一个前端 bug：那段重试从来没执行过
+
+详情页的文档写着「刚投递完的窗口期里 404 是正常的，所以自动重试几次」，代码是
+`if (auto && retries < MAX) setTimeout(...)`，而调用处是 `onMounted(() => void load())`
+—— **不传参数，`auto` 恒为 `false`**，那句 `setTimeout` 一次都没执行过。
+注释和代码说的是两件事，而没有任何东西报错。
+
+是渲染测试抓出来的（`expected 1 to be greater than 1`）。现在 404 一定安排重试
+（上限 8 次），`auto` 只决定要不要显示骨架屏；组件卸载时清掉定时器。
+
+#### 一个更阴的：6 条测试全绿，而组件根本没工作
+
+第一版渲染测试 6 条**全过**，但日志里躺着一行
+`Failed to resolve component: el-tooltip` —— 测试环境没装 Element Plus，
+Vue 把未注册的组件当**未知元素**渲染，插槽里的文字照样进 DOM，于是
+`wrapper.text()` 的断言全部照常通过。
+
+现在 `web/src/testing/mount.ts` 的 `mountWithUi()` 做两件事：按线上那样装上
+Element Plus，并**让任何 Vue 警告直接判失败**。而这道闸**自己也有测试**
+（`mount.spec.ts`）—— 一个闸失效的表现是所有渲染测试照样全绿，不会被发现。
+（写那条探针时还踩了一次假阴性：用内联 `template` 字符串写的探针根本没渲染，
+于是「没触发组件解析」被误读成「闸没起作用」。探针本身也得是对的。）
+
+#### 一个开发机上的陷阱：5173 端口上蹲着两个东西，都不报错
+
+| | |
+|---|---|
+| `0.0.0.0:5173` / `[::]:5173` | Docker 的端口转发（nginx，跑的是**镜像里那份构建产物**） |
+| `127.0.0.1:5173` / `[::1]:5173` | Vite 开发服务器 |
+
+两者**都能绑上、谁都不报错**，而本机 `localhost` 优先解析到 `::1` —— 于是打开
+5173 看到的是旧构建、改代码毫无反应。开发服务器现在独占 **5273** 并设了
+`strictPort`（抢不到就报错退出，而不是自己换个端口继续打印「Local: 5174」）。
+判据：开发模板里有 `/@vite/client`，构建产物里是带哈希的 `/assets/*.js`。
+
+#### 过程中改掉的东西
+
+| 现象 | 原因与修法 |
+|---|---|
+| `JSON.parse` 的结果没验形状，`null` / `5` / `"x"` 会让流「活着但不再处理消息」 | 形状检查从 try 里分出来。一个抛穿 `onmessage` 的 TypeError，症状是流看起来还正常 |
+| 「七个节点全绿」这条断言**连着红了两回** | 两回都是 fixture 里漏了 `finalize` 那条 `node.finished`（只有 `plan` 和 `finalize` 会发）。第二次不再改 fixture，而是把「一个完整跑完的 run 的事件序列」收进 `testing/factories.ts` 一份，两个 spec 共用 |
+| 按数组下标取 fixture（`REAL_RUN[5]`） | 往中间补一条事件，所有下标错位 —— 测试红了，而红的原因和被测的东西无关。改成按事件类型取 |
+| 成本 `$0.03` | 一次审查的成本在**分级**量级（实测 `$0.0342`），两位小数把有效数字砍掉一半，而「每 PR 成本」正是要拿出来讲的数字。一美元以下改成四位小数 |
+| `vitest` 2 装完 `vue-tsc` 报了一屏 `Omit<UserConfig, "plugins">` 不兼容 | vitest 2 自带一份 vite 5，和项目的 vite 6 撞类型。升到 vitest 3 |
+
+
 
 #### 第一步：对着桩看退避
 
@@ -732,7 +826,15 @@ python tasks.py up            # 构建 + 启动 + 等健康检查通过
 
 > Windows 上用 `python tasks.py <命令>`；Linux/macOS 上 `make <命令>` 等价。
 
-打开 <http://localhost:5173> 应该看到状态页，四个指标全部连通。
+打开 <http://localhost:5173> 是**运行记录**（nginx 托管的构建产物）；没有数据时
+按页面上的提示跑一次 `python tasks.py demo`，几秒后列表顶上会自己多出一行。
+点进去就是这次审查的全部：按文件分组的发现、实时时间线、成本明细。
+
+想改前端代码用热更新那条路（**另一个端口**，见下）：
+
+```bash
+python tasks.py web-dev     # → http://localhost:5273
+```
 
 ```bash
 python tasks.py health      # 依赖的真实连通性（版本号 + 延迟），不可用则非零退出
@@ -813,6 +915,10 @@ DeepSeek 走 OpenAI 兼容接口，所以换成 OpenAI、vLLM 或本地模型只
 | **限流了真的会退避重发** | `python tasks.py stub-github` + 把 `GITHUB_API_BASE` 指向它 + `python tasks.py demo` | 桩先回两次 429（带 `retry-after`），编排器日志里出现两条 `github.retry`，第三次成功；评论**真的发出去了**（桩的 `/__state` 里能看到） |
 | **评论真的发到真实 PR 上** | `python tasks.py record-fixture --repo <owner/name> --pr <n>` 之后 `python tasks.py demo` | 那个 PR 上出现一条 review（正文开头是 `<!-- sfly:run:<id> -->`）+ 最多 25 条行内评论，全部锚在真实变更行上 |
 | **重放到真实 PR 上也不重复评论** | `python tasks.py replay-bootstrap --task-id <id> --simulate-crash` | 事件里 `form=already`，PR 上评论条数不变（`gh api .../pulls/<n>/reviews --jq length`） |
+| **界面能自己动起来** | `python tasks.py demo` 之后盯着 <http://localhost:5173> | 列表每 5 秒自动刷新，几秒后顶上多出一行；点进去看那条 run 的节点进度与事件时间线。**不需要刷新页面** |
+| **实时时间线断线能补齐** | `python tasks.py demo --follow --drop-after 3` + 页面开着 | 服务端主动断开再重连，客户端按 `seq` 去重、服务端按 `Last-Event-ID` 补齐 —— 时间线上不重不漏 |
+| **前端也能自己跑测试** | `python tasks.py test-web` | 66 条，jsdom 里跑真组件（含 Element Plus），不需要后端、不需要浏览器、几秒钟 |
+| 前端 lint 与格式 | `python tasks.py lint-web` | ESLint（只管对错）+ Prettier（只管格式）—— 和 Python 那边 `ruff check` / `ruff format` 的分工一致 |
 | **发出去但没记住，能自愈** | 同一条再加上 `--forget-comment-id` | `form=adopted:review`：靠正文里的隐藏标记从 PR 上认回自己的评论，并把 id 写回库 |
 | 投递账本 | `GET /api/deliveries` | 每条投递的结局：`accepted` / `duplicate` / `ignored` / `rejected`，以及它转给了哪个 run |
 | 断点恢复 | `docker restart sfly-orchestrator-1` | 从 Postgres 的 checkpoint 续跑 |
@@ -918,7 +1024,13 @@ packages/
                  state.py 图状态、risk.py 文件风险排序、
                  aggregate/ 主 Agent 的聚合（fingerprint / confidence /
                  decision / pipeline / render，**全确定性、零 LLM 调用**）
-web/             Vue 3 SPA
+web/             Vue 3 SPA（Vue 3 + TS + Vite + Element Plus + Pinia + vue-router）
+                 src/api/    client.ts 取数与类型、sse.ts 事件流封装
+                 src/lib/    纯函数：格式化、发现的分组/排序、事件摘要与节点进度
+                             （**纯函数是有意的** —— 前端真正值得测的是这些）
+                 src/testing/ factories（假数据）+ mount.ts（挂载助手，
+                             **让任何 Vue 警告判失败**，它自己也有测试）
+                 src/components/ views/ stores/ router/
 infra/           postgres init（只有扩展，表由应用建）、redis conf、nginx conf
 fixtures/        diff 样例、录制的 webhook 载荷（含 /pulls/{n}/files 的响应）、大 PR
 scripts/        运维与演示脚本（replay_webhook.py 是 M6 的验收工具；
@@ -969,8 +1081,20 @@ API 不直接写 `review_tasks` —— 文件风险排序和规则检索由编�
   问题、或者模型这次报第 10 行下次报第 12 行时，指纹不同 —— 而它们其实是同一件事。
   那一步（并查集 + rapidfuzz，同 Worker 0.75 / 跨 Worker 0.55）是 M9。
   指纹那一步**永远不会被替换掉**（它是并查集的快速路径），M9 加的是它后面的兜底。
-- **`conflicts` 恒为空。** 冲突消解（同路径 + 邻近行号 + 不同 Worker + 严重度差 ≥ 2）
-  和聚类一起排在 M9。前端要在空列表上正常工作。
+- **`conflicts` 恒为空，而且前端必须说清楚这件事。** 冲突消解（同路径 + 邻近行号 +
+  不同 Worker + 严重度差 ≥ 2）和聚类一起排在 M9。界面上「一个空表格」和
+  「算过了、没有冲突」长得一模一样，含义正好相反 —— 所以冲突面板在空的时候
+  **主动解释**自己的空是因为还没算（`ConflictsPanel.vue` 里的第一段）。
+  同样受影响的还有每条发现右下角那组 Worker 圆点：跨 Worker 印证也来自聚类，
+  所以现在每条发现的来源都只有一个 Worker，界面上不做任何「印证数」的统计。
+- **前端没有浏览器端的端到端测试。** 组件测试跑在 jsdom 里（66 条），SSE 那一段
+  用 Node 内置的真 `EventSource` 验过协议行为，但「真浏览器里点一遍」没有自动化 ——
+  jsdom 不实现 `EventSource`、布局与滚动也是假的。这一层目前靠人工冒烟。
+- **Element Plus 是全量引入，构建产物 940 KB（gzip 302 KB）。** 首屏因此偏重，
+  而精简模式跑在 Render 免费版上、冷启动本来就慢。改成按需引入（两个构建期插件）
+  预计能砍到 100 KB 上下，排在 M10 部署那一步一起做。
+- **`localhost:5173` 与 `localhost:5273` 是两份不同的东西**（nginx 的构建产物 vs
+  Vite 的热更新），差别和踩过的坑见 M8 那一节。
 - **`WAIT_STRATEGY=poll` 一次只能推进一个 run。** 轮询期间整条消费协程被占住，
   而 `interrupt` 之下 `ainvoke` 几十毫秒就返回了。这是逃生开关的已知代价，
   不是缺陷 —— 但它意味着那个开关只适合兜底，不适合长期开着。

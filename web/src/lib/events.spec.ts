@@ -62,7 +62,9 @@ describe('summarize', () => {
   })
 
   it('posted=false 是「未发布」，但那不等于失败（dry-run 也长这样）', () => {
-    const text = summarize(runEvent({ kind: 'publish.done', payload: { form: 'dry_run', posted: false } }))
+    const text = summarize(
+      runEvent({ kind: 'publish.done', payload: { form: 'dry_run', posted: false } }),
+    )
     expect(text).toBe('dry_run · 未发布')
   })
 })
@@ -99,7 +101,8 @@ describe('nodeStates', () => {
   it('没有可审的文件时 run 停在 plan —— 后面的节点是「未开始」，不是「失败」', () => {
     // 「没跑」和「失败了」在界面上必须长得不一样。这类 run（`skipped`）是正常的。
     const onlyPlan = REAL_RUN.filter(
-      (e) => e.kind === 'run.created' || (e.kind === 'node.finished' && e.payload['node'] === 'plan'),
+      (e) =>
+        e.kind === 'run.created' || (e.kind === 'node.finished' && e.payload['node'] === 'plan'),
     )
     const states = nodeStates(onlyPlan, 'skipped')
     expect(states.slice(0, 2).every((s) => s.state === 'done')).toBe(true)
@@ -109,7 +112,11 @@ describe('nodeStates', () => {
   it('发布失败时那一个节点是红的', () => {
     const events = [
       ...REAL_RUN.filter((e) => e.kind !== 'publish.done' && e.kind !== 'run.finished'),
-      runEvent({ seq: 190, kind: 'publish.failed', payload: { reason: '401 Unauthorized', retryable: false } }),
+      runEvent({
+        seq: 190,
+        kind: 'publish.failed',
+        payload: { reason: '401 Unauthorized', retryable: false },
+      }),
     ]
     const states = nodeStates(events, 'publish_failed')
     expect(states.at(-1)).toEqual({ node: 'publish', state: 'failed' })

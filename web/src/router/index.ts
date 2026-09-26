@@ -60,7 +60,8 @@ const router = createRouter({
 })
 
 router.afterEach((to) => {
-  const title = (to.meta.title as string | undefined) ?? (to.name === 'run-detail' ? '运行详情' : '')
+  const title =
+    (to.meta.title as string | undefined) ?? (to.name === 'run-detail' ? '运行详情' : '')
   document.title = title ? `${title} · sfly` : 'sfly — 多 Agent 代码审查'
 })
 
