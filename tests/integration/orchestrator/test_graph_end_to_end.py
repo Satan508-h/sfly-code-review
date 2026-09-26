@@ -524,18 +524,39 @@ async def test_purge_also_deletes_the_checkpoints(
 async def test_a_pr_with_nothing_to_review_is_skipped(
     ctx: NodeContext, store: PostgresRunStore, checkpointer: AsyncPostgresSaver
 ) -> None:
-    """没有可审文件时标 ``skipped``，**不产出一份「0 条发现」的报告**。
+    """拉到了文件、但一个都审不了（全是二进制）→ 标 ``skipped``，
+    **不产出一份「0 条发现」的报告**。
 
     后者会被读成「审查通过」，而实际上什么都没看 —— 那是最坏的一种误导
     （``sfly_workers --diff`` 在空 diff 上宁可退出码 3，说的是同一件事）。
-    """
-    graph = _build(ctx, checkpointer)
-    msg = bootstrap(file_patches=[])
-    run = await store.create_run(msg)
 
-    async with running_pipeline(ctx, graph, workers=True):
-        await ctx.queue.publish_bootstrap(msg)
-        await _wait_status(store, run.task_id, RunStatus.SKIPPED)
+    ### 这条测试的构造在 M10 改过，值得说明
+
+    它以前用 ``file_patches=[]`` 来表达「没有可审的东西」。M10 把「载荷里没有
+    文件」接上「自己去 GitHub 拉」之后，那就不再是同一个意思了：``plan`` 会去
+    拉，而**拉不到**是另一件事 —— 那是「我们根本没看到代码」，会抛异常、重试、
+    最后判 ``failed``。两者必须分开，一个说「看过了，没问题」，另一个说
+    「根本没看到」。
+
+    所以现在用真实客户端打桩：``logo.png`` **没有 ``patch`` 字段**（GitHub 对
+    二进制文件就是这样），于是「文件在、补丁不在」—— 这正是 ``skipped`` 想表达的
+    那个状态。空载荷 + 没配 token 那条路在
+    ``tests/unit/orchestrator/test_plan_fetches_files.py`` 里。
+    """
+    with GitHubStub(files=[{"filename": "logo.png", "status": "modified"}]) as stub:
+        client = GitHubClient(token="test-token", base_url=stub.base_url)
+        wired = NodeContext(
+            store=ctx.store, queue=ctx.queue, lock=ctx.lock, settings=ctx.settings, github=client
+        )
+        graph = _build(wired, checkpointer)
+        # repo_id 要用桩认得的那个仓库（桩对别的仓库一律 404，和真实 GitHub
+        # 对无权访问的仓库是同一种回答）。
+        msg = bootstrap(repo_id=recorded_repo(), file_patches=[])
+        run = await store.create_run(msg)
+
+        async with running_pipeline(wired, graph, workers=True):
+            await wired.queue.publish_bootstrap(msg)
+            await _wait_status(store, run.task_id, RunStatus.SKIPPED)
 
     assert await store.get_report(run.task_id) is None
     kinds = [e.kind for e in await store.events_since(run.task_id, 0)]
