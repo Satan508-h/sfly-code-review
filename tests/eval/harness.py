@@ -383,6 +383,26 @@ def all_merged(run: CaseRun) -> list[Any]:
     return [*run.report.findings, *run.report.suppressed]
 
 
+def score_by_group(runs: Sequence[CaseRun]) -> dict[str, Metrics]:
+    """按组分别打分。
+
+    **这一层是必须的，不是锦上添花。** 三个组量的是不同的东西：
+
+    * ``injected`` —— 扫描器认得出的注入缺陷。离线层真正量的就是这一组。
+    * ``rebuilt`` —— 真实 CVE 修复回退出来的。**Mock 基本认不出它们**
+      （它们是真代码，不是为正则准备的），所以离线层在这一组上的低分
+      说明的是扫描器弱，不是聚合层差。这一组的分数只有真实层才有意义。
+    * ``clean`` —— 误报。
+
+    把三组混在一个数字里，得到的既不是「聚合层有多好」也不是「模型有多好」,
+    而是一个取决于用例配比的数 —— 那种数字面试官一问就散。
+    """
+    grouped: dict[str, list[CaseRun]] = {}
+    for run in runs:
+        grouped.setdefault(run.case.group, []).append(run)
+    return {group: score(group_runs) for group, group_runs in grouped.items()}
+
+
 def score(runs: Sequence[CaseRun]) -> Metrics:
     """把一批跑完的用例汇总成指标。**纯函数**（除了读 ``CaseRun``）。"""
     m = Metrics(runs=len(runs))
@@ -480,6 +500,7 @@ def render_report(
     meta: Sequence[str],
     sweep: Sequence[SweepRow] = (),
     current_threshold: float | None = None,
+    by_group: dict[str, Metrics] | None = None,
 ) -> str:
     """Markdown 报告。**人读的第一份产物**，所以数字要带单位和口径。"""
 
@@ -518,7 +539,40 @@ def render_report(
         "",
         "> 严格档 = 文件 + 类目 + 行号（±3 行内）全对；宽松档 = 文件 + 类目对，不看行号。",
         "> 差距说明的是「定位准不准」，而不是「有没有找到」。",
+        ">",
+        "> **上面这个总数只能当索引看** —— 三组量的是不同的东西，"
+        "混在一起的数字取决于用例配比。分组数字在下一节。",
         "",
+    ]
+
+    if by_group:
+        lines += [
+            "## 分组指标（**这才是有意义的那些数**）",
+            "",
+            "| 组 | 用例 | 期望 | 发布 | 严格精确率 | 严格召回率 | 被砍的真阳性 |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ]
+        for group, gm in by_group.items():
+            expected = sum(len(r.case.expected) for r in runs if r.case.group == group)
+            lines.append(
+                f"| `{group}` | {gm.runs} | {expected} | {gm.published} | "
+                f"{pct(gm.strict.precision)} | {pct(gm.strict.recall)} | {gm.suppressed_hits} |"
+            )
+        lines += [
+            "",
+            "读法（每一组的数字说明什么，差别很大）：",
+            "",
+            "* `injected` —— **离线层真正量的就是这一组**。用例是照着扫描器认得出的写法"
+            "准备的，所以这里量的是**聚合层**（去重、置信度闸、冲突消解）对精确率和"
+            "召回率的影响。",
+            "* `rebuilt` —— 真实 CVE 修复回退出来的代码。**Mock 基本认不出它们**，"
+            "因为它们是真代码，不是为正则准备的。这一组的低分说明的是**扫描器弱**，"
+            "不是聚合层差；它的意义只有真实层才发挥得出来。",
+            "* `clean` —— 误报。见下一节。",
+            "",
+        ]
+
+    lines += [
         "## 误报与召回损失",
         "",
         f"- 干净组：{metrics.clean_cases} 个用例，共发布 **{metrics.clean_findings}** 条发现"
@@ -573,14 +627,15 @@ def render_report(
         "",
         "## 逐用例",
         "",
-        "| 用例 | 组 | 期望 | 发布 | 严格命中 | 假阳 | 冲突 | 耗时 |",
-        "|---|---|---:|---:|---:|---:|---:|---:|",
+        "| 用例 | 组 | 期望 | 发布 | 被砍 | 严格命中 | 假阳 | 冲突 | 耗时 |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for run in runs:
         per = score([run])
         lines.append(
             f"| `{run.case.id}` | {run.case.group} | {len(run.case.expected)} | "
-            f"{len(run.report.findings)} | {per.strict.tp} | {per.strict.fp} | "
+            f"{len(run.report.findings)} | {len(run.report.suppressed)} | "
+            f"{per.strict.tp} | {per.strict.fp} | "
             f"{len(run.report.conflicts)} | {run.wall_ms} ms |"
         )
 

@@ -1,0 +1,11 @@
+id: rebuilt-djangocms-editmode-xss
+group: rebuilt
+origin: rebuilt
+repo: django-cms/django-cms
+commit: b56a568844
+note: "回退 CVE-2026-75526 的修复：异常消息又直接拼进 HTML 标题"
+expected:
+  - file: cms/plugin_rendering.py
+    line: 601
+    category: xss
+    severity: high

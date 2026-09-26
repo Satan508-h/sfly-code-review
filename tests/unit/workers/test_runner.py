@@ -146,7 +146,7 @@ def test_hallucinated_rule_id_is_nulled_so_grounding_cannot_be_faked() -> None:
     report = reconcile_findings(
         [_finding("a.py", 1, rule_id="sec-编的-999"), _finding("a.py", 2, rule_id="sec-sqli-001")],
         [_patch("a.py", [1, 2])],
-        [_rule("sec-sqli-001")],
+        {"sec-sqli-001"},
     )
     assert report.kept[0].rule_id is None
     assert report.kept[1].rule_id == "sec-sqli-001"
@@ -154,10 +154,34 @@ def test_hallucinated_rule_id_is_nulled_so_grounding_cannot_be_faked() -> None:
 
 
 @pytest.mark.unit
-def test_rule_id_is_cleared_when_no_rules_were_provided() -> None:
-    """没送规则时，任何 rule_id 都是编的。"""
-    report = reconcile_findings([_finding("a.py", 1, rule_id="sec-sqli-001")], [_patch("a.py", [1])], [])
-    assert report.kept[0].rule_id is None
+def test_a_real_rule_that_was_not_retrieved_this_round_is_kept() -> None:
+    """**参照物是规则库，不是「这一轮检索到的规则」。**
+
+    这条曾经写反了：第三个参数以前是 ``Sequence[Rule]``（本轮检索到的那几条），
+    而 ``grounded`` 的文档说的是「命中**规则库**里的某一条」。两个集合差了
+    十几倍（``top_k`` 是 8，规则库 29 条），于是模型引用了一条真实存在、
+    只是没被检索到的规则时，明明不是幻觉却拿不到那 ``+0.10`` ——
+    少了这 0.10，一条真阳性会掉到 ``SUPPRESS_THRESHOLD`` 以下被砍掉，
+    而且**哪里都不会显示它**。
+
+    M9 的离线评测量到了代价：改按规则库校验之后注入组召回率 78.3% → 82.6%，
+    重建组从一个真实 CVE 里找回了一条 SSRF 发现。
+
+    另一面：规则库为空时（语料加载坏了）一切照旧被清掉 —— 那是「没有参照物」，
+    与「这条规则不存在」在数据上不可区分，取保守的那一边。
+    """
+    kept = reconcile_findings(
+        [_finding("a.py", 1, rule_id="sec-sqli-001")],
+        [_patch("a.py", [1])],
+        {"sec-sqli-001", "perf-nplus1-001"},  # 库里有很多条，本轮只检索到别的
+    )
+    assert kept.kept[0].rule_id == "sec-sqli-001"
+    assert kept.hallucinated_rules == 0
+
+    empty_library = reconcile_findings(
+        [_finding("a.py", 1, rule_id="sec-sqli-001")], [_patch("a.py", [1])], set()
+    )
+    assert empty_library.kept[0].rule_id is None
 
 
 # --------------------------------------------------------------------------- #

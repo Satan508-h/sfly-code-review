@@ -1,0 +1,11 @@
+id: rebuilt-mistune-toc-xss
+group: rebuilt
+origin: rebuilt
+repo: lepture/mistune
+commit: 04880a0
+note: "回退 CVE-2026-44898 的修复：目录锚点的 id 又未转义地拼进 href"
+expected:
+  - file: src/mistune/toc.py
+    line: 92
+    category: xss
+    severity: medium

@@ -1,0 +1,11 @@
+id: rebuilt-geopandas-sqli
+group: rebuilt
+origin: rebuilt
+repo: geopandas/geopandas
+commit: 6aa8ef14ff
+note: "回退 CVE-2025-69662 的修复：Find_SRID 的三个参数又被 f-string 拼进 SQL"
+expected:
+  - file: geopandas/io/sql.py
+    line: 434
+    category: sqli
+    severity: critical

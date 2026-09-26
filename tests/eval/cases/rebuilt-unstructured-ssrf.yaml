@@ -1,0 +1,11 @@
+id: rebuilt-unstructured-ssrf
+group: rebuilt
+origin: rebuilt
+repo: Unstructured-IO/unstructured
+commit: 445c95735c
+note: "回退 CVE-2026-71428 的修复：调用方给的 URL 又直接交给 requests.get"
+expected:
+  - file: unstructured/partition/html/partition.py
+    line: 161
+    category: ssrf
+    severity: high

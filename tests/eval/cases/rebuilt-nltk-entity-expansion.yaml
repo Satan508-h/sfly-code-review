@@ -1,0 +1,11 @@
+id: rebuilt-nltk-entity-expansion
+group: rebuilt
+origin: rebuilt
+repo: nltk/nltk
+commit: e91789c9a0
+note: "回退 CVE-2026-78681 的修复：XML 又用默认解析器解析，实体声明会展开"
+expected:
+  - file: nltk/chunk/named_entity.py
+    line: 236
+    category: xxe
+    severity: high

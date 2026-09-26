@@ -1,0 +1,11 @@
+id: rebuilt-langgraph-limit-sqli
+group: rebuilt
+origin: rebuilt
+repo: langchain-ai/langgraph
+commit: 297242913f
+note: "回退 CVE-2025-67644 的修复：LIMIT 又被 f-string 拼进查询"
+expected:
+  - file: libs/checkpoint-sqlite/langgraph/checkpoint/sqlite/__init__.py
+    line: 333
+    category: sqli
+    severity: high

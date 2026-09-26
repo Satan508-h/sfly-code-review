@@ -1,0 +1,11 @@
+id: rebuilt-mistune-admonition-xss
+group: rebuilt
+origin: rebuilt
+repo: lepture/mistune
+commit: a3cb6e5655
+note: "回退 CVE-2026-59926 的修复：admonition 的 class 选项又未转义地拼进 HTML"
+expected:
+  - file: src/mistune/directives/admonition.py
+    line: 67
+    category: xss
+    severity: medium

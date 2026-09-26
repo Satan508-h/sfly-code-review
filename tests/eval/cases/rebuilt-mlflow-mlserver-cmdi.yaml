@@ -1,0 +1,11 @@
+id: rebuilt-mlflow-mlserver-cmdi
+group: rebuilt
+origin: rebuilt
+repo: mlflow/mlflow
+commit: 202fac4c83
+note: "回退 CVE-2026-0596 的修复：模型 URI 又未加引号地拼进 shell 命令"
+expected:
+  - file: mlflow/pyfunc/mlserver.py
+    line: 19
+    category: command_injection
+    severity: high

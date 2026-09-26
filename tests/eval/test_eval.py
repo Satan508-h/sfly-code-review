@@ -40,6 +40,7 @@ from harness import (
     render_report,
     run_all,
     score,
+    score_by_group,
     threshold_sweep,
 )
 
@@ -278,6 +279,7 @@ def test_write_the_report(offline_runs) -> None:  # type: ignore[no-untyped-def]
         ],
         sweep=sweep,
         current_threshold=SUPPRESS_THRESHOLD,
+        by_group=score_by_group(offline_runs),
     )
 
     REPORTS_DIR.mkdir(exist_ok=True)

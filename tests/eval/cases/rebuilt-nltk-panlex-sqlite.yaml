@@ -1,0 +1,11 @@
+id: rebuilt-nltk-panlex-sqlite
+group: rebuilt
+origin: rebuilt
+repo: nltk/nltk
+commit: bc007200d1
+note: "回退 CVE-2026-79674 的修复：SQLite 库文件又直接从调用方给的 root 下打开"
+expected:
+  - file: nltk/corpus/reader/panlex_lite.py
+    line: 46
+    category: path_traversal
+    severity: high

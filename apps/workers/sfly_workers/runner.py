@@ -12,12 +12,14 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 
 from sfly_agent.llm.base import LLMProvider
 from sfly_agent.llm.structured import complete_structured
 from sfly_agent.prompt import build_system_prompt, build_user_prompt, dominant_language
+from sfly_agent.rag.loader import load_rules
 from sfly_shared.config import Settings, get_settings
 from sfly_shared.contracts import (
     ErrorClass,
@@ -33,6 +35,20 @@ from sfly_shared.logging import bind_task, get_logger
 from sfly_workers.specs import WorkerSpec
 
 log = get_logger(__name__)
+
+
+@lru_cache(maxsize=1)
+def library_rule_ids() -> frozenset[str]:
+    """**规则库**里全部合法的规则 id。
+
+    这是「模型有没有编造 rule_id」的唯一正确参照物，理由见
+    :func:`reconcile_findings` 的文档第 3 条。
+
+    读的是随包发布的 YAML 数据文件（``load_rules`` 自己也带缓存），
+    **不是检索**：Worker 依然不做 BM25 排序、不挑规则 —— 那些仍然由编排层
+    的 ``plan`` 节点做完再随任务发下来。这里只是要一份「哪些 id 是合法的」清单。
+    """
+    return frozenset(rule.id for rule in load_rules().rules)
 
 
 @dataclass(slots=True)
@@ -52,7 +68,7 @@ class ReconcileReport:
 def reconcile_findings(
     findings: Sequence[Finding],
     patches: Sequence[FilePatch],
-    rules: Sequence[Rule],
+    library_ids: Collection[str],
 ) -> ReconcileReport:
     """把模型的输出对齐到**真实的输入**上。
 
@@ -68,6 +84,19 @@ def reconcile_findings(
        422 拒绝锚定在未变更行上的 inline 评论。
     3. **规则 id**：编造的 rule_id 会让这条 finding 拿到 ``grounded`` 的
        置信度加成。加成必须只给真正命中规则库的条目，否则置信度公式就废了。
+
+       ``library_ids`` 的参数名与类型在这里很关键，它曾经是「本次检索到的规则」
+       （``Sequence[Rule]``），而那是个**静默吃掉真阳性的 bug**：
+
+       ``grounded`` 的文档说的是「命中**规则库**里的某一条」，而检索每轮只挑
+       ``top_k`` 条 —— 两个集合差了十几倍。模型引用了一条真实存在、只是没被检索
+       到的规则时，它既不是幻觉、也不该失去加成，但旧实现会把它清掉；
+       少了那 ``+0.10``，一条真阳性就掉到 ``SUPPRESS_THRESHOLD`` 以下被砍掉，
+       **而它不会出现在任何地方**。
+
+       M9 的离线评测量到了这件事：改按规则库校验之后，注入组的召回率
+       78.3% → 82.6%，重建组从一个真实 CVE 里找回了那条 SSRF 发现
+       （精确率相应从 100% 降到 90.5% —— 多出来的那条是假阳性）。
     """
     canonical = {normalize_path(p.path): p.path for p in patches}
     changed = {p.path: set(p.changed_lines) for p in patches}
@@ -75,8 +104,6 @@ def reconcile_findings(
     by_basename: dict[str, list[str]] = {}
     for p in patches:
         by_basename.setdefault(p.path.rsplit("/", 1)[-1].lower(), []).append(p.path)
-
-    known_rules = {r.id for r in rules}
 
     kept: list[Finding] = []
     mismatches: list[str] = []
@@ -100,7 +127,7 @@ def reconcile_findings(
         if not finding.source_line_verified:
             unverified += 1
 
-        if finding.rule_id is not None and finding.rule_id not in known_rules:
+        if finding.rule_id is not None and finding.rule_id not in library_ids:
             fake_rules += 1
             finding.rule_id = None
 
@@ -178,7 +205,7 @@ class WorkerRunner:
                 attempt=attempt,
             )
 
-        report = reconcile_findings(outcome.items, patches, rules)
+        report = reconcile_findings(outcome.items, patches, library_rule_ids())
         dropped = outcome.dropped + report.dropped
         status = ResultStatus.PARTIAL if dropped else ResultStatus.OK
 

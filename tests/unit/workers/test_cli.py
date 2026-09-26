@@ -24,6 +24,14 @@ from sfly_shared.config import Settings
 from sfly_shared.contracts import ErrorClass, WorkerResult, WorkerType
 from sfly_workers.__main__ import EXIT_BAD_INPUT, EXIT_FAILED, EXIT_OK, main
 from sfly_workers.pool import should_dead_letter
+from sfly_workers.runner import library_rule_ids
+
+
+def _rule_exists(rule_id: str) -> bool:
+    """这个 id 真的在规则库里吗。**直接问生产代码那份清单**，
+    而不是在测试里再写一遍「合法 id 长什么样」—— 那种副本一定会漂移。"""
+    return rule_id in library_rule_ids()
+
 
 FIXTURES = Path(__file__).resolve().parents[3] / "fixtures"
 NOT_A_DIFF = "这是一段普通文字，不是 diff。"
@@ -276,19 +284,29 @@ def test_max_files_caps_the_review_and_says_so(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("spec", ["security", "performance", "style"])
-def test_no_rules_still_runs_and_clears_rule_ids(
+def test_no_rules_still_runs_and_keeps_real_rule_ids(
     spec: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """``--no-rules`` 用来验证「没有规则时会不会开始自由发挥」。
 
-    注意 ``rule_id`` 全部变成 null —— 没送规则时任何 rule_id 都是编的，
-    ``reconcile_findings`` 会如实清掉它。
+    ``--no-rules`` 影响的是**送进提示词的那几条**，不是「哪些 rule_id 合法」。
+    后者查的是规则库（见 ``reconcile_findings`` 的文档第 3 条）——
+    所以 ``rule_id`` **不会**因为不送规则而被清掉。
+
+    这两件事以前是同一件事（第三个参数就是「本轮检索到的规则」），
+    而那让一条真实存在、只是没被检索到的规则被当成幻觉清掉，
+    连带丢掉 ``grounded`` 的 +0.10 加成。M9 的评测把这个代价量了出来。
     """
     code, out, _err = _run(
         monkeypatch, capsys, "--spec", spec, "--diff", str(FIXTURES / "security_demo.diff"), "--no-rules"
     )
     assert code == EXIT_OK
-    assert all(f["rule_id"] is None for f in json.loads(out)["findings"])
+    findings = json.loads(out)["findings"]
+    assert findings, "这份 diff 上本来就该有发现；空的说明审查根本没跑起来"
+    # 保留下来的 id 必须真的存在于规则库里，而不是随便什么字符串。
+    assert all(f["rule_id"] is None or _rule_exists(f["rule_id"]) for f in findings), [
+        f["rule_id"] for f in findings
+    ]
 
 
 @pytest.mark.unit

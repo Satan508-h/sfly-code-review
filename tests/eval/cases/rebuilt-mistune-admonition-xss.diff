@@ -1,0 +1,18 @@
+diff --git a/src/mistune/directives/admonition.py b/src/mistune/directives/admonition.py
+--- a/src/mistune/directives/admonition.py
++++ b/src/mistune/directives/admonition.py
+@@ -1,5 +1,4 @@
+ from typing import TYPE_CHECKING, Any, Dict, Match
+-from ..util import escape as escape_text
+ 
+ from ._base import BaseDirective, DirectivePlugin
+ 
+@@ -65,7 +64,7 @@ def render_admonition(self: Any, text: str, name: str, **attrs: Any) -> str:
+     html = '<section class="admonition ' + name
+     _cls = attrs.get("class")
+     if _cls:
++        html += " " + _cls
+-        html += " " + escape_text(_cls)
+     return html + '">\n' + text + "</section>\n"
+ 
+ 

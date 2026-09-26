@@ -1,0 +1,11 @@
+id: rebuilt-gradio-open-redirect
+group: rebuilt
+origin: rebuilt
+repo: gradio-app/gradio
+commit: dfee0da06d
+note: "回退 CVE-2026-28415 的修复：OAuth 回调又直接跳转到调用方给的地址"
+expected:
+  - file: gradio/oauth.py
+    line: 223
+    category: open_redirect
+    severity: medium
