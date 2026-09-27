@@ -63,8 +63,15 @@
 
 ## 第 2 步 · Render：部署后端
 
+> **要选哪个仓库？`Satan508-h/sfly-code-review`** —— 就是装着这份代码的那个。
+> （注意别和 `sfly-playground` 搞混：那是**被审查的靶场仓库**，第 5 步配 webhook
+> 才用得到它。本地文件夹叫 `sfly-code-review-system`，那只是文件夹名，
+> GitHub 上的仓库名不一样 —— 按仓库名找。）
+
 1. 登录 Render → **New** → **Blueprint**。
-2. 选 **GitHub** → 授权 → 选中 `sfly-code-review-system` 这个仓库 → **Connect**。
+2. 选 **GitHub** → 授权。授权那一步会让你选「允许 Render 看哪些仓库」——
+   **`sfly-code-review` 必须在列表里**（选 All repositories，或者单独勾上它）。
+   授权完回到 Render，选中 `Satan508-h/sfly-code-review` → **Connect**。
 3. Render 会读出仓库里的 `render.yaml`，列出它要建的服务（`sfly-lite`）。
    点 **Apply**。
 4. 接着它会**问你几个值**（`render.yaml` 里标了 `sync: false` 的那几个）。
