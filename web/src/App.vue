@@ -89,8 +89,7 @@ onUnmounted(() => healthStore.stopWatch())
           <div class="waking-spinner" />
           <h2>正在唤醒服务</h2>
           <p class="waking-lead">
-            免费的演示实例在长时间没人访问后会休眠，这次访问正在把它重新拉起来，
-            通常需要 1–3 分钟。
+            免费的演示实例在长时间没人访问后会休眠，这次访问正在把它重新拉起来， 通常需要 1–3 分钟。
           </p>
           <p class="waking-stats mono">
             已等待 {{ healthStore.waitedS }} 秒 · 第 {{ healthStore.attempts }} 次探测
