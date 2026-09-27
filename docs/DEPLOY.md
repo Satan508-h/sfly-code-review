@@ -28,19 +28,36 @@
 
 1. 登录 Neon → **Create project** → 名字随便填（比如 `sfly`）→ 区域选**离你近的**
    （新加坡 / 东京，如果列表里有）。
-2. 建好之后它会给你一条连接串，长这样：
+2. Neon 会给你**两条**连接串，长这样：
 
    ```
-   postgresql://用户名:密码@ep-xxx-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require
+   postgresql://用户名:密码@ep-xxx.ap-southeast-1.aws.neon.tech/neondb?sslmode=require          ← Direct
+   postgresql://用户名:密码@ep-xxx-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require   ← Pooled
    ```
 
-   **要带 `-pooler` 的那个**（Neon 页面上叫 "Pooled connection"）。
-   免费版的直连端点超过 10 条并发连接会被拒，而我们的容器开的是连接池。
+   **两条都复制**，粘到项目根目录的 `.env` 里这一行（`NEON_DATABASE_URL=` 后面）：
 
-3. 把这条串复制到某处暂存（下一步要粘进 Render）。
+   ```
+   NEON_DATABASE_URL=把两条都粘在这里
+   ```
 
-> 这一步不需要跑任何命令。表会在后端第一次启动时自动建好
-> （`migrate_on_startup`，幂等，本地线上走的是同一段代码）。
+   下面的命令会**自己挑出带 `-pooler` 的那一条**（Neon 面板上叫
+   "Pooled connection"）—— 直连端点在免费档的并发上限低，而容器里有两个连接池。
+
+3. 验证一下这条连接串真的能用（这一步会让 Neon 提前建好表，容器起来时就不用现建了）：
+
+   ```bash
+   python tasks.py db-check --name NEON_DATABASE_URL
+   ```
+
+   **你应该看到**最后一行是 `[OK] NEON_DATABASE_URL 可用（连接、权限、迁移都验过了）`，
+   上面还会列出 `findings, llm_calls, review_reports, review_runs, run_events,
+   schema_version, webhook_deliveries, worker_results` 八张表。
+
+   > 这一步值得做：它走的是**和容器启动时同一条路**，所以连接、权限、SSL、
+   > 以及我们的建表 SQL 全都提前验过了。不验的话，这些问题的表现是
+   > 「Render 构建五分钟、部署成功、然后打开页面说数据库连不上」——
+   > 排查方向会先跑到 Render 那边去。
 
 ---
 
@@ -56,14 +73,15 @@
 
    | 变量 | 值从哪来 |
    |---|---|
-   | `DATABASE_URL` | **粘上一步 Neon 那条连接串**（不是本项目 `.env` 里那条！那条指向你本机的 Docker，粘上去线上连不上数据库） |
-   | `LLM_API_KEY` | 在本项目目录跑 `python tasks.py copy-env LLM_API_KEY`，然后在这里 Ctrl+V |
+   | `DATABASE_URL` | 在本项目目录跑 `python tasks.py copy-env NEON_DATABASE_URL`，然后在这里 Ctrl+V。**注意变量名对不上是故意的**：`.env` 里的 `DATABASE_URL` 指向你本机的 Docker，粘上去线上连不上数据库 |
+   | `LLM_API_KEY` | 同上，`python tasks.py copy-env LLM_API_KEY` |
    | `GITHUB_TOKEN` | 同上，`python tasks.py copy-env GITHUB_TOKEN` |
    | `GITHUB_WEBHOOK_SECRET` | 同上，`python tasks.py copy-env GITHUB_WEBHOOK_SECRET` |
    | `CORS_ORIGINS` | **先随便填**，第 4 步会回来改成真正的网址。现在填 `http://localhost:5173` |
 
    > `copy-env` 那条命令**不会把值打印到屏幕上**，它只把值放进剪贴板 ——
    > 密钥不该出现在终端历史、日志或者截图里。跑完直接去网页上粘贴。
+   > **一次复制一条**，粘完再去复制下一条（剪贴板只有一格）。
 
 5. 点 **Apply / Create**，然后等。第一次构建要 3–5 分钟。
 6. 构建完，页面上会给你一个网址，形如：

@@ -599,6 +599,78 @@ def cmd_copy_env(args: argparse.Namespace) -> None:
     print("  下一步：到需要它的那个网页表单里 Ctrl+V。", file=sys.stderr)
 
 
+def cmd_db_check(args: argparse.Namespace) -> None:
+    """探一条连接串能不能用 —— **部署之前跑，别等构建完才发现**。
+
+    它读的是 ``.env`` 里的某一个变量（默认 ``DATABASE_URL``），走的是**和容器
+    启动时同一条路**：开连接池 → 探一次 → 建表（幂等）。所以它验的不只是
+    「连得上」，还有「我们的迁移 SQL 在这台服务器上跑得通」——
+    线上库的版本、权限、SSL 要求只要有一处不同，在这里就会现形，
+    而那时你还没花掉一次五分钟的构建。
+
+    报错里的密码会被抹掉再打印：连接串是凭据，而报错信息经常带着整个 DSN。
+    """
+    import re
+
+    from sfly_shared.aio import run
+
+    name = args.name
+    dsn = ""
+    path = ROOT / ".env"
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith(f"{name}="):
+                dsn = line.strip().split("=", 1)[1]
+                break
+    if not dsn:
+        _die(f".env 里 {name} 是空的。要么你还没填，要么名字写错了。")
+
+    def _scrub(text: str) -> str:
+        return re.sub(r"://([^:/@]+):[^@]*@", r"://\1:***@", str(text))
+
+    async def _check() -> None:
+        # **刻意不走 ``open_dependencies``**：那会按 .env 把队列和锁也开起来
+        # （默认是 Redis），于是「探一下这个数据库」会顺带连一次 Redis、
+        # 冒出几条和问题无关的日志 —— 而 Redis 挂了的时候，一个只想知道
+        # 「这条连接串对不对」的人会以为是自己填错了。
+        # 这里只碰数据库，别的一概不碰。
+        from sfly_bus.postgres import PostgresPool, PostgresRunStore, migrate_on_startup
+        from sfly_shared.config import Settings
+
+        s = Settings(database_url=dsn)
+        pool = PostgresPool(dsn, min_size=1, max_size=2, connect_timeout_s=s.db_connect_timeout_s)
+        # **先单独探一次，再开池子。** 池子拿不到连接时只会报一句
+        # ``PoolTimeout``（等满 30 秒），真正的原因 —— 密码不对、主机名打错、
+        # 服务器没开 —— 全被那句话盖住。``ping()`` 走的是一条一次性连接，
+        # 报出来的是原始错误，而且它**不抛异常**。
+        # 顺序也重要：连不上时池子根本不用开，于是也不会多出库自己那行
+        # 英文警告，用户的屏幕上只有一句中文。（同一条纪律见 CLAUDE.md 的
+        # 「健康探测必须走独立连接」。）
+        probe = await pool.ping()
+        print(f"  连通性：{'ok' if probe.ok else 'down'} —— {_scrub(probe.detail)}", file=sys.stderr)
+        if not probe.ok:
+            raise RuntimeError(f"连不上：{probe.detail}")
+
+        await pool.open()
+        try:
+            await migrate_on_startup(PostgresRunStore(pool, run_deadline_s=s.run_deadline_s))
+            async with pool.connection() as conn:
+                cur = await conn.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema='public' ORDER BY table_name"
+                )
+                tables = [r["table_name"] for r in await cur.fetchall()]
+            print(f"  表：{', '.join(tables) if tables else '（还没有，迁移没建成东西）'}", file=sys.stderr)
+        finally:
+            await pool.close()
+
+    try:
+        run(_check())
+    except Exception as exc:
+        _die(f"{name} 连不上或跑不通迁移：{type(exc).__name__}: {_scrub(exc)[:500]}")
+    _ok(f"{name} 可用（连接、权限、迁移都验过了）")
+
+
 def cmd_set_llm_key(_: argparse.Namespace) -> None:
     """把剪贴板里的 LLM key 写进 ``.env``。
 
@@ -985,6 +1057,17 @@ def build_parser() -> argparse.ArgumentParser:
         cmd_copy_env,
         "把 .env 里某一项的值复制到剪贴板（部署时往网页表单里粘，不回显内容）",
         [(("name",), {"help": "变量名，例如 GITHUB_TOKEN"})],
+    )
+    add(
+        "db-check",
+        cmd_db_check,
+        "探一条连接串能不能用（开池 → 探活 → 建表），部署前跑",
+        [
+            (
+                ("--name",),
+                {"default": "DATABASE_URL", "help": "读 .env 里哪个变量（默认 DATABASE_URL）"},
+            )
+        ],
     )
 
     add(

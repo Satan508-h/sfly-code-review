@@ -629,6 +629,12 @@ python tasks.py set-llm-key  # 把剪贴板里的 key 写进 .env（不回显内
 python tasks.py copy-env GITHUB_TOKEN
                              # 把 .env 里某一项的值复制到剪贴板（部署时往
                              # Render 的网页表单里粘）。**同样不回显内容与长度**
+python tasks.py db-check --name NEON_DATABASE_URL
+                             # 探一条连接串：开池之前先走一次性连接探活，
+                             # 再跑一次迁移。**部署之前跑** —— 它验的是
+                             # 「连得上 + 权限够 + 建表 SQL 在这台服务器上跑得通」，
+                             # 而这三件事出问题时的表现都是「构建五分钟、部署成功、
+                             # 然后页面说数据库连不上」
 
 # 精简模式：一个进程跑完整个系统（Render 上跑的就是它，本地也用同一段代码）。
 # 需要一个 Postgres，**不需要 Redis**。用独立的库 —— 完整模式的 orchestrator
