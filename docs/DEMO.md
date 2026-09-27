@@ -9,6 +9,16 @@
 
 ## 录屏之前：一次彩排（约 5 分钟）
 
+> **下面所有命令都要在项目目录里跑。** 新开的终端默认落在你的用户主目录，
+> 在那里敲 `python tasks.py` 会报
+> `can't open file 'C:\Users\<你>\tasks.py': [Errno 2] No such file or directory` ——
+> 那不是文件没了，是站错地方了。先切过去（`cd` 一次就够，同一个终端窗口里
+> 之后都在那儿；关掉重开或者切走了要再 `cd` 一次）：
+>
+> ```bash
+> cd 项目所在的目录          # 里面应该能看到 tasks.py
+> ```
+
 ```bash
 python tasks.py up          # 七个容器起来，阻塞到健康检查通过（第一次要几分钟构建）
 python tasks.py ps          # 全绿再往下走
