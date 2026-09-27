@@ -16,7 +16,7 @@ commit**。
 | 文件 | 是什么 |
 |---|---|
 | [`eval-a010ba9-real-deepseek.md`](eval-a010ba9-real-deepseek.md) | 30 个用例跑 DeepSeek，$0.15。**分组数字才是重点**：回退真实 CVE 的那 10 条全找出来了（严格召回 100%），而同一批用例在离线层一条都认不出来 |
-| [`eval-e9aafd0-ablation-real-deepseek.md`](eval-e9aafd0-ablation-real-deepseek.md) | 1 / 2 / 3 Worker + 单 Agent 基线四档对照。**「多 Agent 值不值」只有这份能给答案**：多召回 12.1 个百分点，代价 2.4 倍成本 |
+| [`eval-e9aafd0-ablation-real-deepseek.md`](eval-e9aafd0-ablation-real-deepseek.md) | 1 / 2 / 3 Worker + 单 Agent 基线四档对照。**「多 Agent 值不值」只有这份能给答案**：多召回 12.1 个百分点，代价 2.77 倍成本 |
 
 ### 离线层 —— Mock（$0、秒级、可复现）
 

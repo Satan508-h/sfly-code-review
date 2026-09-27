@@ -16,7 +16,10 @@
 > 之后都在那儿；关掉重开或者切走了要再 `cd` 一次）：
 >
 > ```bash
-> cd 项目所在的目录          # 里面应该能看到 tasks.py
+> cd 项目所在的目录 
+cd "C:\Users\33879\Desktop\sfly-code-review-system"
+python tasks.py ps
+         # 里面应该能看到 tasks.py
 > ```
 
 ```bash
@@ -131,7 +134,7 @@ python tasks.py replay-bootstrap --task-id <刚才那个> --simulate-crash
 **说**：「这些数字是花真钱跑出来的。最值得看的是这个：**10 条回退真实 CVE
 修复的用例，真实模型全部找了出来**（召回 100%），而同一批用例在离线层
 一条都认不出来。还有消融：**三个 Worker 比单 Agent 多召回 12.1 个百分点**，
-代价是 2.4 倍成本。」
+代价是 2.77 倍成本。」
 
 ---
 
@@ -144,7 +147,7 @@ python tasks.py replay-bootstrap --task-id <刚才那个> --simulate-crash
 | 「为什么不用 Kafka / K8s？」 | 这个体量用不上，而且**换掉它们不影响任何业务代码** —— 队列和锁都是协议，两种实现（Redis / 进程内）共用同一份契约测试 | `tests/contracts/`；`python tasks.py test-int` |
 | 「怎么保证不重复审查？」 | 靠数据库唯一约束，**不靠 Redis SETNX**（它会过期、会随重启丢失）。SETNX 只是省 token 的快路径 | `worker_results` 的主键；README 的「幂等」那段 |
 | 「去重为什么不用 embedding？」 | 确定性、可复现（评测需要它）、无模型下载、微秒级 | `aggregate/cluster.py` |
-| 「多 Agent 到底比单 Agent 强多少？」 | **真实模型上 +12.1 个百分点召回，代价 2.4 倍成本**。而且这个结论**离线层给不出来**（Mock 按 lane 过滤，三份并集天然等于一次全报） | `reports/*-ablation-real-*.md` |
+| 「多 Agent 到底比单 Agent 强多少？」 | **真实模型上 +12.1 个百分点召回，代价 2.77 倍成本**。而且这个结论**离线层给不出来**（Mock 按 lane 过滤，三份并集天然等于一次全报） | `reports/*-ablation-real-*.md` |
 | 「置信度阈值 0.35 怎么定的？」 | 扫描出来的，而且**两层结论相反**：离线层说 0.30 更好，真实层说 0.35 支配它 —— 因为 Mock 的置信度是手写常数，拿错误的分布调参数 | `reports/*-real-*.md` 的扫描表 |
 | 「部署了吗？」 | **没有，而且原因不在代码** —— 三个平台的原文报错我都留着：Render 要绑卡、HF 的 Docker Space 要 PRO 订阅且国内打不开、vercel.app 被墙。部署配置是完整可执行的，每一步的字段名都实测过 | [`docs/DEPLOY.md`](DEPLOY.md) 开头 |
 | 「这项目最难的地方是哪？」 | 「都不报错」那一类。最好举例：一次推理模型把输出预算全用在思维链上、正文一个字没写，而报告会以**「未发现问题」**发布出去 —— 上游看到的现象只是「解析不出 JSON」 | README 的 M10 那节 |
