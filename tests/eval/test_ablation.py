@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 
 import pytest
@@ -145,13 +146,23 @@ def test_write_the_ablation_report(variants: list[Variant]) -> None:
     provider = Settings().llm_provider
     # 层名进文件名，理由见 ``test_eval.py`` 里的同一处。
     layer_slug = "offline" if provider == "mock" else f"real-{provider}"
+    # 「数据来源」那一行指向同一批用例的主报告 —— **但那份不一定存在**：
+    # 真实层的消融可以单独跑（它比主报告贵得多），那一次的 sha 就没有配套的
+    # `-real-<provider>.md`。写死文件名会得到一个死链，而这份报告是提交进仓库、
+    # 给面试官点的 —— 死链要到他点下去那一刻才被发现。
+    peer = f"eval-{sha}-{layer_slug}.md"
+    source = (
+        f"- 数据来源：与 [`{peer}`]({peer}) 同一批用例，配置不同"
+        if (REPORTS_DIR / peer).exists()
+        else "- 数据来源：与本轮评测同一批用例，配置不同（这一次没有同时跑非消融的那份）"
+    )
     lines = [
         f"# sfly 消融与基线报告 · {sha}",
         "",
         f"- 代码版本：`{sha}`" + ("（**生成时工作区有未提交改动**）" if dirty else "（生成时工作区干净）"),
         f"- 用例：{len(load_cases())} 个",
         f"- LLM：`{provider}`",
-        f"- 数据来源：与 `eval-{sha}-{layer_slug}.md` 同一批用例，配置不同",
+        source,
         "",
         "这四档之间**只有拓扑不同**：用例、规则库、`WorkerRunner`、聚合层逐字相同。",
         "所以表里的差值是拓扑带来的，不是实现差异带来的。",
@@ -185,6 +196,12 @@ def test_write_the_ablation_report(variants: list[Variant]) -> None:
         "",
     ]
     body = "\n".join(lines).rstrip() + "\n"
+
+    # 「数据来源」曾经写死成链接 —— 而真实层的消融可以单独跑，那一次的 sha
+    # 就没有配套的主报告，于是报告里留下一个**死链**。报告是提交进仓库、
+    # 给面试官点的：死链要到他点下去那一刻才被发现。
+    for target in re.findall(r"\]\((eval-[^)]+\.md)\)", source):
+        assert (REPORTS_DIR / target).exists(), f"「数据来源」指向不存在的 {target}"
 
     REPORTS_DIR.mkdir(exist_ok=True)
     path = REPORTS_DIR / f"eval-{sha}-ablation-{layer_slug}.md"
