@@ -141,7 +141,10 @@ describe('冷启动等待', () => {
     await store.startWatch()
     expect(store.waiting).toBe(true)
 
-    await vi.advanceTimersByTimeAsync(120_000)
+    // 这个数必须**大于** store 里的 GIVE_UP_MS（现在是 7 分钟），而那个值
+    // 跟着部署平台的冷启动走。推进得不够远的话，这条测试会变成「面板还在
+    // 等待」而失败 —— 那正是它该有的表现：上限和平台不匹配了。
+    await vi.advanceTimersByTimeAsync(500_000)
 
     expect(store.waiting).toBe(false)
     expect(store.error).toContain('Network Error')

@@ -85,8 +85,12 @@ reports/         评测报告，提交进仓库。**层名在文件名里**：
 docs/            DEPLOY.md —— 部署手册（Render / Vercel / Neon 六步 + 排查顺序），
                  写给非技术读者。render.yaml 是它的可执行版本
 render.yaml      Render Blueprint（精简模式）。**不带任何 build arg** ——
-                 Dockerfile 的 ARG 默认值就是精简模式，理由见那里
+                 Dockerfile 的 ARG 默认值就是精简模式，理由见那里。
+                 **它是备选**：线上走的是 Hugging Face Spaces（见 docs/DEPLOY.md）
 web/vercel.json  SPA 重写（前端用 createWebHistory，刷新深链接要它）
+README.md 顶部    **Hugging Face Spaces 的 frontmatter**（sdk / app_port）。
+                 Spaces 的配置只从仓库根 README 读，没有别的地方能放 ——
+                 所以它必须在最上面，代价是 GitHub 会把它渲染成一张表
 ```
 
 **`tests/contracts/` 是「两种拓扑」这个卖点的证据本身**：`queue_contract.py`
@@ -591,6 +595,29 @@ webhook 投进那一条，`GraphRunner` 在另一条上等。实测：`HTTP 202 
 `_target_groups(None)` 早就写好了要覆盖 bootstrap，契约测试也断言了 —— 缺的
 只是那个调用者。
 
+**部署平台换过一次，而换平台会牵动四处「跟着平台走」的数。**
+原先按 Render 免费档设计（512 MB、闲置 15 分钟休眠、冷启动 30–60 秒），
+实做时发现它的免费档现在**要绑一张信用卡**做身份验证，于是换成
+**Hugging Face Spaces**（不要卡、16 GB 内存、闲置 **48 小时**才休眠）。
+换的时候同时要改的是这四处，少改一处都不会报错、只会在线上表现成怪现象：
+
+| 跟着平台走的东西 | Render | HF Spaces | 不改的症状 |
+|---|---|---|---|
+| `stores/health.ts` 的 `GIVE_UP_MS` | 120 秒 | **420 秒** | 真撞上冷启动时，唤醒面板在容器醒之前变成「后端未连通」 |
+| `App.vue` 唤醒面板的文案 | 30–60 秒 | **1–3 分钟** | 承诺了一个做不到的时间 |
+| README frontmatter 的 `app_port` | — | **7860** | 见下面那条 |
+| 容器里的 uid | 10001 | **1000** | 平台以 uid 1000 运行容器，镜像里没这个用户时 `/app` 对它是只读的 |
+
+**端口必须在两处写同一个数。** Spaces 的 frontmatter 里 `app_port` 决定平台把
+流量转到哪个端口，而程序听的是 `PORT` 环境变量（默认 8000）。**平台有可能
+自己注入一个 `PORT`** —— 所以线上显式设 `PORT=7860`，frontmatter 也写 7860：
+不一致的症状是「构建成功、日志正常、页面打不开」，而那种错很难往端口上想。
+
+**Hugging Face 的 frontmatter 只能放在仓库根 README 的最上面**（Spaces 只读
+那里），而 GitHub 会把它渲染成一张表 —— 所以项目首页最上面多几行元数据。
+这是本仓库唯一一处为部署让步的地方，`docs/DEPLOY.md` 和 README 里都写明了；
+换平台时删掉整块即可。
+
 **重建组的用例只接受「替换了代码」的修复。**
 回退一个纯新增的修复（只加了一段校验）会得到纯删除的 diff，而被删的行
 **没有可锚的位置** —— 审查报出的行号必须落在新增行上。这类提交做不成用例，
@@ -733,10 +760,12 @@ python tasks.py demo --follow --drop-after 3   # 断开重连，SSE 无缺口
       **两层都跑完**，四份报告在 `reports/`：真实层 30 个用例 ≈ $0.15 / 10 分钟，
       重建组（回退真实 CVE）精确率 76.9% / 召回率 100%，
       三 Worker 比单 Agent 多召回 12.1 个百分点
-- [ ] M10 — 精简模式 + Render / Vercel 部署。**代码这一半全部完成并验证过**：
+- [ ] M10 — 精简模式 + 部署上线。**代码这一半全部完成并验证过**：
       单进程跑通（`python -m sfly_lite`）、成本闸、冷启动前端、线上那条路
       （`plan` 自己去拉代码）、部署配置与 `docs/DEPLOY.md`。
-      **剩下的是账号那一半**：Render / Vercel / Neon 注册 + 线上验收
+      **部署平台是 Hugging Face Spaces**（不是 Render —— 它的免费档要绑卡，
+      见上面那条技术决定）。**Neon 那一半已经做完并验过**（八张表建好了）。
+      **剩下的是账号那一半**：HF Spaces + Vercel 注册，按 `docs/DEPLOY.md` 走
 - [ ] M11 — 可选：pgvector、LLM 冲突消解 A/B
 
 详细计划见 `~/.claude/plans/1-agent-pr-curried-unicorn.md`。

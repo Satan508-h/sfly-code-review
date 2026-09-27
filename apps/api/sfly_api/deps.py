@@ -38,7 +38,7 @@ async def require_deps(deps: Annotated[Dependencies | None, Depends(get_deps)]) 
 
     503 是「现在干不了活、过会儿再来」的准确含义 —— 而 500 会让调用方以为
     是代码坏了。这条路径真实存在：lifespan 还没跑完（uvicorn 启动中、
-    Render 冷启动）、或者把 app 挂到一个不转发 lifespan 的宿主上。
+    免费档冷启动）、或者把 app 挂到一个不转发 lifespan 的宿主上。
     """
     if deps is None:  # pragma: no cover —— 正常由 lifespan 保证
         raise HTTPException(status_code=503, detail="依赖未初始化")

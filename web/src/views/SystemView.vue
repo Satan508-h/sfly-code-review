@@ -82,7 +82,7 @@ const WORKERS = [
  * 写成 `prop="0"` 不会报错 —— 它只是**显示空白**。
  */
 const TOPOLOGY = [
-  { dim: '启动方式', full: 'docker compose up', lite: 'Render 单容器' },
+  { dim: '启动方式', full: 'docker compose up', lite: '单容器（免费档）' },
   {
     dim: '容器数',
     full: '7+（api / orchestrator / worker×3 / redis / postgres / web）',
@@ -131,8 +131,8 @@ onMounted(() => {
       <template #default>
         <p style="margin: 4px 0 0">{{ store.error }}</p>
         <p style="margin: 4px 0 0; color: var(--sfly-text-dim)">
-          先执行 <code>python tasks.py up</code>，等健康检查通过后重试。 Render 免费版冷启动需要约
-          60 秒。
+          先执行 <code>python tasks.py up</code>，等健康检查通过后重试。
+          线上免费档冷启动需要几分钟（页面顶部会显示唤醒进度）。
         </p>
       </template>
     </el-alert>

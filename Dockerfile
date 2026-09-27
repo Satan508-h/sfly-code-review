@@ -83,7 +83,15 @@ ENV PATH="/app/.venv/bin:$PATH" \
 ARG APP_MODULE=sfly_lite
 
 # 非 root 运行。uid 固定，方便挂载卷时的权限排查。
-RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin sfly \
+# uid 用 **1000**，不是随手挑的一个数：**Hugging Face Spaces 以 uid 1000 运行
+# 容器**，镜像里没有这个用户的话，`/app` 下的东西对运行时用户是只读的 ——
+# 而那种故障的表现是「本地好好的、线上某个写操作报 permission denied」。
+# 用同一个 uid 就没有这层意外。1000 也是各发行版第一个普通用户的惯例编号。
+#
+# 这个改动对 compose 没有影响：五个服务的 uid 从 10001 变成 1000，而它们
+# 都不挂载宿主目录（挂进容器的是给 postgres 用的 init.sql），所以没有
+# 「宿主机上的文件属主对不上」这一类问题。
+RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin sfly \
  && mkdir -p /tmp \
  && chown -R sfly:sfly /app
 USER sfly

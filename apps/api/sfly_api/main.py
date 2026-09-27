@@ -128,7 +128,7 @@ def create_app(*, deps: Dependencies | None = None) -> FastAPI:
         app.state.host_deps = True
 
     # 完整模式下前端由 nginx 同源代理，用不上 CORS。
-    # 精简模式下前端在 Vercel、后端在 Render，**必须**显式列出来，
+    # 精简模式下前端在 Vercel、后端在 Hugging Face Spaces，**必须**显式列出来，
     # 否则浏览器的 EventSource 会被拦。
     app.add_middleware(
         CORSMiddleware,

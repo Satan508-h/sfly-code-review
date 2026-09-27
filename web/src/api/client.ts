@@ -7,15 +7,20 @@ import axios from 'axios'
  * devServer.proxy（开发）转发到 api:8000。**业务代码里永远不要出现
  * 硬编码的后端地址**，跨环境差异只在这一个地方处理。
  *
- * 精简模式（前端在 Vercel、后端在 Render）在构建时注入绝对地址：
- *   VITE_API_BASE=https://sfly-api.onrender.com/api npm run build
+ * 精简模式（前端在 Vercel、后端在 Hugging Face Spaces）在构建时注入绝对地址：
+ *   VITE_API_BASE=https://你的空间网址/api npm run build
  */
 export const API_BASE: string = import.meta.env.VITE_API_BASE ?? '/api'
 
 export const http = axios.create({
   baseURL: API_BASE,
-  // Render 免费版冷启动：容器休眠后第一个请求要等约 60 秒。
-  // 超时给短了会在冷启动时直接失败，用户看到的是一个坏掉的页面。
+  // 免费档冷启动时，容器要重新拉起来（Hugging Face Spaces 是 1–5 分钟），
+  // 期间请求会一直挂着。超时给短了会在冷启动时直接失败，用户看到的是坏页面。
+  //
+  // 90 秒**不是**为了等它醒完（那要几分钟），而是为了不让一次探测永远挂着：
+  // 真正负责「等到它醒」的是 stores/health.ts 那条重试循环，它一次一次地探，
+  // 而每一次探测都在这 90 秒之内结束。冷启动期间 Space 那边的唤醒不受
+  // 我们超时的影响 —— 它是在自己启动容器。
   timeout: 90_000,
   headers: { 'Content-Type': 'application/json' },
 })

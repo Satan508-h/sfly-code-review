@@ -5,7 +5,7 @@
  * 它只做四件事，业务全在 views/ 里：
  *   1. 顶栏 —— 品牌、两个导航项、以及**当前部署形态的回显**
  *   2. `<el-config-provider>` —— Element Plus 的中文文案，见下面那段注释
- *   3. 后端还没答应时的**唤醒面板**（Render 免费档冷启动，见 stores/health.ts）
+ *   3. 后端还没答应时的**唤醒面板**（免费档冷启动，见 stores/health.ts）
  *   4. 连不上时的全局提示条
  *
  * ### 顶栏那个徽章为什么值得留
@@ -89,7 +89,8 @@ onUnmounted(() => healthStore.stopWatch())
           <div class="waking-spinner" />
           <h2>正在唤醒服务</h2>
           <p class="waking-lead">
-            Render 免费档在 15 分钟没人访问后会休眠，下一次访问要重新拉起容器， 通常需要 30–60 秒。
+            免费的演示实例在长时间没人访问后会休眠，这次访问正在把它重新拉起来，
+            通常需要 1–3 分钟。
           </p>
           <p class="waking-stats mono">
             已等待 {{ healthStore.waitedS }} 秒 · 第 {{ healthStore.attempts }} 次探测

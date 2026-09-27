@@ -3,8 +3,8 @@
  *
  * 这一屏有两件事值得钉住，而它们都属于「错了不会报错」那一类：
  *
- * 1. **唤醒面板要出现。** 不出现的表现是白屏 —— 而 Render 免费档冷启动
- *    60 秒是必然会发生的场景，也就是简历上那个链接被点开的第一秒。
+ * 1. **唤醒面板要出现。** 不出现的表现是白屏 —— 而免费档冷启动是必然会
+ *    发生的场景，也就是简历上那个链接被点开的第一秒。
  * 2. **唤醒期间不能挂载路由。** 挂载了的话，每个视图都会在同一个冷启动
  *    窗口里发自己的请求、一起挂 90 秒、然后各报一次错 —— 访客看到三四个
  *    红色错误，而真相只有一个：容器还没醒。这条用「路由内容不存在」来断言。
@@ -137,7 +137,9 @@ describe('冷启动第一屏', () => {
     fetchHealthMock.mockRejectedValue(new Error('Network Error'))
     const wrapper = await render()
 
-    await vi.advanceTimersByTimeAsync(125_000)
+    // 必须超过 stores/health.ts 的 GIVE_UP_MS（7 分钟）。见那里：那个上限
+    // 跟着平台的冷启动走，改平台时要一起改。
+    await vi.advanceTimersByTimeAsync(500_000)
     await flushPromises()
 
     expect(wrapper.find('.waking').exists()).toBe(false)
