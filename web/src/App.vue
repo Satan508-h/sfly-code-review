@@ -89,7 +89,8 @@ onUnmounted(() => healthStore.stopWatch())
           <div class="waking-spinner" />
           <h2>正在唤醒服务</h2>
           <p class="waking-lead">
-            免费的演示实例在长时间没人访问后会休眠，这次访问正在把它重新拉起来， 通常需要 1–3 分钟。
+            后端还没有应答，页面会一直重试。本地跑的话，先确认执行过
+            <code>python tasks.py up</code>；线上的免费档休眠后需要 1–3 分钟重新拉起容器。
           </p>
           <p class="waking-stats mono">
             已等待 {{ healthStore.waitedS }} 秒 · 第 {{ healthStore.attempts }} 次探测

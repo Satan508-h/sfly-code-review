@@ -18,10 +18,13 @@ sys.path，所以下面手动加一次。
 
 from __future__ import annotations
 
+import re
+import shutil
 import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -109,3 +112,68 @@ def test_a_missing_readme_refuses_to_upload() -> None:
     它会被当成别的东西，而构建仍然是成功的。"""
     with pytest.raises(SystemExit):
         _assert_sane_upload(["Dockerfile", "pyproject.toml"])
+
+
+def test_a_missing_space_header_refuses_to_upload(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """配置头文件不在时也拒传。
+
+    它不在仓库的 README 里（那是刻意的，见下面那条），所以「它还在不在」
+    本身就是一件会被弄丢的事 —— 比如有人整理目录时顺手删了 `deploy/`。
+    """
+    import tasks
+
+    monkeypatch.setattr(tasks, "ROOT", tmp_path)
+    with pytest.raises(SystemExit):
+        _assert_sane_upload(["Dockerfile", "README.md"])
+
+
+def test_the_staged_readme_carries_valid_space_metadata() -> None:
+    """暂存之后，README 顶上的 frontmatter 得是**合法 YAML** 且两个关键字段对。
+
+    这两个字段错了不会报错：`sdk` 不对 Space 会当成别的东西去跑，`app_port`
+    不对则是「构建成功、页面打不开」。
+    """
+    import tasks
+
+    stage = tasks._stage_upload_tree(["README.md", "Dockerfile"])
+    try:
+        readme = (stage / "README.md").read_text(encoding="utf-8")
+        match = re.match(r"\A---\n(.*?)\n---\n", readme, re.S)
+        assert match is not None, "拼接后的 README 顶上没有 frontmatter"
+
+        data = yaml.safe_load(match.group(1))
+        assert data["sdk"] == "docker"
+        # 必须和出题处（deploy-hf 设的 PORT）以及程序默认端口对得上。
+        # 三处任一不一致，症状都是「构建成功、日志正常、页面打不开」。
+        assert data["app_port"] == 7860
+
+        # 原来的正文要**原样**跟在后面 —— 拼接不是替换。
+        assert readme.count("# sfly — 基于多 Agent 的分布式代码审查系统") >= 1
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def test_the_staged_tree_never_contains_credentials() -> None:
+    """暂存出来的那棵树里也不能有凭据 —— 上传的是它，不是仓库。"""
+    import tasks
+
+    stage = tasks._stage_upload_tree(_upload_files())
+    try:
+        present = [p.relative_to(stage).as_posix() for p in stage.rglob("*") if p.is_file()]
+        leaked = [p for p in present if _is_secret_path(p)]
+        assert leaked == [], f"暂存目录里有凭据：{leaked[:5]}"
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def test_the_repo_readme_stays_clean() -> None:
+    """仓库里的 README **不带** frontmatter。
+
+    这是上面那套拼接存在的全部理由：GitHub 会把 frontmatter 渲染成一张表，
+    而那是项目首页 —— 为了部署而常年顶着一张元数据表，代价不该由仓库付。
+    """
+    import tasks
+
+    text = (tasks.ROOT / "README.md").read_text(encoding="utf-8")
+    assert not text.startswith("---\n"), "仓库的 README 顶部又出现了 frontmatter"
+    assert text.startswith("# sfly"), "第一行该是项目标题"

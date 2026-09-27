@@ -1,27 +1,3 @@
----
-# 这一块是 **Hugging Face Spaces 的配置**，不是这个项目的文档。
-#
-# 精简模式的线上演示跑在 HF Spaces 上，而 Spaces 的配置（用哪种 SDK、
-# 监听哪个端口）**只从仓库根目录这个 README 的 frontmatter 读** —— 没有
-# 别的文件可以放。所以它必须在最上面。
-#
-# 代价要知道：GitHub 会把它渲染成一张表（这是 GitHub 的行为，不是我们的选择），
-# 所以项目首页最上面会多出这几行。这是本仓库唯一一处为部署让步的地方。
-# 换平台（比如 Render）时删掉整块即可，别的文件都不用动 —— 见 docs/DEPLOY.md。
-#
-# `app_port` 用 7860 而不是程序默认的 8000，是**刻意**的：7860 是 Spaces 的
-# 默认端口，而平台有可能自己往容器里注入一个 PORT 环境变量。两边都写 7860
-# 之后，无论它注不注入、注进来是哪个值，端口都是一致的 —— 不一致的症状是
-# 「构建成功、日志正常、页面打不开」，而那种错很难往端口上想。
-# 线上那个 7860 由 `python tasks.py deploy-hf` 设上去（见 docs/DEPLOY.md 第 2 步）。
-title: sfly — 多 Agent 代码审查
-emoji: 🔍
-colorFrom: indigo
-colorTo: blue
-sdk: docker
-app_port: 7860
----
-
 # sfly — 基于多 Agent 的分布式代码审查系统
 
 [![CI](https://github.com/Satan508-h/sfly-code-review/actions/workflows/ci.yml/badge.svg)](https://github.com/Satan508-h/sfly-code-review/actions/workflows/ci.yml)
@@ -38,13 +14,26 @@ app_port: 7860
 
 ## 当前状态
 
-**M10 进行中**：**精简模式已跑通并端到端验证**（一个进程跑完整个系统，
-用的是完整模式下同一批类），部署配置与[部署手册](docs/DEPLOY.md)就绪。
-**线上那一半等三个账号**（Render / Vercel / Neon，都能用 GitHub 登录、都免费）。
+**M10 已完成：精简模式 + 部署配置。跑在本地，公网那一半没执行。**
+
+M10 的代码全部做完并验证过 —— 精简模式（一个进程跑完整个系统，用的是完整模式
+下同一批类）、线上成本闸、冷启动前端、以及让 webhook 那条路真的能用的
+「`plan` 自己去拉代码」。**但没有部署到公网**，原因是三个平台的账号门槛，
+**三条都是平台政策，不是这个项目的代码**：Render 免费档要绑信用卡、
+Hugging Face 的 Docker Space 要 PRO 订阅（而且国内打不开）、`vercel.app` 已被墙。
+
+所以「可部署上线」这句话在这里的准确形式是：**部署配置是完整的、可执行的、
+每一步都实测过字段名，只是没执行**。理由和那三个平台的原文报错都记在
+[部署手册](docs/DEPLOY.md)开头。
 
 ```bash
-python -m sfly_lite   # 本地起精简模式：API + 编排器 + 三个 Worker 在一个事件循环上
+python tasks.py up    # 完整形态：七个容器 + 真 Redis Streams + 前端 :5173
+python tasks.py demo  # 投一次审查，几秒后列表顶上自己多出一行
+python -m sfly_lite   # 精简形态：一个进程跑完整个系统（线上跑的就是它）
 ```
+
+想知道**怎么演示给面试官看**（包括本地才能演的那几个分布式能力）见
+[演示脚本](docs/DEMO.md)。
 
 **M9 已完成**：聚合硬化（相似度聚类 + 冲突消解）+ **30 条评测集** + 消融与
 单 Agent 基线。**两层都跑完了**，报告提交进仓库（`reports/`）。
@@ -261,7 +250,7 @@ CI 就只能一律当成失败。
 
 密钥没配时会怎样，见下表 —— 这是**默认状态**（这个项目的默认是零密钥跑通全链路）：
 
-| `GITHUB_WEBHOOK_SECRET` | `MODE=full`（本地 compose） | `MODE=lite`（Render，公网） |
+| `GITHUB_WEBHOOK_SECRET` | `MODE=full`（本地 compose） | `MODE=lite`（单容器，公网托管） |
 |---|---|---|
 | 配了 | 必须验签，401 拒绝 | 必须验签，401 拒绝 |
 | 没配 | **放行**，每个请求记一条 warning，`/api/health` 回显 `webhook_secret: missing` | **503 拒绝** |
@@ -342,7 +331,7 @@ MODE=lite QUEUE_BACKEND=memory LOCK_BACKEND=memory \
 DATABASE_URL=postgresql://sfly:sfly@localhost:55432/sfly_lite \
 PORT=8010 LLM_PROVIDER=mock python -m sfly_lite
 
-# 部署：见 docs/DEPLOY.md（Neon → Render → Vercel → GitHub webhook → 验收）
+# 部署：见 docs/DEPLOY.md（配置完整、可执行，但**没有执行** —— 原因在那份文档开头）
 python tasks.py copy-env GITHUB_TOKEN   # 把 .env 里的值复制到剪贴板，不回显
 ```
 
@@ -360,7 +349,7 @@ create_app(deps=deps)                  # 同 api 容器
 
 换掉的只有 `QUEUE_BACKEND=memory` / `LOCK_BACKEND=memory`，而**全代码库只有
 `sfly_bus/factory.py` 读这两个值**（`tests/unit/bus/test_protocols.py` 用 AST 扫着）。
-Render 上构建的是**同一个 Dockerfile**，不带任何 build arg。
+线上构建的是**同一个 Dockerfile**，不带任何 build arg。
 
 #### 这一步真正的工作量在一处注入上
 
@@ -411,8 +400,8 @@ webhook 返回 202、健康检查全绿、**而 run 列表是空的**。唯一�
 之前查一次「今天还能花吗」，超了就换扫描器并在模型名后缀上原因
 （`mock-1 (budget: 45/45 calls today)`），一路进 `worker_results` 和报告。
 
-阈值读的是 `llm_calls` 表的 SUM，**不是进程内计数器** —— 精简模式跑在 Render
-免费档上，15 分钟没人访问就休眠、下次访问换一个进程，内存计数器每天会被重置
+阈值读的是 `llm_calls` 表的 SUM，**不是进程内计数器** —— 精简模式的目标是免费档
+托管，而免费档在闲置后会休眠、下次访问换一个进程，内存计数器每天会被重置
 几十次，而它失败的方向是多花钱。计数排除 Mock（单价为零，算进去会让
 「今天还能花几次」因为「今天已经降级过一次」而变小）。
 
@@ -1145,7 +1134,7 @@ flowchart TB
     API & ORC & WS & WP & WS2 <--> RD[(Redis<br/>Streams + 锁)]
 ```
 
-### 精简模式（Render 单容器）
+### 精简模式（单容器，免费档托管）
 
 ```mermaid
 flowchart LR
@@ -1475,7 +1464,7 @@ API 不直接写 `review_tasks` —— 文件风险排序和规则检索由编�
   用 Node 内置的真 `EventSource` 验过协议行为，但「真浏览器里点一遍」没有自动化 ——
   jsdom 不实现 `EventSource`、布局与滚动也是假的。这一层目前靠人工冒烟。
 - **Element Plus 是全量引入，构建产物 940 KB（gzip 302 KB）。** 首屏因此偏重，
-  而精简模式跑在 Render 免费版上、冷启动本来就慢。改成按需引入（两个构建期插件）
+  而精简模式跑在免费档上、冷启动本来就慢（唤醒要几分钟）。改成按需引入（两个构建期插件）
   预计能砍到 100 KB 上下，排在 M10 部署那一步一起做。
 - **`localhost:5173` 与 `localhost:5273` 是两份不同的东西**（nginx 的构建产物 vs
   Vite 的热更新），差别和踩过的坑见 M8 那一节。
@@ -1498,7 +1487,8 @@ API 不直接写 `review_tasks` —— 文件风险排序和规则检索由编�
   `/repos/{o}/{r}`、`/pulls/{n}`、`/pulls/{n}/files` 三个**拉取式**接口的响应，
   再拼成 webhook 的形状。所以我们读的那些字段路径是被验证过的（拼错了会立刻
   体现在报告里），但**「GitHub 真正推过来的整包长什么样」仍然没有端到端验证过**
-  —— 那需要一个公网可达的地址（M10 的 Render）和一个真实的 webhook secret。
+  —— 那需要一个公网可达的地址和一个真实的 webhook secret（**这一半没有做**，见
+  docs/DEPLOY.md 开头）。
   这是部署上线后才能回答的第一个问题。
 - **两道防重复闸的触发窗口是「制造」出来的，不是撞出来的。**
   它们的真实触发条件是「评论发出去了、写状态那一步崩了」，那是个毫秒级窗口。

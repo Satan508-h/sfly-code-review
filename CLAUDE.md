@@ -82,8 +82,12 @@ tests/           contracts/（两后端共用的契约，被 unit 与 integratio
 reports/         评测报告，提交进仓库。**层名在文件名里**：
                  `eval-<sha>-offline.md` / `-real-<provider>.md`，消融同理。
                  两层同 sha，只按 sha 命名会让后跑的覆盖先跑的
-docs/            DEPLOY.md —— 部署手册（Render / Vercel / Neon 六步 + 排查顺序），
-                 写给非技术读者。render.yaml 是它的可执行版本
+docs/            DEPLOY.md —— 部署手册（**没执行过**，原因写在它开头：三个平台的
+                 账号门槛都是政策问题）。DEMO.md —— 演示脚本（录屏分镜 +
+                 面试问答），本地演示是这个项目现在唯一的展示方式
+deploy/          hf-space-header.md —— HF Spaces 的 frontmatter，**不在仓库 README 里**：
+                 Spaces 只认根 README 的 frontmatter，而 GitHub 会把它渲染成一张表，
+                 所以那块由 `deploy-hf` 上传时拼上去
 render.yaml      Render Blueprint（精简模式）。**不带任何 build arg** ——
                  Dockerfile 的 ARG 默认值就是精简模式，理由见那里。
                  **它是备选**：线上走的是 Hugging Face Spaces（见 docs/DEPLOY.md）
@@ -618,6 +622,33 @@ webhook 投进那一条，`GraphRunner` 在另一条上等。实测：`HTTP 202 
 这是本仓库唯一一处为部署让步的地方，`docs/DEPLOY.md` 和 README 里都写明了；
 换平台时删掉整块即可。
 
+**「部署到免费 PaaS」对国内用户基本是堵的 —— 而且这件事该在动手之前查。**
+M10 在这上面连撞三次，每次都是平台自己给的原文报错：
+
+| 平台 | 撞到的 |
+|---|---|
+| Render | 免费 Web Service 要**绑信用卡**做身份验证 |
+| Hugging Face Spaces | **Docker Space 在免费档要 PRO 订阅**（402；只有静态站点免费）|
+| Vercel | **`vercel.app` 已被墙**（Vercel 自己的中国加速文档承认），要自有域名 + 中国专用 DNS |
+
+**第三条是前两次都没考虑的那个角度**：链接打不开比链接要钱更致命 ——
+这个项目的读者在国内。所以判断一个托管平台，除了「要不要卡」，
+还要问「**目标读者打不打得开**」。
+
+结论是**不部署**：展示方式是本地跑 + 录屏 + `docs/DEMO.md`，而「可部署」
+这句话的准确形式是「配置完整可执行、每一步实测过字段名，但没有执行」。
+需求上不吃亏的地方：`--scale` 扩容和杀掉 Worker 看降级**只有本地能演**
+（单容器精简模式没有第二个进程可以加入消费者组）。
+
+**换平台时要一起改的四个数**（少改一处都不报错，只会在线上表现成怪现象）：
+
+| 跟着平台走的东西 | 在哪 | 不改的症状 |
+|---|---|---|
+| 前端放弃等待的上限 `GIVE_UP_MS` | `web/src/stores/health.ts` | 真撞上冷启动时，唤醒面板在容器醒之前变成「后端未连通」 |
+| 唤醒面板的文案 | `web/src/App.vue` | 承诺一个做不到的时间 |
+| 容器里的 uid | `Dockerfile` | 平台以某个 uid 运行容器，镜像里没这个用户时 `/app` 对它是只读的 |
+| 暴露的端口（两处同一个数） | README 的 frontmatter + `PORT` | 「构建成功、日志正常、页面打不开」 |
+
 **重建组的用例只接受「替换了代码」的修复。**
 回退一个纯新增的修复（只加了一段校验）会得到纯删除的 diff，而被删的行
 **没有可锚的位置** —— 审查报出的行号必须落在新增行上。这类提交做不成用例，
@@ -767,12 +798,13 @@ python tasks.py demo --follow --drop-after 3   # 断开重连，SSE 无缺口
       **两层都跑完**，四份报告在 `reports/`：真实层 30 个用例 ≈ $0.15 / 10 分钟，
       重建组（回退真实 CVE）精确率 76.9% / 召回率 100%，
       三 Worker 比单 Agent 多召回 12.1 个百分点
-- [ ] M10 — 精简模式 + 部署上线。**代码这一半全部完成并验证过**：
-      单进程跑通（`python -m sfly_lite`）、成本闸、冷启动前端、线上那条路
-      （`plan` 自己去拉代码）、部署配置与 `docs/DEPLOY.md`。
-      **部署平台是 Hugging Face Spaces**（不是 Render —— 它的免费档要绑卡，
-      见上面那条技术决定）。**Neon 那一半已经做完并验过**（八张表建好了）。
-      **剩下的是账号那一半**：HF Spaces + Vercel 注册，按 `docs/DEPLOY.md` 走
+- [x] M10 — 精简模式 + 部署配置。**代码全部完成并验证过**：单进程跑通
+      （`python -m sfly_lite`）、成本闸、冷启动前端、线上那条路（`plan` 自己去
+      拉代码）、部署配置（`render.yaml` + `deploy-hf` 命令）与
+      `docs/DEPLOY.md` / `docs/DEMO.md`。Neon 也建好了（八张表）。
+      **但公网那一半没有执行** —— 三个平台全卡在账号门槛上，而且三条都是
+      平台政策（要卡 / 要 PRO 订阅 / 被墙），不是代码问题。所以这个项目的
+      展示方式是**本地演示 + 录屏**，见 `docs/DEMO.md`
 - [ ] M11 — 可选：pgvector、LLM 冲突消解 A/B
 
 详细计划见 `~/.claude/plans/1-agent-pr-curried-unicorn.md`。

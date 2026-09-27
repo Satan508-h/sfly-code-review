@@ -25,6 +25,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -883,7 +884,7 @@ def _upload_files() -> list[str]:
 
 
 def _assert_sane_upload(files: list[str]) -> None:
-    """上传之前挡两道 —— 两道防的都是「静默出错」。
+    """上传之前挡三道 —— 三道防的都是「静默出错」。
 
     1. **清单里不能有凭据。** Space 是公开仓库，而 ``.env`` 里躺着这个项目
        全部的密钥。这条检查只有在排除规则写坏时才会触发，而那时唯一能救你的
@@ -892,6 +893,8 @@ def _assert_sane_upload(files: list[str]) -> None:
        建不起来：前者决定怎么跑，后者的 frontmatter 决定它是 Docker Space
        还是别的、以及监听哪个端口。而失败的样子是「上传成功、构建失败」，
        或者更糟的「构建成功、跑起来是另一个东西」。
+    3. **配置头文件得在。** 它不在仓库里（见 :func:`_stage_upload_tree` 的
+       理由），所以拼不上它就和第 2 条是同一个后果。
     """
     leaked = [p for p in files if _is_secret_path(p)]
     if leaked:
@@ -899,6 +902,32 @@ def _assert_sane_upload(files: list[str]) -> None:
     missing = [name for name in ("Dockerfile", "README.md") if name not in files]
     if missing:
         _die(f"拒绝上传：清单里没有 {'、'.join(missing)}。Space 建不起来，先查排除规则。")
+    if not (ROOT / "deploy" / "hf-space-header.md").exists():
+        _die(
+            "找不到 deploy/hf-space-header.md —— Space 靠它知道自己是 Docker Space、"
+            "监听哪个端口。没有它，构建会「成功」但跑起来是另一个东西。"
+        )
+
+
+def _stage_upload_tree(files: list[str]) -> Path:
+    """把要上传的文件复制到临时目录，并把 HF 的配置头拼到 README 最前面。
+
+    **为什么不在仓库里直接改 README**：Spaces 只认**仓库根目录 README** 的
+    frontmatter，而 GitHub 会把它渲染成一张元数据表（GitHub 自己的行为）。
+    也就是说不这么绕的话，为了部署，项目首页得常年顶着一张和项目无关的表。
+    把拼接放到上传这一刻，仓库就是干净的，而 Space 那边拿到的仍然是完整的。
+
+    返回临时目录，调用方负责删。
+    """
+    header = (ROOT / "deploy" / "hf-space-header.md").read_text(encoding="utf-8")
+    stage = Path(tempfile.mkdtemp(prefix="sfly-hf-"))
+    for rel in files:
+        dest = stage / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / rel, dest)
+    readme = stage / "README.md"
+    readme.write_text(header + "\n" + readme.read_text(encoding="utf-8"), encoding="utf-8", newline="")
+    return stage
 
 
 def cmd_deploy_hf(args: argparse.Namespace) -> None:
@@ -975,19 +1004,25 @@ def cmd_deploy_hf(args: argparse.Namespace) -> None:
         api.add_space_secret(repo_id=repo_id, key=key, value=value)
 
     print(f"  上传 {len(files)} 个文件…", file=sys.stderr)
+    stage = _stage_upload_tree(files)
     try:
         # 刻意**不用** ``delete_patterns``（那是「镜像式同步」）：它能把远端
         # 清干净，但一旦清单算错了就是**清空整个 Space**。留几个陈旧文件无害，
         # 清空不是。两个方向的代价不对称，所以选小的那个。
+        #
+        # 从**暂存目录**上传而不是从仓库根：那里面的 README 已经拼上了
+        # Spaces 的配置头（见 _stage_upload_tree），而仓库里的那份是干净的。
         api.upload_folder(
             repo_id=repo_id,
             repo_type="space",
-            folder_path=str(ROOT),
+            folder_path=str(stage),
             ignore_patterns=_IGNORE_PATTERNS,
             commit_message="deploy: python tasks.py deploy-hf",
         )
     except Exception as exc:
         _die(f"上传失败：{type(exc).__name__}: {exc}")
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
 
     _ok(f"已部署：https://huggingface.co/spaces/{repo_id}")
     print(f"  网址：https://{repo_id.replace('/', '-').lower()}.hf.space", file=sys.stderr)
