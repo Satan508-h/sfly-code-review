@@ -1557,9 +1557,14 @@ python tasks.py eval --real --budget 5  # 真实层（DeepSeek，有硬上限）
 | `reports/eval-<sha>-real-<provider>.md` | 真实层：同一批用例，真实模型 |
 | `reports/eval-<sha>-ablation-<层>.md` | 1/2/3 Worker 消融 + 单 Agent 基线 |
 
-**四份报告的 sha 不一样，这是设计使然**：报告总是**先于**提交生成，
-所以文件名里那个 sha 永远是「生成时的 HEAD」。每份报告开头都写清了自己对应的
-sha 以及当时工作区是否干净（脏检查排除 `reports/` 自己，否则它永远是脏的）。
+**每份报告开头那两行必须先读**：它写明了这份数字对应哪个 sha、以及生成时工作区
+干不干净（脏检查排除 `reports/` 自己，否则它永远是脏的）。标着「干净」的那份才是
+**精确**对应它标注的那个 commit；标着「有未提交改动」的，那个 sha 只是生成时的
+HEAD，改动还在工作区里。
+
+`reports/` 里的文件会越积越多（每次改代码重跑就多一对，旧的不覆盖 ——
+这样两层在同一个 commit 上能并存）。**哪几份是重点、两层分别该怎么读**，
+见 [`reports/README.md`](reports/README.md)。
 
 **两层量的是不同的东西，不能混着引用：**
 
