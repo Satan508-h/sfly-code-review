@@ -13,7 +13,7 @@
 # 默认端口，而平台有可能自己往容器里注入一个 PORT 环境变量。两边都写 7860
 # 之后，无论它注不注入、注进来是哪个值，端口都是一致的 —— 不一致的症状是
 # 「构建成功、日志正常、页面打不开」，而那种错很难往端口上想。
-# 线上同时显式设一个 `PORT=7860` 的 Variable（见 docs/DEPLOY.md 第 2.3 步）。
+# 线上那个 7860 由 `python tasks.py deploy-hf` 设上去（见 docs/DEPLOY.md 第 2 步）。
 title: sfly — 多 Agent 代码审查
 emoji: 🔍
 colorFrom: indigo

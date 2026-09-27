@@ -28,7 +28,7 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 # --- Windows 控制台编码 --------------------------------------------------- #
 #
@@ -117,7 +117,13 @@ def run(
         _die(f"命令失败（exit {exc.returncode}）：{printable}")
 
 
-def _die(msg: str) -> None:
+def _die(msg: str) -> NoReturn:
+    """打印一句人就退出。**签名里写了 NoReturn** —— 它从不返回。
+
+    这不只是好看：不写的话 mypy 不知道控制流到此为止，于是每个「先 _die
+    再返回」的 helper 都会多一条 `Missing return statement`，而那种噪音会
+    让真正的类型错误淹没在里头（`tasks.py` 长期没人查类型，就是这么开始的）。
+    """
     print(f"\n\033[31m[!!]\033[0m {msg}\n", file=sys.stderr)
     raise SystemExit(1)
 
@@ -570,26 +576,36 @@ def _write_clipboard(text: str) -> None:
         _die(f"写剪贴板失败（{proc.returncode}）。直接打开 .env 手动复制。")
 
 
-def cmd_copy_env(args: argparse.Namespace) -> None:
-    """把 ``.env`` 里某一项的值复制到剪贴板（**部署时往 Render 表单里粘**）。
+def _env_value(name: str) -> str:
+    """读 ``.env`` 里某一项的值。没有这一项、或者它是空的，都返回空串。
 
-    它不打印任何东西 —— 值、长度、前缀都不打印，理由和 ``set-llm-key``
-    完全一样。跑完它去目标网页 Ctrl+V 就行。
-
-    **为什么要有这条命令**：部署时要把三个值填进 Render 的网页表单，
-    而手动打开 .env 复制很容易带上行尾的空格或者抄错行 —— 那种错误的表现是
-    「签名怎么都验不过」「token 无效」，排查方向会先跑偏到「值是不是过期了」。
+    **不抛异常**：三个调用方对「空」的处置各不相同（copy-env 要报错、
+    deploy-hf 要区分「必须填」和「可以不填」），所以判断留给它们。
     """
-    name = args.name
     path = ROOT / ".env"
     if not path.exists():
-        _die("找不到 .env。先跑 python tasks.py env 生成一份。")
-    value = ""
+        return ""
     for line in path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if stripped.startswith(f"{name}="):
-            value = stripped[len(name) + 1 :].strip()
-            break
+            return stripped[len(name) + 1 :].strip()
+    return ""
+
+
+def cmd_copy_env(args: argparse.Namespace) -> None:
+    """把 ``.env`` 里某一项的值复制到剪贴板（**部署时往网页表单里粘**）。
+
+    它不打印任何东西 —— 值、长度、前缀都不打印，理由和 ``set-env``
+    完全一样。跑完它去目标网页 Ctrl+V 就行。
+
+    **为什么要有这条命令**：部署时要把几个值填进网页表单，而手动打开 .env
+    复制很容易带上行尾的空格或者抄错行 —— 那种错误的表现是「签名怎么都验不过」
+    「token 无效」，排查方向会先跑偏到「值是不是过期了」。
+    """
+    name = args.name
+    if not (ROOT / ".env").exists():
+        _die("找不到 .env。先跑 python tasks.py env 生成一份。")
+    value = _env_value(name)
     if not value:
         _die(
             f".env 里 {name} 是空的。要么它本来就不需要（比如不打算发评论时的 GITHUB_TOKEN），要么你还没填。"
@@ -615,13 +631,7 @@ def cmd_db_check(args: argparse.Namespace) -> None:
     from sfly_shared.aio import run
 
     name = args.name
-    dsn = ""
-    path = ROOT / ".env"
-    if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line.strip().startswith(f"{name}="):
-                dsn = line.strip().split("=", 1)[1]
-                break
+    dsn = _env_value(name)
     if not dsn:
         _die(f".env 里 {name} 是空的。要么你还没填，要么名字写错了。")
 
@@ -667,21 +677,64 @@ def cmd_db_check(args: argparse.Namespace) -> None:
     try:
         run(_check())
     except Exception as exc:
-        _die(f"{name} 连不上或跑不通迁移：{type(exc).__name__}: {_scrub(exc)[:500]}")
+        _die(f"{name} 连不上或跑不通迁移：{type(exc).__name__}: {_scrub(str(exc))[:500]}")
     _ok(f"{name} 可用（连接、权限、迁移都验过了）")
 
 
-def cmd_set_llm_key(_: argparse.Namespace) -> None:
-    """把剪贴板里的 LLM key 写进 ``.env``。
+#: 这些变量的形状是有前缀的，可以顺手验一下。**不是为了安全，是为了省一次排查。**
+#:
+#: 剪贴板只有一格，很容易还留着上一次复制的东西 —— 我自己就踩过：复制完 Neon
+#: 连接串紧接着跑 ``set-env HF_TOKEN``，于是把连接串写成了 HF token。那种错的
+#: 表现是几步之后「token 无效」，排查方向完全指错（会先去怀疑 token 过期）。
+#:
+#: **只警告、不拒绝**：前缀是厂商的习惯而不是契约，写死成硬校验会在换 provider
+#: 时挡住合法的值 —— 那种阻断比它防的问题更烦人。
+_KNOWN_PREFIXES = {
+    "HF_TOKEN": "hf_",
+    "LLM_API_KEY": "sk-",
+    "GITHUB_TOKEN": "",  # 形态太多（ghp_ / github_pat_ / fine-grained），不猜
+}
 
-    先复制 key，再跑这一条 —— **它不会打印 key，连长度都不打印**
-    （长度、前缀切片一样是凭证外泄：它缩小了猜测空间，也让截图变得危险）。
+
+def _set_env_from_clipboard(name: str) -> None:
+    """把剪贴板里的值写进 ``.env`` 的某一项 —— ``copy-env`` 的反向。
+
+    **不回显内容，也不回显长度**（长度、前缀切片一样是凭证外泄：
+    它缩小了猜测空间，也让截图变得危险）。这条纪律和 ``copy-env``、
+    ``set-llm-key`` 是同一条。
     """
-    key = _read_clipboard().strip()
-    if len(key) < 16:
-        _die("剪贴板里没有像 key 的东西（为空或太短）。先复制 key，再跑这条命令。")
-    _set_env_var("LLM_API_KEY", key)
-    _ok("已写入 .env：LLM_API_KEY（没有回显内容，也没有回显长度）")
+    value = _read_clipboard().strip()
+    if len(value) < 16:
+        _die(f"剪贴板里没有像 {name} 的东西（为空或太短）。先复制，再跑这条命令。")
+    prefix = _KNOWN_PREFIXES.get(name, "")
+    if prefix and not value.startswith(prefix):
+        print(
+            f"  ⚠ 剪贴板里那个值看起来不像 {name}（它通常以 {prefix} 开头）。\n"
+            "    还是写进去了 —— 如果本来就该是别的形状，请忽略这行；\n"
+            "    如果确实拿错了东西（剪贴板里还留着上一次复制的内容？），"
+            f"重新复制之后再跑一次这条命令覆盖它。",
+            file=sys.stderr,
+        )
+    _set_env_var(name, value)
+    _ok(f"已写入 .env：{name}（没有回显内容，也没有回显长度）")
+
+
+def cmd_set_env(args: argparse.Namespace) -> None:
+    """把剪贴板里的值写进 ``.env`` 的某一项（部署时用来收密钥）。
+
+    部署过程中有几处要在网页上生成东西（HF 的访问 token），而**网页
+    只能靠复制粘贴把它交出来**。这条命令就是那条通道：复制 → 跑它 →
+    值进了 ``.env``（已被 gitignore），而它一次都没有出现在屏幕上。
+    """
+    _set_env_from_clipboard(args.name)
+
+
+def cmd_set_llm_key(_: argparse.Namespace) -> None:
+    """``set-env LLM_API_KEY`` 的专用入口（保留是因为文档和报错信息里都指着它）。
+
+    实现只有一份 —— 见 :func:`_set_env_from_clipboard`。
+    """
+    _set_env_from_clipboard("LLM_API_KEY")
     print("  下一步：python tasks.py eval --real --budget 5", file=sys.stderr)
 
 
@@ -704,6 +757,241 @@ def _require_real_llm_key() -> None:
         "  （或者直接编辑 .env 里的 LLM_API_KEY。）\n"
         "  这个脚本**不会**打印 key，也不会把它写进任何日志或报告。",
     )
+
+
+# --------------------------------------------------------------------------- #
+# 部署：Hugging Face Spaces
+# --------------------------------------------------------------------------- #
+
+#: 上传到 Space 时要排除的东西。**意图和 ``.dockerignore`` 是同一件事** ——
+#: 「平台上能重新生成的东西」和「含密钥的东西」都不该进去。
+#:
+#: 但**语法完全不同，而这个差别很要命**：这里是 fnmatch，不是 gitignore，
+#: 也不是 shell 通配 —— `*` **会跨路径分隔符**（所以 `web/node_modules/*`
+#: 能匹配它下面任意深度的文件），而 `.gitignore` 本身**不被遵守**
+#: （`upload_folder` 的文档明说了）。所以 `.venv` / `node_modules` / `.env`
+#: 都必须显式列出来，否则会被原样传上去 —— 几万个文件，外加全部凭据。
+#:
+#: `.env` 那一条是**安全边界**，不是优化：Space 是公开仓库。
+_IGNORE_PATTERNS = [
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    ".git/*",
+    ".github/*",
+    ".idea/*",
+    ".vscode/*",
+    "*.swp",
+    ".DS_Store",
+    ".venv/*",
+    "venv/*",
+    "*__pycache__*",
+    "*.py[cod]",
+    "*.egg-info/*",
+    ".pytest_cache/*",
+    ".mypy_cache/*",
+    ".ruff_cache/*",
+    ".coverage",
+    "htmlcov/*",
+    "web/node_modules/*",
+    "web/dist/*",
+    "web/.vite/*",
+    "web/tsconfig.tsbuildinfo",
+    "pgdata/*",
+    "redisdata/*",
+    "*.sqlite",
+    "*.db",
+    "tmp/*",
+    "scratch/*",
+]
+
+#: 走目录树时先剪掉的分支。**纯粹为了快**：`.venv` 和 `node_modules` 加起来
+#: 几万个文件，走一遍要好几秒，而它们本来就一个都不会传。
+#:
+#: 剪枝和上面的排除规则必须一致，不一致的后果是「某个该传的文件没传」——
+#: 而那种错在 Space 那边表现为构建失败，看不出和这里有关。所以
+#: :func:`_assert_sane_upload` 会盯着清单里必须有 Dockerfile 和 README.md。
+_PRUNE_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "node_modules",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "dist",
+    ".vite",
+    "htmlcov",
+    "pgdata",
+    "redisdata",
+}
+
+#: Space 上的变量（可见的那一类）。密钥走 secrets，不在这里。
+_SPACE_VARIABLES = {
+    "MODE": "lite",
+    "QUEUE_BACKEND": "memory",
+    "LOCK_BACKEND": "memory",
+    "LLM_PROVIDER": "deepseek",
+    # 见 README 顶部的 frontmatter：两处必须是同一个数，否则平台把流量转到
+    # 一个没人听的端口上，症状是「构建成功、日志正常、页面打不开」。
+    "PORT": "7860",
+}
+
+#: 从 ``.env`` 搬到 Space 的密钥。左边是 Space 上的名字，右边是 ``.env`` 里的名字。
+#: 两边不一致的那一条（``DATABASE_URL``）是刻意的 —— 见 docs/DEPLOY.md。
+_SPACE_SECRETS = {
+    "DATABASE_URL": "NEON_DATABASE_URL",
+    "LLM_API_KEY": "LLM_API_KEY",
+    "GITHUB_TOKEN": "GITHUB_TOKEN",
+    "GITHUB_WEBHOOK_SECRET": "GITHUB_WEBHOOK_SECRET",
+}
+
+
+def _is_secret_path(rel: str) -> bool:
+    """这个路径看起来含凭据吗？
+
+    ``.env.example`` **不算** —— 它是模板，值都是空的，而且本来就该公开。
+    判据写成「.env 开头但不是 .example」，是因为这两者在磁盘上只差一个后缀，
+    而漏判的代价是把真密钥传上一个公开仓库。
+    """
+    name = rel.rsplit("/", 1)[-1]
+    if name.endswith(".example"):
+        return False
+    return name == ".env" or name.startswith(".env.") or name.endswith((".pem", ".key"))
+
+
+def _upload_files() -> list[str]:
+    """算出会传上去的文件清单（相对仓库根的 posix 路径）。
+
+    **先剪枝再过滤**：剪枝只求快，过滤求准。两者不一致的后果由
+    :func:`_assert_sane_upload` 兜住。
+    """
+    # 类型存根没有显式导出它，但**它必须就是 upload_folder 内部用的那一个** ——
+    # 自己拿 fnmatch 重写一遍，就等于「我算的清单」和「实际传的清单」可能不一致，
+    # 而那正是下面这道安全检查要防的事。宁可 ignore 一行类型。
+    from huggingface_hub.utils import filter_repo_objects  # type: ignore[attr-defined]
+
+    rel: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in _PRUNE_DIRS]
+        base = Path(dirpath)
+        for filename in filenames:
+            rel.append((base / filename).relative_to(ROOT).as_posix())
+    return list(filter_repo_objects(rel, ignore_patterns=_IGNORE_PATTERNS))
+
+
+def _assert_sane_upload(files: list[str]) -> None:
+    """上传之前挡两道 —— 两道防的都是「静默出错」。
+
+    1. **清单里不能有凭据。** Space 是公开仓库，而 ``.env`` 里躺着这个项目
+       全部的密钥。这条检查只有在排除规则写坏时才会触发，而那时唯一能救你的
+       就是它。
+    2. **清单里必须有 ``Dockerfile`` 和 ``README.md``。** 少任何一个 Space 都
+       建不起来：前者决定怎么跑，后者的 frontmatter 决定它是 Docker Space
+       还是别的、以及监听哪个端口。而失败的样子是「上传成功、构建失败」，
+       或者更糟的「构建成功、跑起来是另一个东西」。
+    """
+    leaked = [p for p in files if _is_secret_path(p)]
+    if leaked:
+        _die(f"拒绝上传：清单里有疑似凭据的文件（{', '.join(leaked[:5])}）。Space 是公开仓库。")
+    missing = [name for name in ("Dockerfile", "README.md") if name not in files]
+    if missing:
+        _die(f"拒绝上传：清单里没有 {'、'.join(missing)}。Space 建不起来，先查排除规则。")
+
+
+def cmd_deploy_hf(args: argparse.Namespace) -> None:
+    """把工作区部署成一个 Hugging Face Space（精简模式的线上形态）。
+
+    **为什么走 API 而不是在网页上点**：建 Space 那一步要在网页上填十来个
+    环境变量，其中四个是密钥 —— 手打既容易错（表现是「密钥无效」），
+    又会让密钥在剪贴板里来回好几趟。这里直接从 ``.env`` 读、直接设上去，
+    全程不打印任何值。
+
+    它做四件事：问出用户名 → Space 不存在就建（顺便把变量和密钥一起设好）
+    → 上传代码 → 打印网址。**可以反复跑**，第二次就是「更新配置 + 重新上传」。
+
+    需要 ``.env`` 里有 ``HF_TOKEN``（Write 类型）。它不能由脚本生成，
+    只能你在 https://huggingface.co/settings/tokens 上建一个，
+    然后用 ``python tasks.py set-env HF_TOKEN`` 收进来。
+    """
+    from huggingface_hub import HfApi
+
+    token = _env_value("HF_TOKEN")
+    if not token:
+        _die(
+            "没有 HF_TOKEN。它只能你去建一个：\n"
+            "  1. 打开 https://huggingface.co/settings/tokens\n"
+            "  2. Create new token → 类型选 **Write** → 建完复制它\n"
+            "  3. 回来跑：python tasks.py set-env HF_TOKEN\n"
+            "     （那条命令只把剪贴板里的东西写进 .env，不回显内容也不回显长度）"
+        )
+
+    secrets: dict[str, str] = {}
+    for space_name, env_name in _SPACE_SECRETS.items():
+        value = _env_value(env_name)
+        if not value:
+            _die(f".env 里 {env_name} 是空的，线上需要它。（它在 Space 上的名字是 {space_name}）")
+        secrets[space_name] = value
+
+    variables = dict(_SPACE_VARIABLES)
+    variables["CORS_ORIGINS"] = args.cors or _env_value("CORS_ORIGINS") or "http://localhost:5173"
+
+    # **先算清单、再上传。** 见 _assert_sane_upload：两道检查都必须在
+    # 网络调用之前 —— 一旦传上去就没有「撤回」这个操作了。
+    files = _upload_files()
+    _assert_sane_upload(files)
+
+    api = HfApi(token=token)
+    try:
+        user = api.whoami()["name"]
+    except Exception as exc:
+        _die(f"HF_TOKEN 用不了（{type(exc).__name__}）。确认它是 Write 类型、没过期。")
+    repo_id = f"{user}/{args.space}"
+
+    if api.repo_exists(repo_id, repo_type="space"):
+        print(f"  Space 已存在：{repo_id} —— 更新配置和代码", file=sys.stderr)
+    else:
+        print(f"  建 Space：{repo_id}（公开、Docker、免费档）", file=sys.stderr)
+        try:
+            api.create_repo(
+                repo_id=repo_id,
+                repo_type="space",
+                space_sdk="docker",
+                private=False,
+                space_variables=[{"key": k, "value": v} for k, v in variables.items()],
+                space_secrets=[{"key": k, "value": v} for k, v in secrets.items()],
+            )
+        except Exception as exc:
+            _die(f"建 Space 失败：{type(exc).__name__}: {exc}")
+
+    # **每次跑都重设一遍**（幂等的 upsert）：改过 .env 之后重跑这一条就够了，
+    # 不用记「哪几个变了」。变量和密钥分开设，是因为 HF 把它们存在两个地方 ——
+    # 变量在页面上和 API 上都能读回来，密钥写进去就再也读不出来了。
+    for key, value in variables.items():
+        api.add_space_variable(repo_id=repo_id, key=key, value=value)
+    for key, value in secrets.items():
+        api.add_space_secret(repo_id=repo_id, key=key, value=value)
+
+    print(f"  上传 {len(files)} 个文件…", file=sys.stderr)
+    try:
+        # 刻意**不用** ``delete_patterns``（那是「镜像式同步」）：它能把远端
+        # 清干净，但一旦清单算错了就是**清空整个 Space**。留几个陈旧文件无害，
+        # 清空不是。两个方向的代价不对称，所以选小的那个。
+        api.upload_folder(
+            repo_id=repo_id,
+            repo_type="space",
+            folder_path=str(ROOT),
+            ignore_patterns=_IGNORE_PATTERNS,
+            commit_message="deploy: python tasks.py deploy-hf",
+        )
+    except Exception as exc:
+        _die(f"上传失败：{type(exc).__name__}: {exc}")
+
+    _ok(f"已部署：https://huggingface.co/spaces/{repo_id}")
+    print(f"  网址：https://{repo_id.replace('/', '-').lower()}.hf.space", file=sys.stderr)
+    print("  构建要几分钟，进度在 Space 页面的 Logs 标签里。", file=sys.stderr)
 
 
 # -- 质量 ------------------------------------------------------------------- #
@@ -1052,6 +1340,27 @@ def build_parser() -> argparse.ArgumentParser:
         ],
     )
     add("set-llm-key", cmd_set_llm_key, "把剪贴板里的 LLM key 写进 .env（不回显内容）")
+    add(
+        "set-env",
+        cmd_set_env,
+        "把剪贴板里的值写进 .env 的某一项（部署时收密钥用，不回显内容）",
+        [(("name",), {"help": "变量名，例如 HF_TOKEN"})],
+    )
+    add(
+        "deploy-hf",
+        cmd_deploy_hf,
+        "部署到 Hugging Face Spaces（建 Space + 设变量密钥 + 上传代码）",
+        [
+            (
+                ("--space",),
+                {"default": "sfly-lite", "help": "Space 名字（默认 sfly-lite）"},
+            ),
+            (
+                ("--cors",),
+                {"default": "", "help": "前端网址，写进 CORS_ORIGINS（第 4 步之后才需要）"},
+            ),
+        ],
+    )
     add(
         "copy-env",
         cmd_copy_env,

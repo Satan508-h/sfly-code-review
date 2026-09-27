@@ -26,6 +26,12 @@ dev = [
     "testcontainers[postgres,redis]>=4.15",
     "mypy>=1.14",
     "ruff>=0.9",
+    # `python tasks.py deploy-hf` 用的。**它是部署工具，不是应用依赖** ——
+    # 所以放在 dev 组：镜像里 `uv sync --no-dev` 装不到它，而开发机上
+    # （也就是跑 tasks.py 的那台）有。放在这里而不是让 tasks.py 去 import
+    # 一个没声明的包，是因为「本地 venv 装了全部东西所以测不出来」这件事
+    # 这个仓库已经吃过一次亏（见 CLAUDE.md 里「缺依赖在本地测不出来」那条）。
+    "huggingface_hub>=1.2",
 ]
 
 [tool.pytest.ini_options]

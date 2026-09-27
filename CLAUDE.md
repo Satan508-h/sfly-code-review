@@ -656,6 +656,13 @@ python tasks.py set-llm-key  # 把剪贴板里的 key 写进 .env（不回显内
 python tasks.py copy-env GITHUB_TOKEN
                              # 把 .env 里某一项的值复制到剪贴板（部署时往
                              # Render 的网页表单里粘）。**同样不回显内容与长度**
+python tasks.py set-env HF_TOKEN
+                             # copy-env 的反向：把剪贴板里的值写进 .env 的某一项
+                             # （部署时收网页上生成的 token 用）。**不回显内容与长度**
+python tasks.py deploy-hf    # 部署到 Hugging Face Spaces：建 Space + 设变量密钥
+                             # + 上传代码。**可以反复跑**，第二次就是「更新」
+                             # 它拒绝上传 .env（Space 是公开仓库），见
+                             # tests/unit/test_deploy_hf.py
 python tasks.py db-check --name NEON_DATABASE_URL
                              # 探一条连接串：开池之前先走一次性连接探活，
                              # 再跑一次迁移。**部署之前跑** —— 它验的是

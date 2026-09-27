@@ -15,7 +15,9 @@
 | [Hugging Face](https://huggingface.co) 账号 | 跑后端那个容器 | 免费，**不需要信用卡** |
 | [Vercel](https://vercel.com) 账号 | 托管前端页面 | 免费 |
 
-三个都能用 **GitHub 账号一键登录**。
+三个都能用 **GitHub 账号一键登录**。Hugging Face 那边还要额外建一个访问
+token（第 2.1 步）—— 那是全程唯一必须在网页上做的一步，因为 token 只能由
+你在网页上生成。
 
 > **为什么后端是 Hugging Face 而不是 Render。**
 > Render 的免费档现在要求绑一张信用卡做身份验证（据说是 $1 预授权、会退回），
@@ -72,80 +74,51 @@
 
 ## 第 2 步 · Hugging Face Spaces：部署后端
 
-> **要连哪个仓库？`Satan508-h/sfly-code-review`** —— 就是装着这份代码的那个。
-> （注意别和 `sfly-playground` 搞混：那是**被审查的靶场仓库**，第 5 步配 webhook
-> 才用得到它。本地文件夹叫 `sfly-code-review-system`，那只是文件夹名。）
-
-### 2.1 建一个 Space
+### 2.1 建一个访问 token（这一步只能在网页上做）
 
 1. 登录 [huggingface.co](https://huggingface.co)（能用 GitHub 账号登录）。
-2. 打开 <https://huggingface.co/new-space>，填：
+2. 打开 <https://huggingface.co/settings/tokens> → **Create new token**。
+3. 类型选 **Write**（建 Space、改配置都需要写权限），名字随便（比如 `sfly-deploy`）。
+4. 建完它**只会显示一次** —— 立刻点复制按钮。
 
-   | 字段 | 填什么 |
-   |---|---|
-   | Owner / Space name | 名字随便，建议 `sfly-lite` |
-   | **Select the Space SDK** | 选 **Docker** → 模板选 **Blank** |
-   | Space hardware | 保持 **CPU basic · FREE**（不要动，动了就要钱） |
-   | Visibility | **Public**（Private 的话外人点不开） |
+### 2.2 一条命令部署
 
-3. 点 **Create Space**。它会给你一个网址，形如：
+回到项目目录，先把这个 token 收进 `.env`（**它不会回显内容，也不会回显长度**）：
 
-   ```
-   https://satan508-h-sfly-lite.hf.space
-   ```
+```bash
+python tasks.py set-env HF_TOKEN
+```
 
-   **记下它**，后面几步都要用。
+然后：
 
-### 2.2 让它跟着你的 GitHub 仓库走
+```bash
+python tasks.py deploy-hf
+```
 
-在 Space 页面里进 **Settings**，找和 GitHub 同步有关的那一栏
-（不同时期可能叫 **Source Repos** 或 **Connect GitHub repository**），
-点它 → 授权 → 选中 `Satan508-h/sfly-code-review`。
+这一条命令做四件事：问出你的用户名 → 建 Space（顺便把环境变量和密钥一起设好）
+→ 上传代码 → 打印网址。**可以反复跑**，第二次就是「更新配置 + 重新上传」。
 
-连上之后，**你往 GitHub 推代码，Space 会自动重新构建** —— 不用再管这一步。
+**你应该看到**最后两行形如：
 
-> **找不到那一栏就停下告诉我**，别自己猜着点。HF 的界面改过几次名字，
-> 我给你一条别的路（把代码直接推上去），但那条要另外几步。
+```
+[OK] 已部署：https://huggingface.co/spaces/你的用户名/sfly-lite
+  网址：https://你的用户名-sfly-lite.hf.space
+```
 
-### 2.3 填环境变量
+**把它记下来**（写进 `sfly-杂项/` 里那个文件也行），后面几步都要用。
 
-还是在 **Settings** 里，找到 **Variables and secrets**。要加九个，
-分两类 —— 这个分类是 HF 的规矩，**不是保密的都放 Variables**：
-
-**Variables（不是密钥，看得见）：**
-
-| 名字 | 值 |
-|---|---|
-| `MODE` | `lite` |
-| `QUEUE_BACKEND` | `memory` |
-| `LOCK_BACKEND` | `memory` |
-| `LLM_PROVIDER` | `deepseek` |
-| `PORT` | `7860` |
-| `CORS_ORIGINS` | **先填** `http://localhost:5173`，第 4 步回来改成真正的网址 |
-
-**Secrets（密钥，加完就看不见了）：**
-
-| 名字 | 值从哪来 |
-|---|---|
-| `DATABASE_URL` | 跑 `python tasks.py copy-env NEON_DATABASE_URL`，然后 Ctrl+V。**名字对不上是故意的**：`.env` 里那个 `DATABASE_URL` 指向你本机的 Docker，粘上去线上连不上数据库 |
-| `LLM_API_KEY` | 跑 `python tasks.py copy-env LLM_API_KEY`，然后 Ctrl+V |
-| `GITHUB_TOKEN` | 跑 `python tasks.py copy-env GITHUB_TOKEN`，然后 Ctrl+V |
-| `GITHUB_WEBHOOK_SECRET` | 跑 `python tasks.py copy-env GITHUB_WEBHOOK_SECRET`，然后 Ctrl+V |
-
-> `copy-env` **不会把值打印到屏幕上**，它只把值放进剪贴板 —— 密钥不该出现在
-> 终端历史、日志或者截图里。**一次复制一条，粘完再去复制下一条**（剪贴板只有一格）。
+> **为什么是命令而不是在网页上填**：Space 上要设十来个环境变量，其中四个是密钥。
+> 手打既容易错（表现是「密钥无效」），又会让密钥在剪贴板里来回好几趟。
+> 命令直接从 `.env` 读、直接设上去，全程不打印任何值。
 >
-> **`PORT` 为什么必须显式设成 7860**：README 顶部的 frontmatter 里写着
-> `app_port: 7860`，而程序自己的默认端口是 8000。两处不一致时，容器会听在
-> 8000、而平台把流量转到 7860 —— 症状是「构建成功、日志正常、页面打不开」。
-> 显式设一个 `PORT=7860` 之后，无论平台注不注入它自己的值，两边都是一致的。
+> 它**拒绝上传**两样东西，都是安全边界：`.env`（Space 是公开仓库），
+> 以及缺少 `Dockerfile` / `README.md` 的清单（少了任何一个 Space 都建不起来）。
+> 见 `tests/unit/test_deploy_hf.py`。
 
-### 2.4 等它构建
+### 2.3 等它构建
 
-连上仓库之后 HF 会开始构建，**第一次要 3–8 分钟**（它要把依赖装一遍）。
-在 Space 页面的 **Logs** 标签里能看到进度。
-
-构建完，Space 页面会变成能访问的状态。
+HF 收到代码就开始构建，**第一次要 3–8 分钟**（它要把依赖装一遍）。
+进度在 Space 页面的 **Logs** 标签里。
 
 **你应该看到**：打开 `https://你的空间网址/healthz`，返回
 `{"ok": true, "service": "sfly-api", ...}`。
@@ -160,11 +133,11 @@
   在 Space 页面点 **Restart this Space** 再试一次。
 - 打开是 404 或一直转圈 → 看 Logs 里有没有 `lite.starting`。
   没有的话是容器根本没起来，往上看构建报错。
-- `postgres: down` → `DATABASE_URL` 填错了。先在本地跑
+- `postgres: down` → `DATABASE_URL` 不对。先在本地跑
   `python tasks.py db-check --name NEON_DATABASE_URL` 确认那条串是好的，
-  再回去检查有没有粘成 Direct 那条（要 `-pooler` 的）。
-
----
+  再重跑一遍 `deploy-hf`（它会重新设一遍密钥）。
+- 想手工看/改某个变量 → Space 页面的 **Settings** → **Variables and secrets**。
+  命令设的值在那里都能看到（密钥除外，密钥写进去就读不回来了）。
 
 ## 第 3 步 · Vercel：部署前端
 
