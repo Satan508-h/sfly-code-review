@@ -882,8 +882,6 @@ def render_report(
             lines.append(f"| … | | | | 另有 {len(false_positives) - 20} 条 |")
         lines += [""]
 
-    lines += ["## 成本与延迟", ""]
-
     if sweep:
         lines += [
             "## 置信度闸的阈值扫描",

@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -320,6 +321,13 @@ def test_write_the_report(eval_runs) -> None:  # type: ignore[no-untyped-def]
         current_threshold=SUPPRESS_THRESHOLD,
         by_group=score_by_group(eval_runs),
     )
+
+    # 每个二级标题下面必须马上有内容 —— 不能被另一个二级标题直接跟着。
+    # 这条是**被一次真实的排版缺陷逼出来的**：`## 成本与延迟` 曾经在渲染里被写成
+    # 两处（一处在阈值扫描之前、是空的），表格在第二处。于是每份报告里都多出一个
+    # 空标题 —— 它不报错、不影响任何数字，从 e9aafd0 一直活到第 22 份报告。
+    # 断言写在**写文件之前**：宁可这次不产报告，也不产一份带空标题的。
+    assert not re.search(r"^## [^\n]*\n\n## ", body, re.M), "报告里有一个空的二级标题"
 
     REPORTS_DIR.mkdir(exist_ok=True)
     # **层名进文件名。** 两层跑的是同一批用例、同一个 sha，只按 sha 命名的话
